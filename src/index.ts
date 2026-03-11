@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { Request as ExpressRequest } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -26,6 +26,12 @@ const REQUIRED_ENV_VARS = [
 const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
 if (missingVars.length > 0) {
   console.error(`[startup] FATAL: Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
+
+const encKey = process.env.ENCRYPTION_KEY ?? '';
+if (!/^[0-9a-fA-F]{64}$/.test(encKey)) {
+  console.error('[startup] FATAL: ENCRYPTION_KEY deve ser uma string hexadecimal de 64 caracteres (32 bytes para AES-256). Gere com: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
   process.exit(1);
 }
 
@@ -76,9 +82,28 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'oriclaw-backend', ts: new Date().toISOString() });
 });
 
+// ── Per-user rate limits for proxy routes ────────────────────────────────────
+const proxyRateLimit = rateLimit({
+  windowMs: 60_000, // 1 minuto
+  max: 30,
+  keyGenerator: (req: ExpressRequest & { user?: { id: string } }) => req.user?.id ?? req.ip ?? 'unknown',
+  message: { error: 'Muitas requisições. Aguarde um momento.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const restartRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: 5,
+  keyGenerator: (req: ExpressRequest & { user?: { id: string } }) => req.user?.id ?? req.ip ?? 'unknown',
+  message: { error: 'Muitos restarts em pouco tempo. Aguarde.' },
+});
+
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.use('/webhooks', webhookRoutes);
 app.use('/api/instances', instanceRoutes);
+app.use('/api/proxy', proxyRateLimit);
+app.use('/api/proxy/:id/restart', restartRateLimit);
 app.use('/api/proxy', proxyRoutes);
 app.use('/api/credits', creditsRoutes);
 app.use('/api/auth', authRoutes);

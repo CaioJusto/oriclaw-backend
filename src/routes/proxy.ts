@@ -163,9 +163,10 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       if (storedKey) {
         try {
           body.anthropic_key = decrypt(storedKey);
-        } catch {
-          // key might be old plaintext — pass as-is
-          body.anthropic_key = storedKey;
+        } catch (decryptErr) {
+          console.error('[proxy/configure] Failed to decrypt stored API key:', decryptErr);
+          res.status(500).json({ error: 'Falha ao decriptar API key armazenada. Por favor, reconfigure sua chave de API.' });
+          return;
         }
       }
     }

@@ -10,7 +10,7 @@
  */
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
-import { getInstanceById, updateInstance, supabase } from '../services/supabase';
+import { getInstanceById, getInstanceByCustomerId, updateInstance, supabase } from '../services/supabase';
 import { encrypt } from '../services/crypto';
 
 const router = Router();
@@ -72,6 +72,19 @@ router.post('/openai/exchange', async (req: Request, res: Response): Promise<voi
 
   if (!code || !instance_id) {
     res.status(400).json({ error: 'Missing code or instance_id' }); return;
+  }
+
+  // Ownership check — prevent IDOR write
+  const userId = await getUserId(req);
+  if (!userId) {
+    res.status(401).json({ error: 'Autenticação obrigatória.' });
+    return;
+  }
+
+  const ownedInstance = await getInstanceByCustomerId(userId);
+  if (!ownedInstance || ownedInstance.id !== instance_id) {
+    res.status(403).json({ error: 'Acesso negado.' });
+    return;
   }
 
   if (!OPENAI_CLIENT_ID || !OPENAI_CLIENT_SECRET) {

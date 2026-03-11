@@ -38,12 +38,14 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
   // Validar que o user autenticado bate com o supabase_user_id enviado
   const authHeader = req.headers['authorization'] ?? '';
   const token = (authHeader as string).replace(/^Bearer\s+/i, '').trim();
-  if (token) {
-    const { data: { user } } = await supabase.auth.getUser(token);
-    if (user && user.id !== supabase_user_id) {
-      res.status(403).json({ error: 'Acesso negado.' });
-      return;
-    }
+  if (!token) {
+    res.status(401).json({ error: 'Autenticação obrigatória.' });
+    return;
+  }
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !user || user.id !== supabase_user_id) {
+    res.status(403).json({ error: 'Acesso negado.' });
+    return;
   }
 
   try {

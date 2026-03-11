@@ -15,6 +15,10 @@ const OPENCLAW_CONFIG_DIR = '/home/openclaw/.openclaw';
 const OPENCLAW_ENV_FILE = path.join(OPENCLAW_CONFIG_DIR, '.env');
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_CONFIG_DIR, 'config.json');
 
+// ── Concurrency locks ─────────────────────────────────────────────────────────
+let isConfiguring = false;
+let isRestarting = false;
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const secret = req.headers['x-agent-secret'];
@@ -78,12 +82,19 @@ function readEnvFile() {
 }
 
 /**
+ * Sanitize env values — strip newlines and null bytes to prevent injection.
+ */
+function sanitizeEnvValue(v) {
+  return String(v).replace(/[\r\n\0]/g, '');
+}
+
+/**
  * Write a plain object back to the .env file, merging with existing values.
  */
 function writeEnvFile(updates) {
   const existing = readEnvFile();
   const merged = { ...existing, ...updates };
-  const content = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  const content = Object.entries(merged).map(([k, v]) => `${k}=${sanitizeEnvValue(v)}`).join('\n') + '\n';
   fs.mkdirSync(OPENCLAW_CONFIG_DIR, { recursive: true });
   fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
   try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
@@ -276,6 +287,11 @@ app.get('/qr', auth, async (req, res) => {
 //         credits_mode?, chatgpt_mode?,
 //         system_prompt?, language?, timezone? }
 app.post('/configure', auth, (req, res) => {
+  if (isConfiguring) {
+    return res.status(429).json({ error: 'Configuração já em andamento. Aguarde.' });
+  }
+  isConfiguring = true;
+
   const {
     anthropic_key,
     openai_key,
@@ -316,8 +332,9 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    exec('systemctl restart openclaw', (restartErr) => {
+    exec('sudo systemctl restart openclaw', (restartErr) => {
       if (restartErr) {
+        isConfiguring = false;
         return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
       }
       // Poll até openclaw estar running ou timeout de 10s
@@ -327,25 +344,36 @@ app.post('/configure', auth, (req, res) => {
         const status = getOpenclawStatus();
         if (status === 'running') {
           clearInterval(poll);
+          isConfiguring = false;
           return res.json({ success: true, openclaw: 'running' });
         }
         if (attempts >= 10) {
           clearInterval(poll);
+          isConfiguring = false;
           return res.json({ success: true, openclaw: status, warning: 'Assistente ainda iniciando, aguarde alguns segundos.' });
         }
       }, 1000);
     });
   } catch (err) {
+    isConfiguring = false;
     res.status(500).json({ error: err.message });
   }
 });
 
 // POST /restart — with status detection and wait-for-up
 app.post('/restart', auth, (req, res) => {
+  if (isRestarting) {
+    return res.status(429).json({ error: 'Reinicialização já em andamento. Aguarde.' });
+  }
+  isRestarting = true;
+
   const previous_status = getOpenclawStatus();
 
-  exec('systemctl restart openclaw', (err) => {
-    if (err) return res.status(500).json({ error: err.message, previous_status, restarted: false });
+  exec('sudo systemctl restart openclaw', (err) => {
+    if (err) {
+      isRestarting = false;
+      return res.status(500).json({ error: err.message, previous_status, restarted: false });
+    }
 
     // Poll for service to come up (up to 10s)
     let attempts = 0;
@@ -355,6 +383,7 @@ app.post('/restart', auth, (req, res) => {
       const new_status = getOpenclawStatus();
       if (new_status === 'running' || attempts >= maxAttempts) {
         clearInterval(poll);
+        isRestarting = false;
         res.json({ success: true, restarted: true, previous_status, new_status });
       }
     }, 1000);
@@ -451,7 +480,7 @@ app.post('/channels/telegram', auth, async (req, res) => {
   try {
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
 
-    exec('systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', (err) => {
       if (err) console.error('[telegram] restart error:', err.message);
     });
 
@@ -472,7 +501,7 @@ app.post('/channels/discord', auth, (req, res) => {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
     if (guild_id) writeConfig({ discord_guild_id: guild_id });
 
-    exec('systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', (err) => {
       if (err) console.error('[discord] restart error:', err.message);
     });
 
@@ -498,7 +527,7 @@ app.delete('/channels/:channel', auth, (req, res) => {
     if (channel === 'whatsapp') {
       // Delete WhatsApp session files so the bot doesn't auto-reconnect
       exec(
-        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && systemctl restart openclaw',
+        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && sudo systemctl restart openclaw',
         (err) => {
           if (err) console.error('[channels] WhatsApp disconnect error:', err.message);
           setTimeout(() => res.json({ success: true }), 3000);
@@ -508,11 +537,11 @@ app.delete('/channels/:channel', auth, (req, res) => {
     } else {
       const env = readEnvFile();
       delete env[envKeyMap[channel]];
-      const content = Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+      const content = Object.entries(env).map(([k, v]) => `${k}=${sanitizeEnvValue(v)}`).join('\n') + '\n';
       fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
       try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
 
-      exec('systemctl restart openclaw', (err) => {
+      exec('sudo systemctl restart openclaw', (err) => {
         if (err) console.error('[disconnect] restart error:', err.message);
       });
     }

@@ -27,7 +27,7 @@ export function sanitizeInstance(instance: OriClawInstance) {
   if (!instance) return instance;
   const { api_key_encrypted, ...rest } = instance;
   if (rest.metadata) {
-    const { agent_secret, openai_access_token, openrouter_key, ...safeMetadata } = rest.metadata;
+    const { agent_secret, openai_access_token, openai_access_token_encrypted, openrouter_key, ...safeMetadata } = rest.metadata;
     rest.metadata = safeMetadata;
   }
   return rest;
