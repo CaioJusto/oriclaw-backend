@@ -125,21 +125,14 @@ router.get('/:customer_id', async (req: Request, res: Response): Promise<void> =
  * Upserts the oriclaw_credits row for customer_id.
  */
 export async function addCredits(customerId: string, amountBrl: number): Promise<void> {
-  const { data: existing } = await supabase
-    .from(CREDITS_TABLE)
-    .select('balance_brl')
-    .eq('customer_id', customerId)
-    .maybeSingle();
+  const { error } = await supabase.rpc('add_credits', {
+    p_customer_id: customerId,
+    p_amount: amountBrl,
+  });
 
-  const currentBalance = (existing as { balance_brl: number } | null)?.balance_brl ?? 0;
-  const newBalance = currentBalance + amountBrl;
-
-  await supabase
-    .from(CREDITS_TABLE)
-    .upsert(
-      { customer_id: customerId, balance_brl: newBalance, updated_at: new Date().toISOString() },
-      { onConflict: 'customer_id' }
-    );
+  if (error) {
+    throw new Error(`Failed to add credits atomically: ${error.message}`);
+  }
 }
 
 export default router;

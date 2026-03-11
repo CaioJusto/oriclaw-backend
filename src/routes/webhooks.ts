@@ -13,19 +13,23 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
 const PROCESSED_EVENTS_TABLE = 'stripe_processed_events';
 
 // ── Idempotency helpers ──────────────────────────────────────────────────────
-async function isEventProcessed(eventId: string): Promise<boolean> {
-  const { data } = await supabase
+async function reserveEventProcessing(eventId: string): Promise<boolean> {
+  const { count, error } = await supabase
     .from(PROCESSED_EVENTS_TABLE)
-    .select('id')
-    .eq('id', eventId)
-    .single();
-  return !!data;
+    .upsert({ id: eventId }, { onConflict: 'id', ignoreDuplicates: true, count: 'exact' });
+
+  if (error) {
+    throw new Error(`Failed to reserve webhook event: ${error.message}`);
+  }
+
+  return (count ?? 0) > 0;
 }
 
-async function markEventProcessed(eventId: string): Promise<void> {
+async function releaseEventReservation(eventId: string): Promise<void> {
   await supabase
     .from(PROCESSED_EVENTS_TABLE)
-    .insert({ id: eventId });
+    .delete()
+    .eq('id', eventId);
 }
 
 // Stripe sends raw body — must use express.raw() for this route
@@ -56,18 +60,19 @@ router.post(
 
     console.log(`[webhook] Received event: ${event.type}`);
 
-    // ── Idempotency check (before processing) ───────────────────────────────
+    // ── Atomic idempotency reservation (INSERT ... ON CONFLICT DO NOTHING) ─
     try {
-      const alreadyProcessed = await isEventProcessed(event.id);
-      if (alreadyProcessed) {
+      const reserved = await reserveEventProcessing(event.id);
+      if (!reserved) {
         console.log(`[webhook] Skipping duplicate event: ${event.id}`);
         res.json({ received: true, skipped: true });
         return;
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Idempotency check failed';
-      console.error('[webhook] Idempotency check error (table may not exist yet), continuing:', msg);
-      // Continue processing — idempotency table may not exist yet
+      const msg = err instanceof Error ? err.message : 'Idempotency reservation failed';
+      console.error('[webhook] Idempotency reservation error:', msg);
+      res.status(500).json({ error: 'Idempotency reservation failed' });
+      return;
     }
 
     try {
@@ -153,17 +158,16 @@ router.post(
           console.log(`[webhook] Unhandled event type: ${event.type}`);
       }
 
-      // Mark as processed AFTER successful handling (FIX 5: idempotency after success)
-      try {
-        await markEventProcessed(event.id);
-      } catch (idempErr: unknown) {
-        const msg = idempErr instanceof Error ? idempErr.message : String(idempErr);
-        console.warn('[webhook] Failed to mark event processed (non-fatal):', msg);
-      }
-
       res.json({ received: true });
     } catch (err: unknown) {
-      // Don't mark as processed — allow Stripe to retry
+      // Release reservation so Stripe retries can process again.
+      try {
+        await releaseEventReservation(event.id);
+      } catch (releaseErr: unknown) {
+        const releaseMsg = releaseErr instanceof Error ? releaseErr.message : String(releaseErr);
+        console.warn('[webhook] Failed to release idempotency reservation:', releaseMsg);
+      }
+
       const msg = err instanceof Error ? err.message : 'Internal error';
       console.error(`[webhook] Handler failed for ${event.type}, will allow retry:`, msg);
       res.status(500).json({ error: 'Handler failed' });

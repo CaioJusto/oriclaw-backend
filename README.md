@@ -106,11 +106,33 @@ CREATE TABLE oriclaw_credits (
   updated_at timestamptz DEFAULT now()
 );
 
+-- Atomic credits increment RPC (used by src/routes/credits.ts)
+CREATE OR REPLACE FUNCTION add_credits(p_customer_id text, p_amount numeric)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO oriclaw_credits (customer_id, balance_brl, updated_at)
+  VALUES (p_customer_id, p_amount, now())
+  ON CONFLICT (customer_id)
+  DO UPDATE
+  SET
+    balance_brl = oriclaw_credits.balance_brl + EXCLUDED.balance_brl,
+    updated_at = now();
+END;
+$$;
+
 -- Stripe webhook idempotency — prevents duplicate processing on retries/replays
 CREATE TABLE stripe_processed_events (
   id text PRIMARY KEY, -- Stripe event.id (e.g. evt_xxx)
   processed_at timestamptz DEFAULT now()
 );
+```
+
+`addCredits()` calls this RPC with:
+
+```ts
+await supabase.rpc('add_credits', { p_customer_id, p_amount });
 ```
 
 Also add `payment_intent.succeeded` to your Stripe webhook events (in addition to subscription events) so credit top-ups are processed automatically.

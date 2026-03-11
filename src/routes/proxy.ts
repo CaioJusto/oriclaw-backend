@@ -145,7 +145,14 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
     }
 
     // Inject stored Anthropic API key (decrypted) if not provided by client and instance has one
-    if (!body.anthropic_key && !body.openai_key && !body.openrouter_key && !body.credits_mode && !body.chatgpt_mode) {
+    if (
+      !body.anthropic_key &&
+      !body.openai_key &&
+      !body.google_key &&
+      !body.openrouter_key &&
+      !body.credits_mode &&
+      !body.chatgpt_mode
+    ) {
       const storedKey = (instance as { api_key_encrypted?: string | null })?.api_key_encrypted;
       if (storedKey) {
         try {

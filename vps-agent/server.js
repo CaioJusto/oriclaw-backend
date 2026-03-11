@@ -257,7 +257,7 @@ app.get('/qr', auth, async (req, res) => {
 });
 
 // POST /configure
-// body: { anthropic_key?, openai_key?, openrouter_key?, openai_token?,
+// body: { anthropic_key?, openai_key?, google_key?, openrouter_key?, openai_token?,
 //         model?, assistant_name?, channel?,
 //         credits_mode?, chatgpt_mode?,
 //         system_prompt?, language?, timezone? }
@@ -265,6 +265,7 @@ app.post('/configure', auth, (req, res) => {
   const {
     anthropic_key,
     openai_key,
+    google_key,
     openrouter_key,
     openai_token,
     model,
@@ -285,7 +286,7 @@ app.post('/configure', auth, (req, res) => {
     if (assistant_name) configUpdates.assistant_name = assistant_name;
     if (credits_mode) configUpdates.ai_mode = 'credits';
     else if (chatgpt_mode) configUpdates.ai_mode = 'chatgpt';
-    else if (anthropic_key || openai_key || openrouter_key) configUpdates.ai_mode = 'byok';
+    else if (anthropic_key || openai_key || google_key || openrouter_key) configUpdates.ai_mode = 'byok';
     if (system_prompt !== undefined) configUpdates.system_prompt = system_prompt;
     if (language) configUpdates.language = language;
     if (timezone) configUpdates.timezone = timezone;
@@ -295,6 +296,7 @@ app.post('/configure', auth, (req, res) => {
     const envUpdates = {};
     if (anthropic_key) envUpdates.ANTHROPIC_API_KEY = anthropic_key;
     if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
+    if (google_key) envUpdates.GOOGLE_API_KEY = google_key;
     if (openrouter_key) envUpdates.OPENROUTER_API_KEY = openrouter_key;
     if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
     if (timezone) envUpdates.TZ = timezone;

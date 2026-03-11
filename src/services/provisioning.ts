@@ -67,15 +67,40 @@ async function createDropletAsync(
     if (ip) break;
   }
 
+  if (!ip) {
+    await updateInstance(instanceId, {
+      status: 'suspended',
+      metadata: {
+        droplet_name: droplet.name,
+        agent_secret: agentSecret,
+        error: 'Droplet não obteve IP em tempo hábil',
+      },
+    });
+    return;
+  }
+
+  // Wait until VPS agent is responding on /health before exposing needs_config.
+  const agentReady = await waitForAgentReadiness(ip, agentSecret, 5 * 60 * 1000);
+  if (!agentReady) {
+    await updateInstance(instanceId, {
+      droplet_ip: ip,
+      status: 'suspended',
+      metadata: {
+        droplet_name: droplet.name,
+        agent_secret: agentSecret,
+        error: 'VPS agent não respondeu após 5 minutos',
+      },
+    });
+    return;
+  }
+
   await updateInstance(instanceId, {
     droplet_ip: ip,
-    // Once IP is obtained the VPS is booting — needs_config until user configures via dashboard
-    status: ip ? 'needs_config' : 'provisioning',
+    status: 'needs_config',
+    metadata: { droplet_name: droplet.name, agent_secret: agentSecret },
   });
 
-  if (ip) {
-    console.log(`[provision] Instance ${instanceId} ready for config at ${ip}`);
-  }
+  console.log(`[provision] Instance ${instanceId} ready for config at ${ip}`);
 }
 
 export async function deprovisionInstance(subscriptionId: string): Promise<void> {
@@ -92,6 +117,11 @@ export async function deprovisionInstance(subscriptionId: string): Promise<void>
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[deprovision] Failed to delete droplet: ${msg}`);
+      await updateInstance(instance.id, {
+        status: 'deletion_failed',
+        metadata: { ...(instance.metadata ?? {}), error: msg },
+      });
+      return;
     }
   }
 
@@ -113,6 +143,33 @@ export { decrypt };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForAgentReadiness(
+  ip: string,
+  agentSecret: string,
+  maxWaitMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await axios.get(`http://${ip}:8080/health`, {
+        headers: { 'x-agent-secret': agentSecret },
+        timeout: 2_000,
+      });
+
+      if (response.status === 200) {
+        return true;
+      }
+    } catch {
+      // keep retrying until timeout
+    }
+
+    await sleep(5_000);
+  }
+
+  return false;
 }
 
 // ── Internal: create droplet with custom cloud-init ──────────────────────────
