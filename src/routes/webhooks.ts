@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
 import { provisionInstance, deprovisionInstance, suspendInstance } from '../services/provisioning';
 import { addCredits } from './credits';
-import { supabase, getInstanceBySubscriptionId } from '../services/supabase';
+import { supabase, getInstanceBySubscriptionId, getInstanceByCustomerId } from '../services/supabase';
 
 const router = Router();
 
@@ -56,7 +56,7 @@ router.post(
 
     console.log(`[webhook] Received event: ${event.type}`);
 
-    // ── Idempotency check ────────────────────────────────────────────────────
+    // ── Idempotency check (before processing) ───────────────────────────────
     try {
       const alreadyProcessed = await isEventProcessed(event.id);
       if (alreadyProcessed) {
@@ -64,11 +64,9 @@ router.post(
         res.json({ received: true, skipped: true });
         return;
       }
-      // Mark as processed immediately before handling
-      await markEventProcessed(event.id);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Idempotency check failed';
-      console.error('[webhook] Idempotency error:', msg);
+      console.error('[webhook] Idempotency check error (table may not exist yet), continuing:', msg);
       // Continue processing — idempotency table may not exist yet
     }
 
@@ -76,22 +74,29 @@ router.post(
       switch (event.type) {
         case 'customer.subscription.created': {
           const subscription = event.data.object as Stripe.Subscription;
-          const customerId = subscription.customer as string;
+          // Get supabase_user_id from subscription metadata (set during checkout)
+          const supabaseUserId = subscription.metadata?.supabase_user_id;
           const plan = resolvePlan(subscription);
 
-          // Uniqueness check: skip if already provisioned for this subscription
-          const existingInstance = await getInstanceBySubscriptionId(subscription.id);
-          if (existingInstance) {
-            console.log(`[webhook] Instance already exists for subscription ${subscription.id}, skipping`);
+          if (!supabaseUserId) {
+            console.warn('[webhook] subscription.created missing supabase_user_id in metadata, skipping provisioning');
+            break;
+          }
+
+          // Uniqueness check: skip if already provisioned for this user
+          const existingInstance = await getInstanceByCustomerId(supabaseUserId);
+          if (existingInstance && existingInstance.status !== 'deleted') {
+            console.log(`[webhook] Instance already exists for user ${supabaseUserId}, skipping`);
             break;
           }
 
           // Fetch customer email from Stripe
+          const customerId = subscription.customer as string;
           const customer = await stripe.customers.retrieve(customerId);
-          const email = 'email' in customer ? (customer.email ?? 'unknown@unknown.com') : 'unknown@unknown.com';
+          const email = 'email' in customer ? (customer.email ?? '') : '';
 
           await provisionInstance({
-            customer_id: customerId,
+            customer_id: supabaseUserId,  // Use Supabase UID, not Stripe cus_
             plan,
             email,
             stripe_subscription_id: subscription.id,
@@ -128,6 +133,7 @@ router.post(
             }
           }
           // For subscription mode, customer.subscription.created handles provisioning
+          console.log(`[webhook] checkout.session.completed: ${session.id}`);
           break;
         }
 
@@ -147,11 +153,20 @@ router.post(
           console.log(`[webhook] Unhandled event type: ${event.type}`);
       }
 
+      // Mark as processed AFTER successful handling (FIX 5: idempotency after success)
+      try {
+        await markEventProcessed(event.id);
+      } catch (idempErr: unknown) {
+        const msg = idempErr instanceof Error ? idempErr.message : String(idempErr);
+        console.warn('[webhook] Failed to mark event processed (non-fatal):', msg);
+      }
+
       res.json({ received: true });
     } catch (err: unknown) {
+      // Don't mark as processed — allow Stripe to retry
       const msg = err instanceof Error ? err.message : 'Internal error';
-      console.error(`[webhook] Handler error for ${event.type}:`, msg);
-      res.status(500).json({ error: msg });
+      console.error(`[webhook] Handler failed for ${event.type}, will allow retry:`, msg);
+      res.status(500).json({ error: 'Handler failed' });
     }
   }
 );

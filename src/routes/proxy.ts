@@ -9,6 +9,7 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { supabase } from '../services/supabase';
 import { getInstanceById, updateInstance } from '../services/supabase';
+import { decrypt } from '../services/crypto';
 
 const router = Router();
 
@@ -141,6 +142,19 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         return;
       }
       body.openrouter_key = orKey;
+    }
+
+    // Inject stored Anthropic API key (decrypted) if not provided by client and instance has one
+    if (!body.anthropic_key && !body.openai_key && !body.openrouter_key && !body.credits_mode && !body.chatgpt_mode) {
+      const storedKey = (instance as { api_key_encrypted?: string | null })?.api_key_encrypted;
+      if (storedKey) {
+        try {
+          body.anthropic_key = decrypt(storedKey);
+        } catch {
+          // key might be old plaintext — pass as-is
+          body.anthropic_key = storedKey;
+        }
+      }
     }
 
     // Inject stored OpenAI OAuth token when ChatGPT Plus mode is requested

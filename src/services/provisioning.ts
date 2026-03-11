@@ -8,6 +8,7 @@ import {
 } from './supabase';
 import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest } from '../types';
+import { encrypt, decrypt } from './crypto';
 
 export async function provisionInstance(
   req: ProvisionRequest
@@ -26,7 +27,7 @@ export async function provisionInstance(
     droplet_ip: null,
     status: 'provisioning',
     stripe_subscription_id: req.stripe_subscription_id ?? null,
-    api_key_encrypted: req.api_key_anthropic ?? null,
+    api_key_encrypted: req.api_key_anthropic ? encrypt(req.api_key_anthropic) : null,
     metadata: { agent_secret: agentSecret },
   });
 
@@ -104,9 +105,11 @@ export async function suspendInstance(subscriptionId: string): Promise<void> {
 }
 
 export async function updateApiKey(instanceId: string, apiKey: string): Promise<void> {
-  await updateInstance(instanceId, { api_key_encrypted: apiKey });
-  console.log(`[updateApiKey] Stored new API key for instance ${instanceId} (configure via /proxy)`);
+  await updateInstance(instanceId, { api_key_encrypted: encrypt(apiKey) });
+  console.log(`[updateApiKey] Stored new encrypted API key for instance ${instanceId} (configure via /proxy)`);
 }
+
+export { decrypt };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

@@ -22,10 +22,15 @@ const PLAN_PRICES: Record<string, number> = {
 // Body: { plan: 'starter' | 'pro' | 'business', email?: string }
 // Returns: { url }
 router.post('/session', async (req: Request, res: Response): Promise<void> => {
-  const { plan, email } = req.body as { plan?: string; email?: string };
+  const { plan, email, supabase_user_id } = req.body as { plan?: string; email?: string; supabase_user_id?: string };
 
   if (!plan || !PLAN_PRICES[plan]) {
     res.status(400).json({ error: 'Invalid plan. Must be: starter | pro | business' });
+    return;
+  }
+
+  if (!supabase_user_id) {
+    res.status(400).json({ error: 'supabase_user_id required' });
     return;
   }
 
@@ -44,7 +49,10 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
       }],
       success_url: `${process.env.APP_URL}/dashboard?checkout=success`,
       cancel_url: `${process.env.APP_URL}/checkout?plan=${plan}&cancelled=true`,
-      metadata: { plan },
+      metadata: { plan, supabase_user_id },
+      subscription_data: {
+        metadata: { supabase_user_id, plan },
+      },
     });
 
     res.json({ url: session.url });
