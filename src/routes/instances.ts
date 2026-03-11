@@ -50,7 +50,7 @@ router.post('/provision', requireApiSecret, async (req: Request, res: Response):
 
 // GET /api/instances/:customer_id — requires Supabase JWT; returns only own instance
 router.get('/:customer_id', requireAuth, async (req: Request, res: Response): Promise<void> => {
-  const userId = (req as any).user?.id;
+  const userId = req.user?.id;
   // Verify the requesting user matches the customer_id in the URL
   if (userId !== req.params.customer_id) {
     res.status(403).json({ error: 'Forbidden' });
@@ -95,7 +95,7 @@ router.post('/:instance_id/update-apikey', requireApiSecret, async (req: Request
 
 // GET /api/instances/:instance_id/status — requires Supabase JWT + ownership
 router.get('/:instance_id/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
-  const userId = (req as any).user?.id;
+  const userId = req.user?.id;
   try {
     const instance = await getInstanceById(req.params.instance_id);
     if (!instance) {

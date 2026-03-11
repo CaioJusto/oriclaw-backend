@@ -1,3 +1,11 @@
+declare global {
+  namespace Express {
+    interface Request {
+      user?: { id: string; email?: string };
+    }
+  }
+}
+
 export interface OriClawInstance {
   id: string;
   created_at: string;

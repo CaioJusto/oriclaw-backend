@@ -22,6 +22,8 @@ async function reserveEventProcessing(eventId: string): Promise<boolean> {
     throw new Error(`Failed to reserve webhook event: ${error.message}`);
   }
 
+  // count > 0 = row was inserted (new event, proceed)
+  // count === 0 = row already existed (duplicate, skip)
   return (count ?? 0) > 0;
 }
 

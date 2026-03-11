@@ -10,6 +10,22 @@ import creditsRoutes from './routes/credits';
 import authRoutes from './routes/auth';
 import checkoutRoutes from './routes/checkout';
 
+// ── Required environment variable validation ──────────────────────────────────
+const REQUIRED_ENV_VARS = [
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'DO_API_TOKEN',
+  'STRIPE_SECRET_KEY',
+  'STRIPE_WEBHOOK_SECRET',
+  'ENCRYPTION_KEY',
+];
+
+const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`[startup] FATAL: Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
+
 const app = express();
 const PORT = process.env.PORT ?? 3001;
 

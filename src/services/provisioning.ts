@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import axios from 'axios';
 import { createDroplet, deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
 import {
   createInstance,
@@ -7,7 +8,7 @@ import {
   updateInstance,
 } from './supabase';
 import { CLOUD_INIT_SCRIPT } from './cloudInit';
-import { ProvisionRequest } from '../types';
+import { ProvisionRequest, DODroplet, DODropletResponse } from '../types';
 import { encrypt, decrypt } from './crypto';
 
 export async function provisionInstance(
@@ -173,9 +174,6 @@ async function waitForAgentReadiness(
 }
 
 // ── Internal: create droplet with custom cloud-init ──────────────────────────
-import axios from 'axios';
-import { DODroplet, DODropletResponse } from '../types';
-
 const DO_API_BASE = 'https://api.digitalocean.com/v2';
 
 function getHeaders() {

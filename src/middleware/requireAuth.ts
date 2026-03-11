@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
+import { OriClawInstance } from '../types';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -18,11 +19,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     res.status(401).json({ error: 'Invalid token' });
     return;
   }
-  (req as any).user = user;
+  req.user = { id: user.id, email: user.email ?? undefined };
   next();
 }
 
-export function sanitizeInstance(instance: any) {
+export function sanitizeInstance(instance: OriClawInstance) {
   if (!instance) return instance;
   const { api_key_encrypted, ...rest } = instance;
   if (rest.metadata) {
