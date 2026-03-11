@@ -139,6 +139,97 @@ app.get('/health', auth, (req, res) => {
   res.json({ status: 'ok', openclaw: status, uptime });
 });
 
+// GET /health/detailed
+app.get('/health/detailed', auth, (req, res) => {
+  try {
+    // Service status
+    let openclaw = 'stopped';
+    try {
+      const activeOut = runCmd('systemctl is-active openclaw').trim();
+      if (activeOut === 'active') openclaw = 'running';
+      else if (activeOut === 'failed') openclaw = 'crashed';
+      else openclaw = 'stopped';
+    } catch { openclaw = 'stopped'; }
+
+    // Restart count
+    let restart_count = 0;
+    try {
+      const nrestartsOut = runCmd('systemctl show openclaw --property=NRestarts --value').trim();
+      restart_count = parseInt(nrestartsOut, 10) || 0;
+    } catch { restart_count = 0; }
+
+    // If crash or many restarts, mark as crashed
+    if (restart_count > 3 && openclaw !== 'running') openclaw = 'crashed';
+
+    // Uptime
+    const uptime_seconds = getUptimeSeconds();
+
+    // RAM from /proc/meminfo
+    let ram_used_mb = 0, ram_total_mb = 0;
+    try {
+      const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+      const memTotal = parseInt((meminfo.match(/MemTotal:\s+(\d+)/) || [])[1] || '0', 10);
+      const memAvail = parseInt((meminfo.match(/MemAvailable:\s+(\d+)/) || [])[1] || '0', 10);
+      ram_total_mb = Math.round(memTotal / 1024);
+      ram_used_mb = Math.round((memTotal - memAvail) / 1024);
+    } catch { /* ignore */ }
+
+    // Disk from df
+    let disk_used_gb = 0, disk_total_gb = 0;
+    try {
+      const dfOut = runCmd('df -BG / --output=size,used').trim();
+      const lines = dfOut.split('\n').filter(l => !l.trim().startsWith('1G') && !l.trim().startsWith('Size'));
+      const dataLine = lines.find(l => /\d/.test(l)) || lines[lines.length - 1];
+      if (dataLine) {
+        const parts = dataLine.trim().split(/\s+/);
+        disk_total_gb = parseFloat(parts[0]) || 0;
+        disk_used_gb = parseFloat(parts[1]) || 0;
+      }
+    } catch { /* ignore */ }
+
+    // CPU from top
+    let cpu_percent = 0;
+    try {
+      const topOut = runCmd("top -bn1 | grep 'Cpu(s)'");
+      const match = topOut.match(/(\d+[\.,]\d+)\s*[%]?\s*id/);
+      if (match) {
+        const idle = parseFloat(match[1].replace(',', '.'));
+        cpu_percent = Math.round(100 - idle);
+      } else {
+        const usMatch = topOut.match(/(\d+[\.,]\d+)\s*[%]?\s*us/);
+        if (usMatch) cpu_percent = Math.round(parseFloat(usMatch[1].replace(',', '.')));
+      }
+    } catch { /* ignore */ }
+
+    // Last message time from logs
+    let last_message_at = null;
+    try {
+      const logs = getJournalLogs(100);
+      const lines = logs.split('\n').reverse();
+      for (const line of lines) {
+        if (line.toLowerCase().includes('message') || line.toLowerCase().includes('msg')) {
+          const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s]*)/);
+          if (tsMatch) { last_message_at = tsMatch[1]; break; }
+        }
+      }
+    } catch { /* ignore */ }
+
+    res.json({
+      openclaw,
+      uptime_seconds,
+      cpu_percent,
+      ram_used_mb,
+      ram_total_mb,
+      disk_used_gb,
+      disk_total_gb,
+      last_message_at,
+      restart_count,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogs(200);
@@ -168,7 +259,8 @@ app.get('/qr', auth, async (req, res) => {
 // POST /configure
 // body: { anthropic_key?, openai_key?, openrouter_key?, openai_token?,
 //         model?, assistant_name?, channel?,
-//         credits_mode?, chatgpt_mode? }
+//         credits_mode?, chatgpt_mode?,
+//         system_prompt?, language?, timezone? }
 app.post('/configure', auth, (req, res) => {
   const {
     anthropic_key,
@@ -180,6 +272,9 @@ app.post('/configure', auth, (req, res) => {
     channel,
     credits_mode,
     chatgpt_mode,
+    system_prompt,
+    language,
+    timezone,
   } = req.body || {};
 
   try {
@@ -191,6 +286,9 @@ app.post('/configure', auth, (req, res) => {
     if (credits_mode) configUpdates.ai_mode = 'credits';
     else if (chatgpt_mode) configUpdates.ai_mode = 'chatgpt';
     else if (anthropic_key || openai_key || openrouter_key) configUpdates.ai_mode = 'byok';
+    if (system_prompt !== undefined) configUpdates.system_prompt = system_prompt;
+    if (language) configUpdates.language = language;
+    if (timezone) configUpdates.timezone = timezone;
     writeConfig(configUpdates);
 
     // Update .env
@@ -199,6 +297,7 @@ app.post('/configure', auth, (req, res) => {
     if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
     if (openrouter_key) envUpdates.OPENROUTER_API_KEY = openrouter_key;
     if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
+    if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
     // Restart openclaw service
@@ -212,12 +311,55 @@ app.post('/configure', auth, (req, res) => {
   }
 });
 
-// POST /restart
+// POST /restart — with status detection and wait-for-up
 app.post('/restart', auth, (req, res) => {
+  const previous_status = getOpenclawStatus();
+
   exec('systemctl restart openclaw', (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true });
+    if (err) return res.status(500).json({ error: err.message, previous_status, restarted: false });
+
+    // Poll for service to come up (up to 10s)
+    let attempts = 0;
+    const maxAttempts = 10;
+    const poll = setInterval(() => {
+      attempts++;
+      const new_status = getOpenclawStatus();
+      if (new_status === 'running' || attempts >= maxAttempts) {
+        clearInterval(poll);
+        res.json({ success: true, restarted: true, previous_status, new_status });
+      }
+    }, 1000);
   });
+});
+
+// GET /chat-url → returns the OpenClaw web UI URL and availability
+app.get('/chat-url', auth, (req, res) => {
+  try {
+    // Get the public IP of this machine
+    let publicIp = '';
+    try {
+      publicIp = runCmd("curl -s --max-time 3 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}'").trim();
+    } catch {
+      try { publicIp = runCmd("hostname -I | awk '{print $1}'").trim(); } catch { publicIp = 'localhost'; }
+    }
+
+    // Check if port 3000 is responding
+    let available = false;
+    try {
+      runCmd('curl -s --max-time 2 http://localhost:3000/health > /dev/null 2>&1');
+      available = true;
+    } catch {
+      try {
+        runCmd('nc -z -w2 localhost 3000 2>/dev/null');
+        available = true;
+      } catch { available = false; }
+    }
+
+    const url = `http://${publicIp}:3000`;
+    res.json({ url, available });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /logs  → last 50 lines

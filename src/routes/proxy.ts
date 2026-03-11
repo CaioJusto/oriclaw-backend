@@ -77,6 +77,40 @@ router.get('/:instance_id/health', async (req: Request, res: Response): Promise<
   });
 });
 
+// ── GET /api/proxy/:instance_id/health/detailed ──────────────────────────────
+router.get('/:instance_id/health/detailed', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+    try {
+      const { data } = await axios.get(`${baseUrl}/health/detailed`, {
+        headers: agentHeaders(agentSecret),
+        timeout: 15_000,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Health detailed fetch failed' });
+    }
+  });
+});
+
+// ── GET /api/proxy/:instance_id/chat-url ─────────────────────────────────────
+router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+    try {
+      const { data } = await axios.get(`${baseUrl}/chat-url`, {
+        headers: agentHeaders(agentSecret),
+        timeout: 10_000,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Chat URL fetch failed' });
+    }
+  });
+});
+
 // ── GET /api/proxy/:instance_id/qr ──────────────────────────────────────────
 router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void> => {
   await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
