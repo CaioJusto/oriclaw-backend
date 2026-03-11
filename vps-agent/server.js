@@ -407,11 +407,11 @@ app.get('/channels', auth, (req, res) => {
         phone: config.whatsapp_phone || null,
       },
       telegram: {
-        status: env.TELEGRAM_BOT_TOKEN ? 'connected' : 'not_configured',
+        status: env.TELEGRAM_BOT_TOKEN ? 'configured' : 'not_configured',
         username: config.telegram_username || null,
       },
       discord: {
-        status: (env.DISCORD_BOT_TOKEN && config.discord_guild_id) ? 'connected' : 'not_configured',
+        status: (env.DISCORD_BOT_TOKEN && config.discord_guild_id) ? 'configured' : 'not_configured',
         guild: config.discord_guild_name || config.discord_guild_id || null,
       },
     });
@@ -471,10 +471,15 @@ app.delete('/channels/:channel', auth, (req, res) => {
 
   try {
     if (channel === 'whatsapp') {
-      // For WhatsApp, just restart which clears the session
-      exec('systemctl restart openclaw', (err) => {
-        if (err) console.error('[wa-disconnect] restart error:', err.message);
-      });
+      // Delete WhatsApp session files so the bot doesn't auto-reconnect
+      exec(
+        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && systemctl restart openclaw',
+        (err) => {
+          if (err) console.error('[channels] WhatsApp disconnect error:', err.message);
+          setTimeout(() => res.json({ success: true }), 3000);
+        }
+      );
+      return;
     } else {
       const env = readEnvFile();
       delete env[envKeyMap[channel]];

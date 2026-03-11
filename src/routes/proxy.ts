@@ -27,12 +27,18 @@ async function getUserFromRequest(req: Request): Promise<string | null> {
 // ── Instance ownership check + VPS URL builder ──────────────────────────────
 async function resolveInstance(instanceId: string, userId: string) {
   const instance = await getInstanceById(instanceId);
-  if (!instance) throw Object.assign(new Error('Instance not found'), { status: 404 });
+  if (!instance) throw Object.assign(new Error('Instância não encontrada.'), { status: 404 });
   if (instance.customer_id !== userId) {
-    throw Object.assign(new Error('Forbidden'), { status: 403 });
+    throw Object.assign(new Error('Acesso negado.'), { status: 403 });
+  }
+  if (['suspended', 'deleted', 'deletion_failed'].includes(instance.status)) {
+    throw Object.assign(
+      new Error('Instância suspensa ou cancelada. Acesse o dashboard para regularizar.'),
+      { status: 403 }
+    );
   }
   if (!instance.droplet_ip) {
-    throw Object.assign(new Error('Instance not ready — no IP yet'), { status: 503 });
+    throw Object.assign(new Error('Servidor ainda inicializando. Tente novamente em alguns minutos.'), { status: 503 });
   }
   const agentSecret = (instance.metadata as Record<string, unknown>)?.agent_secret as string | undefined;
   if (!agentSecret) {
@@ -54,7 +60,7 @@ async function withInstance(
   try {
     const userId = await getUserFromRequest(req);
     if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
       return;
     }
     const ctx = await resolveInstance(req.params.instance_id, userId);
@@ -167,11 +173,15 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
     // Inject stored OpenAI OAuth token when ChatGPT Plus mode is requested
     if (body.chatgpt_mode) {
       const meta = (instance?.metadata ?? {}) as Record<string, unknown>;
-      if (!meta.openai_access_token) {
-        res.status(400).json({ error: 'ChatGPT Plus not connected yet. Complete OAuth first.' });
+      const encryptedToken = meta.openai_access_token_encrypted as string | undefined;
+      const openaiToken = encryptedToken
+        ? decrypt(encryptedToken)
+        : (meta.openai_access_token as string | undefined);
+      if (!openaiToken) {
+        res.status(400).json({ error: 'ChatGPT Plus não conectado. Complete o OAuth primeiro.' });
         return;
       }
-      body.openai_token = meta.openai_access_token as string;
+      body.openai_token = openaiToken;
     }
 
     const { data } = await axios.post(`${baseUrl}/configure`, body, {
@@ -275,11 +285,11 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
 router.get('/:instance_id/openai-status', async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = await getUserFromRequest(req);
-    if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    if (!userId) { res.status(401).json({ error: 'Não autorizado. Faça login novamente.' }); return; }
 
     const instance = await getInstanceById(req.params.instance_id);
     if (!instance || instance.customer_id !== userId) {
-      res.status(403).json({ error: 'Forbidden' }); return;
+      res.status(403).json({ error: 'Acesso negado.' }); return;
     }
 
     const meta = (instance.metadata ?? {}) as Record<string, unknown>;

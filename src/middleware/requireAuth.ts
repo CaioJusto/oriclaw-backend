@@ -10,13 +10,13 @@ const supabase = createClient(
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
     return;
   }
   const token = authHeader.slice(7);
   const { data: { user }, error } = await supabase.auth.getUser(token);
   if (error || !user) {
-    res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
     return;
   }
   req.user = { id: user.id, email: user.email ?? undefined };

@@ -11,6 +11,7 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { getInstanceById, updateInstance, supabase } from '../services/supabase';
+import { encrypt } from '../services/crypto';
 
 const router = Router();
 
@@ -95,16 +96,19 @@ router.post('/openai/exchange', async (req: Request, res: Response): Promise<voi
 
     const { access_token } = tokenRes.data;
 
-    // Store token in Supabase instance metadata
+    // Store token in Supabase instance metadata (encrypted)
     const instance = await getInstanceById(instance_id);
-    if (!instance) { res.status(404).json({ error: 'Instance not found' }); return; }
+    if (!instance) { res.status(404).json({ error: 'Instância não encontrada.' }); return; }
 
+    const encryptedToken = encrypt(access_token);
     const existingMeta = (instance.metadata ?? {}) as Record<string, unknown>;
+    // Remove plaintext token if present
+    const { openai_access_token: _plaintext, ...cleanMeta } = existingMeta as Record<string, unknown> & { openai_access_token?: unknown };
     await updateInstance(instance_id, {
       metadata: {
-        ...existingMeta,
+        ...cleanMeta,
         chatgpt_connected: true,
-        openai_access_token: access_token,
+        openai_access_token_encrypted: encryptedToken,
       },
     });
 
