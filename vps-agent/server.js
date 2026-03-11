@@ -230,11 +230,25 @@ app.get('/health/detailed', auth, (req, res) => {
   }
 });
 
+// ── WhatsApp connection check helper ─────────────────────────────────────────
+function isWhatsAppConnected(isRunning, logs) {
+  if (!isRunning) return false;
+  const lower = logs.toLowerCase();
+  return (
+    lower.includes('whatsapp connected') ||
+    lower.includes('wa connected') ||
+    lower.includes('[whatsapp] connected') ||
+    lower.includes('client is ready') ||    // whatsapp-web.js
+    lower.includes('connection opened')     // Baileys
+  );
+}
+
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogs(200);
+  const isRunning = getOpenclawStatus() === 'running';
 
-  if (getOpenclawStatus() === 'running' && logs.toLowerCase().includes('connected')) {
+  if (isWhatsAppConnected(isRunning, logs)) {
     return res.json({ connected: true, qr: null });
   }
 
@@ -302,12 +316,14 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    // Restart openclaw service
+    // Restart openclaw service and wait 3s before responding
     exec('systemctl restart openclaw', (err) => {
       if (err) console.error('[configure] restart error:', err.message);
+      // Wait 3s before responding so openclaw has time to start
+      setTimeout(() => {
+        res.json({ success: true });
+      }, 3000);
     });
-
-    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -383,7 +399,7 @@ app.get('/channels', auth, (req, res) => {
     const env = readEnvFile();
     const logs = getJournalLogs(100);
     const isRunning = getOpenclawStatus() === 'running';
-    const waConnected = isRunning && logs.toLowerCase().includes('connected');
+    const waConnected = isWhatsAppConnected(isRunning, logs);
 
     res.json({
       whatsapp: {

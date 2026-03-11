@@ -81,7 +81,7 @@ async function createDropletAsync(
   }
 
   // Wait until VPS agent is responding on /health before exposing needs_config.
-  const agentReady = await waitForAgentReadiness(ip, agentSecret, 5 * 60 * 1000);
+  const agentReady = await waitForAgentReadiness(ip, agentSecret, 20 * 60 * 1000);
   if (!agentReady) {
     await updateInstance(instanceId, {
       droplet_ip: ip,
@@ -89,7 +89,7 @@ async function createDropletAsync(
       metadata: {
         droplet_name: droplet.name,
         agent_secret: agentSecret,
-        error: 'VPS agent não respondeu após 5 minutos',
+        error: 'VPS agent não respondeu após 20 minutos',
       },
     });
     return;

@@ -17,12 +17,23 @@ apt-get install -y curl wget git
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
 
-# ── OpenClaw ─────────────────────────────────────────────────────────────────
-npm install -g openclaw
+# ── OpenClaw (método oficial) ─────────────────────────────────────────────────
+apt-get install -y build-essential python3 python3-pip
 
-# ── openclaw user ────────────────────────────────────────────────────────────
+# Cria usuário dedicado para openclaw
 useradd -m -s /bin/bash openclaw || true
 mkdir -p /home/openclaw/.openclaw
+
+# Instala openclaw como o usuário openclaw via script oficial
+sudo -u openclaw bash -c '
+  export HOME=/home/openclaw
+  export OPENCLAW_HOME=/home/openclaw/.openclaw
+  curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
+'
+
+# Symlink para PATH global
+ln -sf /home/openclaw/.local/bin/openclaw /usr/local/bin/openclaw 2>/dev/null || \
+  ln -sf "$(sudo -u openclaw bash -c 'which openclaw 2>/dev/null')" /usr/local/bin/openclaw 2>/dev/null || true
 
 cat > /home/openclaw/.openclaw/config.json << 'CONFIGEOF'
 {
@@ -284,11 +295,25 @@ app.get('/health/detailed', auth, (req, res) => {
   }
 });
 
+// ── WhatsApp connection check helper ─────────────────────────────────────────
+function isWhatsAppConnected(isRunning, logs) {
+  if (!isRunning) return false;
+  const lower = logs.toLowerCase();
+  return (
+    lower.includes('whatsapp connected') ||
+    lower.includes('wa connected') ||
+    lower.includes('[whatsapp] connected') ||
+    lower.includes('client is ready') ||
+    lower.includes('connection opened')
+  );
+}
+
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogs(200);
+  const isRunning = getOpenclawStatus() === 'running';
 
-  if (getOpenclawStatus() === 'running' && logs.toLowerCase().includes('connected')) {
+  if (isWhatsAppConnected(isRunning, logs)) {
     return res.json({ connected: true, qr: null });
   }
 
@@ -356,12 +381,13 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    // Restart openclaw service
+    // Restart openclaw service and wait 3s before responding
     exec('systemctl restart openclaw', (err) => {
       if (err) console.error('[configure] restart error:', err.message);
+      setTimeout(() => {
+        res.json({ success: true });
+      }, 3000);
     });
-
-    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -437,7 +463,7 @@ app.get('/channels', auth, (req, res) => {
     const env = readEnvFile();
     const logs = getJournalLogs(100);
     const isRunning = getOpenclawStatus() === 'running';
-    const waConnected = isRunning && logs.toLowerCase().includes('connected');
+    const waConnected = isWhatsAppConnected(isRunning, logs);
 
     res.json({
       whatsapp: {
@@ -543,16 +569,19 @@ cd /opt/oriclaw-agent && npm install --omit=dev
 # ── OpenClaw systemd service ──────────────────────────────────────────────────
 cat > /etc/systemd/system/openclaw.service << 'SVCEOF'
 [Unit]
-Description=OpenClaw AI Assistant
+Description=OpenClaw Gateway
 After=network.target
 
 [Service]
 Type=simple
 User=openclaw
+Group=openclaw
 WorkingDirectory=/home/openclaw
-EnvironmentFile=/home/openclaw/.openclaw/.env
-ExecStart=/usr/local/bin/openclaw gateway start
-Restart=always
+Environment=HOME=/home/openclaw
+Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
+EnvironmentFile=-/home/openclaw/.openclaw/.env
+ExecStart=/home/openclaw/.local/bin/openclaw gateway start --headless
+Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
@@ -569,6 +598,7 @@ After=network.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=/opt/oriclaw-agent
 Environment=PORT=8080
 Environment=AGENT_SECRET=__AGENT_SECRET__
