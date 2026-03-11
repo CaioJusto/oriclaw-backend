@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
 import { provisionInstance, deprovisionInstance, suspendInstance } from '../services/provisioning';
+import { addCredits } from './credits';
 
 const router = Router();
 
@@ -69,6 +70,17 @@ router.post(
             : invoice.subscription?.id ?? null;
           if (subId) {
             await suspendInstance(subId);
+          }
+          break;
+        }
+
+        case 'payment_intent.succeeded': {
+          const pi = event.data.object as Stripe.PaymentIntent;
+          const customerId = pi.metadata?.customer_id;
+          const creditsBrl = parseFloat(pi.metadata?.credits_brl ?? '0');
+          if (customerId && creditsBrl > 0) {
+            await addCredits(customerId, creditsBrl);
+            console.log(`[webhook] Added R$${creditsBrl} credits to ${customerId}`);
           }
           break;
         }

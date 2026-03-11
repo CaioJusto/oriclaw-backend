@@ -59,34 +59,71 @@ function getJournalLogs(lines = 200) {
 }
 
 /**
+ * Read and parse the .env file into a plain object.
+ */
+function readEnvFile() {
+  const envMap = {};
+  try {
+    const content = fs.readFileSync(OPENCLAW_ENV_FILE, 'utf8');
+    content.split('\n').filter(Boolean).forEach((line) => {
+      const eq = line.indexOf('=');
+      if (eq > 0) {
+        const k = line.slice(0, eq).trim();
+        const v = line.slice(eq + 1).trim();
+        envMap[k] = v;
+      }
+    });
+  } catch { /* file may not exist yet */ }
+  return envMap;
+}
+
+/**
+ * Write a plain object back to the .env file, merging with existing values.
+ */
+function writeEnvFile(updates) {
+  const existing = readEnvFile();
+  const merged = { ...existing, ...updates };
+  const content = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  fs.mkdirSync(OPENCLAW_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
+  try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
+}
+
+/**
+ * Read config.json.
+ */
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_FILE, 'utf8')); } catch { return {}; }
+}
+
+/**
+ * Write config.json, merging with existing values.
+ */
+function writeConfig(updates) {
+  const config = { ...readConfig(), ...updates };
+  fs.mkdirSync(OPENCLAW_CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(OPENCLAW_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
+}
+
+/**
  * Extract QR data from OpenClaw logs.
- * OpenClaw prints the WhatsApp QR as a text string (the raw QR data URL / pairing code).
- * We look for lines containing "qr" (case-insensitive) and extract the data portion.
- * If the data looks like a WA QR payload we return it; otherwise null.
  */
 function extractQRData(logs) {
   const lines = logs.split('\n');
 
-  // Strategy 1: look for a line with "qr" keyword followed by a long base64/url-like token
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     const lower = line.toLowerCase();
 
-    // WhatsApp QR data typically looks like: "1@xxxx,yyyy,zzzz,wwww"
-    // or just a long base64 string
     if (lower.includes('qr') || lower.includes('scan')) {
-      // Extract the last whitespace-separated token that looks like QR data
-      // WA QR format: digits@base64,base64,base64,base64
       const waQR = line.match(/\d+@[A-Za-z0-9+/=,_-]{20,}/);
       if (waQR) return waQR[0];
-
-      // Fallback: a long base64 token
       const b64 = line.match(/[A-Za-z0-9+/]{40,}={0,2}/);
       if (b64) return b64[0];
     }
   }
 
-  // Strategy 2: scan for WA QR pattern anywhere in logs (last occurrence)
   const allWA = [...logs.matchAll(/\d+@[A-Za-z0-9+/=,_-]{20,}/g)];
   if (allWA.length) return allWA[allWA.length - 1][0];
 
@@ -106,7 +143,6 @@ app.get('/health', auth, (req, res) => {
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogs(200);
 
-  // Check if already connected (QR no longer present + service running)
   if (getOpenclawStatus() === 'running' && logs.toLowerCase().includes('connected')) {
     return res.json({ connected: true, qr: null });
   }
@@ -129,48 +165,41 @@ app.get('/qr', auth, async (req, res) => {
   }
 });
 
-// POST /configure  → body: { anthropic_key?, openai_key?, model?, assistant_name?, channel? }
+// POST /configure
+// body: { anthropic_key?, openai_key?, openrouter_key?, openai_token?,
+//         model?, assistant_name?, channel?,
+//         credits_mode?, chatgpt_mode? }
 app.post('/configure', auth, (req, res) => {
-  const { anthropic_key, openai_key, model, assistant_name, channel } = req.body || {};
+  const {
+    anthropic_key,
+    openai_key,
+    openrouter_key,
+    openai_token,
+    model,
+    assistant_name,
+    channel,
+    credits_mode,
+    chatgpt_mode,
+  } = req.body || {};
 
   try {
-    // Ensure config dir exists
-    fs.mkdirSync(OPENCLAW_CONFIG_DIR, { recursive: true });
+    // Update config.json
+    const configUpdates = {};
+    if (model) configUpdates.model = model;
+    if (channel) configUpdates.channel = channel;
+    if (assistant_name) configUpdates.assistant_name = assistant_name;
+    if (credits_mode) configUpdates.ai_mode = 'credits';
+    else if (chatgpt_mode) configUpdates.ai_mode = 'chatgpt';
+    else if (anthropic_key || openai_key || openrouter_key) configUpdates.ai_mode = 'byok';
+    writeConfig(configUpdates);
 
-    // Read existing config
-    let config = {};
-    try { config = JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_FILE, 'utf8')); } catch {}
-
-    // Update config
-    if (model) config.model = model;
-    if (channel) config.channel = channel;
-    if (assistant_name) config.assistant_name = assistant_name;
-    fs.writeFileSync(OPENCLAW_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
-
-    // Write .env file
-    const envLines = [];
-    if (anthropic_key) envLines.push(`ANTHROPIC_API_KEY=${anthropic_key}`);
-    if (openai_key) envLines.push(`OPENAI_API_KEY=${openai_key}`);
-
-    if (envLines.length > 0) {
-      // Merge with existing .env
-      let existing = '';
-      try { existing = fs.readFileSync(OPENCLAW_ENV_FILE, 'utf8'); } catch {}
-      const envMap = {};
-      existing.split('\n').filter(Boolean).forEach((l) => {
-        const [k, ...v] = l.split('=');
-        if (k) envMap[k.trim()] = v.join('=').trim();
-      });
-      envLines.forEach((l) => {
-        const [k, ...v] = l.split('=');
-        envMap[k.trim()] = v.join('=');
-      });
-      const merged = Object.entries(envMap).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
-      fs.writeFileSync(OPENCLAW_ENV_FILE, merged, 'utf8');
-
-      // Fix ownership
-      try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch {}
-    }
+    // Update .env
+    const envUpdates = {};
+    if (anthropic_key) envUpdates.ANTHROPIC_API_KEY = anthropic_key;
+    if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
+    if (openrouter_key) envUpdates.OPENROUTER_API_KEY = openrouter_key;
+    if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
+    if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
     // Restart openclaw service
     exec('systemctl restart openclaw', (err) => {
@@ -186,9 +215,7 @@ app.post('/configure', auth, (req, res) => {
 // POST /restart
 app.post('/restart', auth, (req, res) => {
   exec('systemctl restart openclaw', (err) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+    if (err) return res.status(500).json({ error: err.message });
     res.json({ success: true });
   });
 });
@@ -198,6 +225,109 @@ app.get('/logs', auth, (req, res) => {
   try {
     const lines = runCmd('journalctl -u openclaw -n 50 --no-pager --output=short-iso');
     res.json({ logs: lines });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Channel routes ────────────────────────────────────────────────────────────
+
+// GET /channels → status of each configured channel
+app.get('/channels', auth, (req, res) => {
+  try {
+    const config = readConfig();
+    const env = readEnvFile();
+    const logs = getJournalLogs(100);
+    const isRunning = getOpenclawStatus() === 'running';
+    const waConnected = isRunning && logs.toLowerCase().includes('connected');
+
+    res.json({
+      whatsapp: {
+        status: waConnected ? 'connected' : (isRunning ? 'disconnected' : 'disconnected'),
+        phone: config.whatsapp_phone || null,
+      },
+      telegram: {
+        status: env.TELEGRAM_BOT_TOKEN ? 'connected' : 'not_configured',
+        username: config.telegram_username || null,
+      },
+      discord: {
+        status: (env.DISCORD_BOT_TOKEN && config.discord_guild_id) ? 'connected' : 'not_configured',
+        guild: config.discord_guild_name || config.discord_guild_id || null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /channels/telegram → body: { token }
+app.post('/channels/telegram', auth, (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token is required' });
+
+  try {
+    writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
+
+    exec('systemctl restart openclaw', (err) => {
+      if (err) console.error('[telegram] restart error:', err.message);
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /channels/discord → body: { token, guild_id }
+app.post('/channels/discord', auth, (req, res) => {
+  const { token, guild_id } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token is required' });
+
+  try {
+    writeEnvFile({ DISCORD_BOT_TOKEN: token });
+    if (guild_id) writeConfig({ discord_guild_id: guild_id });
+
+    exec('systemctl restart openclaw', (err) => {
+      if (err) console.error('[discord] restart error:', err.message);
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /channels/:channel → disconnect a channel
+app.delete('/channels/:channel', auth, (req, res) => {
+  const { channel } = req.params;
+  const envKeyMap = {
+    telegram: 'TELEGRAM_BOT_TOKEN',
+    discord: 'DISCORD_BOT_TOKEN',
+  };
+
+  if (!envKeyMap[channel] && channel !== 'whatsapp') {
+    return res.status(400).json({ error: `Unknown channel: ${channel}` });
+  }
+
+  try {
+    if (channel === 'whatsapp') {
+      // For WhatsApp, just restart which clears the session
+      exec('systemctl restart openclaw', (err) => {
+        if (err) console.error('[wa-disconnect] restart error:', err.message);
+      });
+    } else {
+      const env = readEnvFile();
+      delete env[envKeyMap[channel]];
+      const content = Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+      fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
+      try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
+
+      exec('systemctl restart openclaw', (err) => {
+        if (err) console.error('[disconnect] restart error:', err.message);
+      });
+    }
+
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

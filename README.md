@@ -40,6 +40,16 @@ When a `customer.subscription.created` event fires:
 | POST | `/api/instances/:instance_id/update-apikey` | API_SECRET | Update Anthropic API key |
 | GET | `/api/instances/:instance_id/status` | — | Get instance + droplet status |
 | DELETE | `/api/instances/:instance_id` | API_SECRET | Destroy instance |
+| GET | `/api/proxy/:instance_id/channels` | Supabase token | Get all channel statuses |
+| POST | `/api/proxy/:instance_id/channels/telegram` | Supabase token | Configure Telegram bot |
+| POST | `/api/proxy/:instance_id/channels/discord` | Supabase token | Configure Discord bot |
+| DELETE | `/api/proxy/:instance_id/channels/:channel` | Supabase token | Disconnect a channel |
+| GET | `/api/proxy/:instance_id/openai-status` | Supabase token | Check ChatGPT Plus connection |
+| GET | `/api/credits` | Supabase token | Get credit balance |
+| POST | `/api/credits/purchase` | Supabase token | Create Stripe PaymentIntent |
+| GET | `/api/credits/:customer_id` | API_SECRET | Admin: get balance by customer |
+| GET | `/api/auth/openai/url/:instance_id` | Supabase token | Get OpenAI OAuth URL |
+| POST | `/api/auth/openai/exchange` | — | Exchange OAuth code for token |
 
 ### Auth
 
@@ -62,6 +72,10 @@ Copy `.env.example` to `.env` and fill in:
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (bypasses RLS) |
 | `API_SECRET` | Internal API secret for protected routes |
 | `PORT` | Server port (default: `3001`) |
+| `OPENAI_CLIENT_ID` | OpenAI OAuth app client ID (for ChatGPT Plus integration) |
+| `OPENAI_CLIENT_SECRET` | OpenAI OAuth app client secret |
+| `ORICLAW_OPENROUTER_KEY` | OpenRouter API key injected into VPS for Credits-mode customers |
+| `APP_URL` | Public URL of the Next.js dashboard (e.g. `https://oriclaw.com.br`) |
 
 ## Supabase Setup
 
@@ -84,7 +98,16 @@ CREATE TABLE oriclaw_instances (
 
 CREATE INDEX ON oriclaw_instances(customer_id);
 CREATE INDEX ON oriclaw_instances(stripe_subscription_id);
+
+-- Credits table for pay-as-you-go customers
+CREATE TABLE oriclaw_credits (
+  customer_id text PRIMARY KEY,
+  balance_brl numeric(10, 2) NOT NULL DEFAULT 0,
+  updated_at timestamptz DEFAULT now()
+);
 ```
+
+Also add `payment_intent.succeeded` to your Stripe webhook events (in addition to subscription events) so credit top-ups are processed automatically.
 
 ## Deploy to Railway
 

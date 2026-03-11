@@ -4,6 +4,8 @@ import cors from 'cors';
 import webhookRoutes from './routes/webhooks';
 import instanceRoutes from './routes/instances';
 import proxyRoutes from './routes/proxy';
+import creditsRoutes from './routes/credits';
+import authRoutes from './routes/auth';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -30,6 +32,8 @@ app.get('/health', (_req, res) => {
 app.use('/webhooks', webhookRoutes);
 app.use('/api/instances', instanceRoutes);
 app.use('/api/proxy', proxyRoutes);
+app.use('/api/credits', creditsRoutes);
+app.use('/api/auth', authRoutes);
 
 // 404 fallback
 app.use((_req, res) => {
