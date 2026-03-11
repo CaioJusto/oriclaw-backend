@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { requireApiSecret } from '../middleware/auth';
+import { requireAuth, sanitizeInstance } from '../middleware/requireAuth';
 import {
   getInstanceByCustomerId,
   getInstanceById,
@@ -47,22 +48,34 @@ router.post('/provision', requireApiSecret, async (req: Request, res: Response):
   }
 });
 
-// GET /api/instances/:customer_id
-router.get('/:customer_id', async (req: Request, res: Response): Promise<void> => {
+// GET /api/instances/:customer_id — requires Supabase JWT; returns only own instance
+router.get('/:customer_id', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const userId = (req as any).user?.id;
+  // Verify the requesting user matches the customer_id in the URL
+  if (userId !== req.params.customer_id) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
   try {
     const instance = await getInstanceByCustomerId(req.params.customer_id);
     if (!instance) {
       res.status(404).json({ error: 'Instance not found' });
       return;
     }
-    res.json(instance);
+    // Double-check ownership
+    if (instance.customer_id !== userId) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    res.json(sanitizeInstance(instance));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Query failed';
     res.status(500).json({ error: msg });
   }
 });
 
-// POST /api/instances/:instance_id/update-apikey
+// POST /api/instances/:instance_id/update-apikey — internal
 router.post('/:instance_id/update-apikey', requireApiSecret, async (req: Request, res: Response): Promise<void> => {
   const { api_key } = req.body as { api_key?: string };
 
@@ -80,12 +93,19 @@ router.post('/:instance_id/update-apikey', requireApiSecret, async (req: Request
   }
 });
 
-// GET /api/instances/:instance_id/status
-router.get('/:instance_id/status', async (req: Request, res: Response): Promise<void> => {
+// GET /api/instances/:instance_id/status — requires Supabase JWT + ownership
+router.get('/:instance_id/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  const userId = (req as any).user?.id;
   try {
     const instance = await getInstanceById(req.params.instance_id);
     if (!instance) {
       res.status(404).json({ error: 'Instance not found' });
+      return;
+    }
+
+    // Ownership check
+    if (instance.customer_id !== userId) {
+      res.status(403).json({ error: 'Forbidden' });
       return;
     }
 
@@ -113,7 +133,7 @@ router.get('/:instance_id/status', async (req: Request, res: Response): Promise<
   }
 });
 
-// DELETE /api/instances/:instance_id
+// DELETE /api/instances/:instance_id — internal
 router.delete('/:instance_id', requireApiSecret, async (req: Request, res: Response): Promise<void> => {
   try {
     const instance = await getInstanceById(req.params.instance_id);

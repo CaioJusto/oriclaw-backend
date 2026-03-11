@@ -105,6 +105,12 @@ CREATE TABLE oriclaw_credits (
   balance_brl numeric(10, 2) NOT NULL DEFAULT 0,
   updated_at timestamptz DEFAULT now()
 );
+
+-- Stripe webhook idempotency — prevents duplicate processing on retries/replays
+CREATE TABLE stripe_processed_events (
+  id text PRIMARY KEY, -- Stripe event.id (e.g. evt_xxx)
+  processed_at timestamptz DEFAULT now()
+);
 ```
 
 Also add `payment_intent.succeeded` to your Stripe webhook events (in addition to subscription events) so credit top-ups are processed automatically.
@@ -127,6 +133,7 @@ Also add `payment_intent.succeeded` to your Stripe webhook events (in addition t
    - `customer.subscription.created`
    - `customer.subscription.deleted`
    - `invoice.payment_failed`
+   - `checkout.session.completed`
 5. Copy the **Signing secret** → set as `STRIPE_WEBHOOK_SECRET` in Railway
 
 ## Local Development

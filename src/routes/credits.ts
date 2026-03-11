@@ -2,8 +2,8 @@
  * Credits routes — manage OriClaw credit balances for pay-as-you-go customers.
  *
  * Credits are stored in `oriclaw_credits` (customer_id, balance_brl, updated_at).
- * Purchases are handled via Stripe PaymentIntents; the webhook handler adds
- * credits to the balance when payment_intent.succeeded fires.
+ * Purchases are handled via Stripe Hosted Checkout; the webhook handler adds
+ * credits to the balance when checkout.session.completed fires (mode: 'payment').
  */
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -51,13 +51,14 @@ router.get('/', async (req: Request, res: Response): Promise<void> => {
 });
 
 // ── POST /api/credits/purchase ───────────────────────────────────────────────
-// Creates a Stripe PaymentIntent for a credit top-up.
-// Body: { amount_brl: 20 | 50 | 100 }
+// Creates a Stripe Hosted Checkout session for a credit top-up.
+// Body: { amount_brl: 20 | 50 | 100, instance_id?: string }
+// Returns: { payment_url }
 router.post('/purchase', async (req: Request, res: Response): Promise<void> => {
   const userId = await getUserId(req);
   if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
 
-  const { amount_brl } = req.body as { amount_brl?: number };
+  const { amount_brl } = req.body as { amount_brl?: number; instance_id?: string };
   if (!amount_brl || !VALID_AMOUNTS[amount_brl]) {
     res.status(400).json({
       error: `Invalid amount. Must be one of: ${Object.keys(VALID_AMOUNTS).join(', ')}`,
@@ -66,23 +67,29 @@ router.post('/purchase', async (req: Request, res: Response): Promise<void> => {
   }
 
   try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount_brl * 100, // centavos
-      currency: 'brl',
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{
+        price_data: {
+          currency: 'brl',
+          product_data: {
+            name: `OriClaw Créditos R$${amount_brl}`,
+            description: `≈${VALID_AMOUNTS[amount_brl].toLocaleString()} mensagens`,
+          },
+          unit_amount: amount_brl * 100, // centavos
+        },
+        quantity: 1,
+      }],
+      success_url: `${process.env.APP_URL}/dashboard?credits=success`,
+      cancel_url: `${process.env.APP_URL}/dashboard?credits=cancelled`,
       metadata: {
         customer_id: userId,
-        credits_brl: String(amount_brl),
+        amount_brl: String(amount_brl),
         messages_estimate: String(VALID_AMOUNTS[amount_brl]),
       },
-      description: `OriClaw créditos — R$${amount_brl} (≈${VALID_AMOUNTS[amount_brl].toLocaleString()} msgs)`,
     });
 
-    res.json({
-      client_secret: paymentIntent.client_secret,
-      payment_intent_id: paymentIntent.id,
-      amount_brl,
-      messages_estimate: VALID_AMOUNTS[amount_brl],
-    });
+    res.json({ payment_url: session.url });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Stripe error';
     console.error('[credits/purchase]', msg);
@@ -113,11 +120,11 @@ router.get('/:customer_id', async (req: Request, res: Response): Promise<void> =
 });
 
 /**
- * addCredits — called by the Stripe webhook when payment_intent.succeeded fires.
+ * addCredits — called by the Stripe webhook when checkout.session.completed fires
+ * (for mode: 'payment' credits purchases).
  * Upserts the oriclaw_credits row for customer_id.
  */
 export async function addCredits(customerId: string, amountBrl: number): Promise<void> {
-  // Try to update existing row first
   const { data: existing } = await supabase
     .from(CREDITS_TABLE)
     .select('balance_brl')
