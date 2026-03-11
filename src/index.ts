@@ -1,10 +1,19 @@
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import webhookRoutes from './routes/webhooks';
 import instanceRoutes from './routes/instances';
+import proxyRoutes from './routes/proxy';
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
+
+// CORS — allow dashboard origins
+app.use(cors({
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-secret'],
+}));
 
 // Stripe webhooks need raw body for signature verification
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
@@ -20,6 +29,7 @@ app.get('/health', (_req, res) => {
 // Routes
 app.use('/webhooks', webhookRoutes);
 app.use('/api/instances', instanceRoutes);
+app.use('/api/proxy', proxyRoutes);
 
 // 404 fallback
 app.use((_req, res) => {

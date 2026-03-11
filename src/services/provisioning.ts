@@ -1,4 +1,4 @@
-import { NodeSSH } from 'node-ssh';
+import crypto from 'crypto';
 import { createDroplet, deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
 import {
   createInstance,
@@ -6,12 +6,16 @@ import {
   getInstanceBySubscriptionId,
   updateInstance,
 } from './supabase';
+import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest } from '../types';
 
 export async function provisionInstance(
   req: ProvisionRequest
 ): Promise<{ instance_id: string; status: string }> {
   console.log(`[provision] Starting for customer: ${req.customer_id}`);
+
+  // Generate random agent secret for this instance
+  const agentSecret = crypto.randomBytes(32).toString('hex');
 
   // Create DB record first
   const instance = await createInstance({
@@ -23,11 +27,11 @@ export async function provisionInstance(
     status: 'provisioning',
     stripe_subscription_id: req.stripe_subscription_id ?? null,
     api_key_encrypted: req.api_key_anthropic ?? null,
-    metadata: null,
+    metadata: { agent_secret: agentSecret },
   });
 
   // Create DO Droplet (non-blocking — status will update async)
-  createDropletAsync(instance.id, req.customer_id).catch((err) => {
+  createDropletAsync(instance.id, req.customer_id, agentSecret).catch((err) => {
     console.error(`[provision] Droplet creation failed for ${instance.id}:`, err.message);
     updateInstance(instance.id, { status: 'suspended', metadata: { error: err.message } }).catch(
       console.error
@@ -37,13 +41,20 @@ export async function provisionInstance(
   return { instance_id: instance.id, status: 'provisioning' };
 }
 
-async function createDropletAsync(instanceId: string, customerId: string): Promise<void> {
-  const droplet = await createDroplet(customerId);
+async function createDropletAsync(
+  instanceId: string,
+  customerId: string,
+  agentSecret: string
+): Promise<void> {
+  // Inject agent secret into cloud-init
+  const cloudInit = CLOUD_INIT_SCRIPT.replace(/__AGENT_SECRET__/g, agentSecret);
+
+  const droplet = await createDropletWithInit(customerId, cloudInit);
   console.log(`[provision] Droplet created: ${droplet.id} for instance ${instanceId}`);
 
   await updateInstance(instanceId, {
     droplet_id: droplet.id,
-    metadata: { droplet_name: droplet.name },
+    metadata: { droplet_name: droplet.name, agent_secret: agentSecret },
   });
 
   // Poll for droplet IP (up to 3 minutes)
@@ -57,11 +68,12 @@ async function createDropletAsync(instanceId: string, customerId: string): Promi
 
   await updateInstance(instanceId, {
     droplet_ip: ip,
-    status: ip ? 'running' : 'provisioning',
+    // Once IP is obtained the VPS is booting — needs_config until user configures via dashboard
+    status: ip ? 'needs_config' : 'provisioning',
   });
 
   if (ip) {
-    console.log(`[provision] Instance ${instanceId} is running at ${ip}`);
+    console.log(`[provision] Instance ${instanceId} ready for config at ${ip}`);
   }
 }
 
@@ -92,39 +104,44 @@ export async function suspendInstance(subscriptionId: string): Promise<void> {
 }
 
 export async function updateApiKey(instanceId: string, apiKey: string): Promise<void> {
-  // Update in Supabase
   await updateInstance(instanceId, { api_key_encrypted: apiKey });
-
-  // Optionally SSH into droplet to update .env
-  const instance = await getInstanceById(instanceId);
-  if (!instance?.droplet_ip) {
-    console.warn(`[updateApiKey] No IP for instance ${instanceId}, skipping SSH`);
-    return;
-  }
-
-  try {
-    const ssh = new NodeSSH();
-    await ssh.connect({
-      host: instance.droplet_ip,
-      username: 'root',
-      // In production, use a private key stored securely
-      // privateKey: process.env.SSH_PRIVATE_KEY,
-      readyTimeout: 10_000,
-    });
-
-    await ssh.execCommand(
-      `echo "ANTHROPIC_API_KEY=${apiKey}" >> /home/openclaw/.env && ` +
-        `systemctl restart openclaw`
-    );
-
-    ssh.dispose();
-    console.log(`[updateApiKey] Updated API key on droplet for instance ${instanceId}`);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[updateApiKey] SSH failed (non-fatal): ${msg}`);
-  }
+  console.log(`[updateApiKey] Stored new API key for instance ${instanceId} (configure via /proxy)`);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Internal: create droplet with custom cloud-init ──────────────────────────
+import axios from 'axios';
+import { DODroplet, DODropletResponse } from '../types';
+
+const DO_API_BASE = 'https://api.digitalocean.com/v2';
+
+function getHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.DO_API_TOKEN}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function createDropletWithInit(customerId: string, cloudInit: string): Promise<DODroplet> {
+  const dropletConfig = {
+    name: `oriclaw-${customerId}`,
+    region: 'nyc3',
+    size: 's-1vcpu-2gb',
+    image: 'ubuntu-22-04-x64',
+    user_data: cloudInit,
+    tags: ['oriclaw', `customer:${customerId}`],
+    monitoring: true,
+    ipv6: false,
+  };
+
+  const response = await axios.post<DODropletResponse>(
+    `${DO_API_BASE}/droplets`,
+    dropletConfig,
+    { headers: getHeaders() }
+  );
+
+  return response.data.droplet;
 }

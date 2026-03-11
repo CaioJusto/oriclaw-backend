@@ -6,7 +6,7 @@ export interface OriClawInstance {
   plan: 'starter' | 'pro' | 'business';
   droplet_id: number | null;
   droplet_ip: string | null;
-  status: 'provisioning' | 'running' | 'suspended' | 'deleted';
+  status: 'provisioning' | 'needs_config' | 'running' | 'suspended' | 'deleted';
   stripe_subscription_id: string | null;
   api_key_encrypted: string | null;
   metadata: Record<string, unknown> | null;
