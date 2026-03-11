@@ -19,6 +19,15 @@ apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--fo
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
 
+# ── Firewall ─────────────────────────────────────────────────────────────────
+apt-get install -y ufw
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp    # SSH
+ufw allow 8080/tcp  # OriClaw VPS Agent
+ufw --force enable
+
 # ── OpenClaw (método oficial) ─────────────────────────────────────────────────
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential python3 python3-pip
 
@@ -509,9 +518,21 @@ app.get('/channels', auth, (req, res) => {
 });
 
 // POST /channels/telegram → body: { token }
-app.post('/channels/telegram', auth, (req, res) => {
+app.post('/channels/telegram', auth, async (req, res) => {
   const { token } = req.body || {};
-  if (!token) return res.status(400).json({ error: 'token is required' });
+  if (!token) return res.status(400).json({ error: 'Token é obrigatório.' });
+
+  // Validar token com a API do Telegram
+  try {
+    const tgRes = await fetch(\`https://api.telegram.org/bot\${token}/getMe\`);
+    const tgData = await tgRes.json();
+    if (!tgData.ok) {
+      return res.status(400).json({ error: 'Token do Telegram inválido. Verifique e tente novamente.' });
+    }
+    console.log(\`[channels] Telegram bot verified: @\${tgData.result.username}\`);
+  } catch (err) {
+    return res.status(500).json({ error: 'Não foi possível verificar o token. Tente novamente.' });
+  }
 
   try {
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
@@ -529,7 +550,9 @@ app.post('/channels/telegram', auth, (req, res) => {
 // POST /channels/discord → body: { token, guild_id }
 app.post('/channels/discord', auth, (req, res) => {
   const { token, guild_id } = req.body || {};
-  if (!token) return res.status(400).json({ error: 'token is required' });
+  if (!token || !guild_id) {
+    return res.status(400).json({ error: 'Token e ID do servidor (guild_id) são obrigatórios.' });
+  }
 
   try {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
@@ -619,6 +642,14 @@ StandardError=journal
 WantedBy=multi-user.target
 SVCEOF
 
+# ── VPS Agent env file (seguro) ──────────────────────────────────────────────
+cat > /etc/oriclaw-agent.env << 'ENVEOF'
+AGENT_SECRET=__AGENT_SECRET__
+PORT=8080
+ENVEOF
+chmod 600 /etc/oriclaw-agent.env
+chown root:root /etc/oriclaw-agent.env
+
 # ── VPS Agent systemd service ─────────────────────────────────────────────────
 cat > /etc/systemd/system/oriclaw-agent.service << 'AGENTEOF'
 [Unit]
@@ -629,8 +660,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/oriclaw-agent
-Environment=PORT=8080
-Environment=AGENT_SECRET=__AGENT_SECRET__
+EnvironmentFile=/etc/oriclaw-agent.env
 ExecStart=/usr/bin/node /opt/oriclaw-agent/server.js
 Restart=always
 RestartSec=5

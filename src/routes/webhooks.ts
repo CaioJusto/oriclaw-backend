@@ -1,8 +1,8 @@
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
-import { provisionInstance, deprovisionInstance, suspendInstance } from '../services/provisioning';
+import { provisionInstance, deprovisionInstance, suspendInstance, reactivateInstance } from '../services/provisioning';
 import { addCredits } from './credits';
-import { supabase, getInstanceBySubscriptionId, getInstanceByCustomerId } from '../services/supabase';
+import { supabase, getInstanceBySubscriptionId, getInstanceByCustomerId, updateInstance } from '../services/supabase';
 
 const router = Router();
 
@@ -124,6 +124,41 @@ router.post(
             : invoice.subscription?.id ?? null;
           if (subId) {
             await suspendInstance(subId);
+          }
+          break;
+        }
+
+        case 'invoice.payment_succeeded': {
+          const invoice = event.data.object as Stripe.Invoice;
+          const subId = typeof invoice.subscription === 'string'
+            ? invoice.subscription
+            : (invoice.subscription as Stripe.Subscription | null)?.id ?? null;
+          if (subId) {
+            try {
+              await reactivateInstance(subId);
+              console.log(`[webhook] Reactivated instance for subscription: ${subId}`);
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`[webhook] Failed to reactivate instance: ${msg}`);
+            }
+          }
+          break;
+        }
+
+        case 'customer.subscription.updated': {
+          const subscription = event.data.object as Stripe.Subscription;
+          const subId = subscription.id;
+          const instance = await getInstanceBySubscriptionId(subId);
+          if (!instance) break;
+
+          // Tentar extrair o plano do metadata do price ou do nickname
+          const planFromMeta = subscription.items.data[0]?.price?.metadata?.plan as string | undefined;
+          const planFromNickname = subscription.items.data[0]?.price?.nickname?.toLowerCase() as string | undefined;
+          const newPlan = planFromMeta ?? planFromNickname ?? null;
+
+          if (newPlan && ['starter', 'pro', 'business'].includes(newPlan)) {
+            await updateInstance(instance.id, { plan: newPlan as 'starter' | 'pro' | 'business' });
+            console.log(`[webhook] Updated plan to ${newPlan} for instance ${instance.id}`);
           }
           break;
         }

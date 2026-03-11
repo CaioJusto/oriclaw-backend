@@ -135,6 +135,21 @@ export async function suspendInstance(subscriptionId: string): Promise<void> {
   await updateInstance(instance.id, { status: 'suspended' });
 }
 
+export async function reactivateInstance(subscriptionId: string): Promise<void> {
+  const instance = await getInstanceBySubscriptionId(subscriptionId);
+  if (!instance) {
+    console.log(`[reactivate] No instance found for subscription: ${subscriptionId}`);
+    return;
+  }
+  if (instance.status === 'suspended') {
+    await updateInstance(instance.id, {
+      status: 'running',
+      metadata: { ...(instance.metadata ?? {}), reactivated_at: new Date().toISOString() },
+    });
+    console.log(`[reactivate] Instance ${instance.id} reactivated`);
+  }
+}
+
 export async function updateApiKey(instanceId: string, apiKey: string): Promise<void> {
   await updateInstance(instanceId, { api_key_encrypted: encrypt(apiKey) });
   console.log(`[updateApiKey] Stored new encrypted API key for instance ${instanceId} (configure via /proxy)`);

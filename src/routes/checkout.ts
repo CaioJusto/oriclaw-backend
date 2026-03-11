@@ -51,6 +51,7 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
       cancel_url: `${process.env.APP_URL}/checkout?plan=${plan}&cancelled=true`,
       metadata: { plan, supabase_user_id },
       subscription_data: {
+        trial_period_days: 7,
         metadata: { supabase_user_id, plan },
       },
     });

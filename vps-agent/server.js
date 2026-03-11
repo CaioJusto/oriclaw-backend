@@ -432,9 +432,21 @@ app.get('/channels', auth, (req, res) => {
 });
 
 // POST /channels/telegram → body: { token }
-app.post('/channels/telegram', auth, (req, res) => {
+app.post('/channels/telegram', auth, async (req, res) => {
   const { token } = req.body || {};
-  if (!token) return res.status(400).json({ error: 'token is required' });
+  if (!token) return res.status(400).json({ error: 'Token é obrigatório.' });
+
+  // Validar token com a API do Telegram
+  try {
+    const tgRes = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const tgData = await tgRes.json();
+    if (!tgData.ok) {
+      return res.status(400).json({ error: 'Token do Telegram inválido. Verifique e tente novamente.' });
+    }
+    console.log(`[channels] Telegram bot verified: @${tgData.result.username}`);
+  } catch (err) {
+    return res.status(500).json({ error: 'Não foi possível verificar o token. Tente novamente.' });
+  }
 
   try {
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
@@ -452,7 +464,9 @@ app.post('/channels/telegram', auth, (req, res) => {
 // POST /channels/discord → body: { token, guild_id }
 app.post('/channels/discord', auth, (req, res) => {
   const { token, guild_id } = req.body || {};
-  if (!token) return res.status(400).json({ error: 'token is required' });
+  if (!token || !guild_id) {
+    return res.status(400).json({ error: 'Token e ID do servidor (guild_id) são obrigatórios.' });
+  }
 
   try {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
