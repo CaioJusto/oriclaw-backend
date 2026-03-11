@@ -632,7 +632,7 @@ WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
 Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.local/bin/openclaw gateway start --headless
+ExecStart=/home/openclaw/.local/bin/openclaw gateway start
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

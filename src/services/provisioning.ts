@@ -142,9 +142,17 @@ export async function reactivateInstance(subscriptionId: string): Promise<void> 
     return;
   }
   if (instance.status === 'suspended') {
+    // Não reativar se a VPS nunca chegou a ter IP (falha de provisionamento)
+    const meta = instance.metadata as Record<string, unknown> | null;
+    const provisioningFailed = meta?.error && !instance.droplet_ip;
+    if (provisioningFailed) {
+      console.warn(`[reactivate] Instance ${instance.id} was suspended due to provisioning failure — not reactivating automatically`);
+      // Manter suspended — o suporte precisará intervir ou re-provisionar
+      return;
+    }
     await updateInstance(instance.id, {
       status: 'running',
-      metadata: { ...(instance.metadata ?? {}), reactivated_at: new Date().toISOString() },
+      metadata: { ...(meta ?? {}), reactivated_at: new Date().toISOString(), error: undefined },
     });
     console.log(`[reactivate] Instance ${instance.id} reactivated`);
   }

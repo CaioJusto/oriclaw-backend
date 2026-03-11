@@ -151,10 +151,11 @@ router.post(
           const instance = await getInstanceBySubscriptionId(subId);
           if (!instance) break;
 
-          // Tentar extrair o plano do metadata do price ou do nickname
+          // Tentar extrair o plano do metadata do price, subscription metadata ou do nickname
           const planFromMeta = subscription.items.data[0]?.price?.metadata?.plan as string | undefined;
+          const planFromSub = subscription.metadata?.plan as string | undefined;
           const planFromNickname = subscription.items.data[0]?.price?.nickname?.toLowerCase() as string | undefined;
-          const newPlan = planFromMeta ?? planFromNickname ?? null;
+          const newPlan = planFromMeta ?? planFromSub ?? planFromNickname ?? null;
 
           if (newPlan && ['starter', 'pro', 'business'].includes(newPlan)) {
             await updateInstance(instance.id, { plan: newPlan as 'starter' | 'pro' | 'business' });
@@ -214,8 +215,11 @@ router.post(
 
 function resolvePlan(subscription: Stripe.Subscription): 'starter' | 'pro' | 'business' {
   const item = subscription.items.data[0];
-  const metadata = item?.price?.metadata ?? {};
-  const plan = metadata['plan'] as string;
+  // Tenta ler do price metadata (se disponível)
+  const planFromPrice = item?.price?.metadata?.plan;
+  // Fallback: subscription metadata (definido no checkout via subscription_data.metadata)
+  const planFromSub = subscription.metadata?.plan;
+  const plan = planFromPrice ?? planFromSub;
 
   if (plan === 'pro') return 'pro';
   if (plan === 'business') return 'business';

@@ -3,6 +3,7 @@
  */
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
+import { supabase } from '../services/supabase';
 
 const router = Router();
 
@@ -34,6 +35,17 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
+  // Validar que o user autenticado bate com o supabase_user_id enviado
+  const authHeader = req.headers['authorization'] ?? '';
+  const token = (authHeader as string).replace(/^Bearer\s+/i, '').trim();
+  if (token) {
+    const { data: { user } } = await supabase.auth.getUser(token);
+    if (user && user.id !== supabase_user_id) {
+      res.status(403).json({ error: 'Acesso negado.' });
+      return;
+    }
+  }
+
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -41,7 +53,7 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
       line_items: [{
         price_data: {
           currency: 'brl',
-          product_data: { name: `OriClaw ${plan.charAt(0).toUpperCase() + plan.slice(1)}` },
+          product_data: { name: `OriClaw ${plan.charAt(0).toUpperCase() + plan.slice(1)}`, metadata: { plan } },
           unit_amount: PLAN_PRICES[plan],
           recurring: { interval: 'month' },
         },

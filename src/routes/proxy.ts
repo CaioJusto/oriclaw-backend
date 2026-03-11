@@ -9,7 +9,7 @@ import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import { supabase } from '../services/supabase';
 import { getInstanceById, updateInstance } from '../services/supabase';
-import { decrypt } from '../services/crypto';
+import { decrypt, encrypt } from '../services/crypto';
 
 const router = Router();
 
@@ -202,6 +202,18 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         if (body.model) metaUpdates.model = body.model as string;
       }
       await updateInstance(instance.id, { status: 'running', metadata: metaUpdates });
+
+      // Persist API key (encrypted) if a user-supplied key was provided
+      const keyToStore = (body.anthropic_key ?? body.openai_key ?? body.google_key ?? body.openrouter_key) as string | undefined;
+      if (!body.credits_mode && !body.chatgpt_mode && keyToStore && typeof keyToStore === 'string') {
+        try {
+          const encrypted = encrypt(keyToStore);
+          await updateInstance(instance.id, { api_key_encrypted: encrypted });
+        } catch (cryptoErr) {
+          console.warn('[proxy/configure] Failed to persist API key:', cryptoErr);
+          // Non-fatal — continua
+        }
+      }
     }
 
     res.json(data);
