@@ -9,6 +9,7 @@ import proxyRoutes from './routes/proxy';
 import creditsRoutes from './routes/credits';
 import authRoutes from './routes/auth';
 import checkoutRoutes from './routes/checkout';
+import billingRoutes from './routes/billing';
 
 // ── Required environment variable validation ──────────────────────────────────
 const REQUIRED_ENV_VARS = [
@@ -27,6 +28,7 @@ if (missingVars.length > 0) {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT ?? 3001;
 
 // ── Security headers ─────────────────────────────────────────────────────────
@@ -74,6 +76,7 @@ app.use('/api/proxy', proxyRoutes);
 app.use('/api/credits', creditsRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/checkout', checkoutRoutes);
+app.use('/api/billing', billingRoutes);
 
 // ── 404 fallback ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
