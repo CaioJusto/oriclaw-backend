@@ -7,18 +7,20 @@
 export const CLOUD_INIT_SCRIPT = `#!/bin/bash
 # OriClaw auto-provisioning script
 set -e
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 
 # ── System ───────────────────────────────────────────────────────────────────
 apt-get update -y
-apt-get upgrade -y
-apt-get install -y curl wget git
+apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git
 
 # ── Node.js 20 ───────────────────────────────────────────────────────────────
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt-get install -y nodejs
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
 
 # ── OpenClaw (método oficial) ─────────────────────────────────────────────────
-apt-get install -y build-essential python3 python3-pip
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential python3 python3-pip
 
 # Cria usuário dedicado para openclaw
 useradd -m -s /bin/bash openclaw || true
@@ -253,7 +255,7 @@ app.get('/health/detailed', auth, (req, res) => {
     let disk_used_gb = 0, disk_total_gb = 0;
     try {
       const dfOut = runCmd('df -BG / --output=size,used').trim();
-      const lines = dfOut.split('\\n').filter(l => !l.trim().startsWith('1G') && !l.trim().startsWith('Size'));
+      const lines = dfOut.split('\\n').filter(l => /^\\d/.test(l.trim()));
       const dataLine = lines.find(l => /\\d/.test(l)) || lines[lines.length - 1];
       if (dataLine) {
         const parts = dataLine.trim().split(/\\s+/);
@@ -391,12 +393,24 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    // Restart openclaw service and wait 3s before responding
-    exec('systemctl restart openclaw', (err) => {
-      if (err) console.error('[configure] restart error:', err.message);
-      setTimeout(() => {
-        res.json({ success: true });
-      }, 3000);
+    exec('systemctl restart openclaw', (restartErr) => {
+      if (restartErr) {
+        return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
+      }
+      // Poll até openclaw estar running ou timeout de 10s
+      let attempts = 0;
+      const poll = setInterval(() => {
+        attempts++;
+        const status = getOpenclawStatus();
+        if (status === 'running') {
+          clearInterval(poll);
+          return res.json({ success: true, openclaw: 'running' });
+        }
+        if (attempts >= 10) {
+          clearInterval(poll);
+          return res.json({ success: true, openclaw: status, warning: 'Assistente ainda iniciando, aguarde alguns segundos.' });
+        }
+      }, 1000);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

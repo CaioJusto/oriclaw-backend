@@ -10,6 +10,7 @@ import creditsRoutes from './routes/credits';
 import authRoutes from './routes/auth';
 import checkoutRoutes from './routes/checkout';
 import billingRoutes from './routes/billing';
+import { supabase } from './services/supabase';
 
 // ── Required environment variable validation ──────────────────────────────────
 const REQUIRED_ENV_VARS = [
@@ -19,11 +20,17 @@ const REQUIRED_ENV_VARS = [
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
   'ENCRYPTION_KEY',
+  'ORICLAW_OPENROUTER_KEY',
 ];
 
 const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
 if (missingVars.length > 0) {
   console.error(`[startup] FATAL: Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
+
+if (process.env.NODE_ENV === 'production' && !process.env.CORS_ORIGIN) {
+  console.error('[startup] FATAL: CORS_ORIGIN is required in production');
   process.exit(1);
 }
 
@@ -88,6 +95,32 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   console.error('[unhandled]', err.message);
   res.status(500).json({ error: err.message });
 });
+
+// ── Startup recovery ─────────────────────────────────────────────────────────
+async function recoverStuckProvisioningInstances() {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString(); // 30 min atrás
+    const { data: stuck } = await supabase
+      .from('oriclaw_instances')
+      .select('id')
+      .eq('status', 'provisioning')
+      .lt('created_at', cutoff);
+
+    if (stuck && stuck.length > 0) {
+      console.log(`[startup] Found ${stuck.length} stuck provisioning instance(s), marking as suspended`);
+      for (const inst of stuck) {
+        await supabase.from('oriclaw_instances').update({
+          status: 'suspended',
+          metadata: { error: 'Timeout de provisionamento — servidor não respondeu a tempo.' }
+        }).eq('id', inst.id);
+      }
+    }
+  } catch (err) {
+    console.warn('[startup] Could not check for stuck instances:', err);
+  }
+}
+
+recoverStuckProvisioningInstances();
 
 app.listen(PORT, () => {
   console.log(`🌀 OriClaw backend running on port ${PORT}`);

@@ -178,7 +178,7 @@ app.get('/health/detailed', auth, (req, res) => {
     let disk_used_gb = 0, disk_total_gb = 0;
     try {
       const dfOut = runCmd('df -BG / --output=size,used').trim();
-      const lines = dfOut.split('\n').filter(l => !l.trim().startsWith('1G') && !l.trim().startsWith('Size'));
+      const lines = dfOut.split('\n').filter(l => /^\d/.test(l.trim()));
       const dataLine = lines.find(l => /\d/.test(l)) || lines[lines.length - 1];
       if (dataLine) {
         const parts = dataLine.trim().split(/\s+/);
@@ -316,13 +316,24 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    // Restart openclaw service and wait 3s before responding
-    exec('systemctl restart openclaw', (err) => {
-      if (err) console.error('[configure] restart error:', err.message);
-      // Wait 3s before responding so openclaw has time to start
-      setTimeout(() => {
-        res.json({ success: true });
-      }, 3000);
+    exec('systemctl restart openclaw', (restartErr) => {
+      if (restartErr) {
+        return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
+      }
+      // Poll até openclaw estar running ou timeout de 10s
+      let attempts = 0;
+      const poll = setInterval(() => {
+        attempts++;
+        const status = getOpenclawStatus();
+        if (status === 'running') {
+          clearInterval(poll);
+          return res.json({ success: true, openclaw: 'running' });
+        }
+        if (attempts >= 10) {
+          clearInterval(poll);
+          return res.json({ success: true, openclaw: status, warning: 'Assistente ainda iniciando, aguarde alguns segundos.' });
+        }
+      }, 1000);
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
