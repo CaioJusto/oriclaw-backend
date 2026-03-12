@@ -19,6 +19,12 @@ const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_CONFIG_DIR, 'config.json');
 let isConfiguring = false;
 let isRestarting = false;
 
+// Safety valve: release locks after 60s to avoid permanent lockout
+// (covers edge cases where exec callback is never fired)
+const LOCK_TIMEOUT_MS = 60_000;
+let configuringTimer = null;
+let restartingTimer = null;
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const secret = req.headers['x-agent-secret'];
@@ -303,6 +309,12 @@ app.post('/configure', auth, (req, res) => {
     return res.status(429).json({ error: 'Configuração já em andamento. Aguarde.' });
   }
   isConfiguring = true;
+  // Safety valve: force-release lock after 60s
+  configuringTimer = setTimeout(() => {
+    console.error('[vps-agent] configure lock timed out — force-releasing');
+    isConfiguring = false;
+    configuringTimer = null;
+  }, LOCK_TIMEOUT_MS);
 
   const {
     anthropic_key,
@@ -344,9 +356,9 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    exec('sudo systemctl restart openclaw', (restartErr) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (restartErr) => {
       if (restartErr) {
-        isConfiguring = false;
+        clearTimeout(configuringTimer); configuringTimer = null; isConfiguring = false;
         return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
       }
       // Poll até openclaw estar running ou timeout de 10s
@@ -356,18 +368,18 @@ app.post('/configure', auth, (req, res) => {
         const status = getOpenclawStatus();
         if (status === 'running') {
           clearInterval(poll);
-          isConfiguring = false;
+          clearTimeout(configuringTimer); configuringTimer = null; isConfiguring = false;
           return res.json({ success: true, openclaw: 'running' });
         }
         if (attempts >= 10) {
           clearInterval(poll);
-          isConfiguring = false;
+          clearTimeout(configuringTimer); configuringTimer = null; isConfiguring = false;
           return res.json({ success: true, openclaw: status, warning: 'Assistente ainda iniciando, aguarde alguns segundos.' });
         }
       }, 1000);
     });
   } catch (err) {
-    isConfiguring = false;
+    clearTimeout(configuringTimer); configuringTimer = null; isConfiguring = false;
     res.status(500).json({ error: err.message });
   }
 });
@@ -378,12 +390,17 @@ app.post('/restart', auth, (req, res) => {
     return res.status(429).json({ error: 'Reinicialização já em andamento. Aguarde.' });
   }
   isRestarting = true;
+  restartingTimer = setTimeout(() => {
+    console.error('[vps-agent] restart lock timed out — force-releasing');
+    isRestarting = false;
+    restartingTimer = null;
+  }, LOCK_TIMEOUT_MS);
 
   const previous_status = getOpenclawStatus();
 
-  exec('sudo systemctl restart openclaw', (err) => {
+  exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
     if (err) {
-      isRestarting = false;
+      clearTimeout(restartingTimer); restartingTimer = null; isRestarting = false;
       return res.status(500).json({ error: err.message, previous_status, restarted: false });
     }
 
@@ -395,7 +412,7 @@ app.post('/restart', auth, (req, res) => {
       const new_status = getOpenclawStatus();
       if (new_status === 'running' || attempts >= maxAttempts) {
         clearInterval(poll);
-        isRestarting = false;
+        clearTimeout(restartingTimer); restartingTimer = null; isRestarting = false;
         res.json({ success: true, restarted: true, previous_status, new_status });
       }
     }, 1000);
