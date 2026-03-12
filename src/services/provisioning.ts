@@ -387,7 +387,7 @@ async function createDropletWithInit(customerId: string, cloudInit: string, size
 
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
-    region: 'nyc3',
+    region: 'nyc1',
     size,
     image: 'ubuntu-24-04-x64',
     user_data: cloudInit,
