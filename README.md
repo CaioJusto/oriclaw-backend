@@ -1,190 +1,291 @@
 # OriClaw Backend
 
-> Provisioning API that automatically creates DigitalOcean Droplets for OpenClaw customers when they pay via Stripe.
+Backend da plataforma **OriClaw** — SaaS que permite contratar um agente de IA com VPS dedicada em poucos cliques, voltado para o mercado brasileiro.
 
-## Architecture
+## O que é o OriClaw?
 
-```
-Stripe Webhook ──► POST /webhooks/stripe
-                         │
-                         ▼
-                  provisionInstance()
-                         │
-                 ┌───────┴────────┐
-                 ▼               ▼
-          DO Droplet         Supabase
-          (created)       (record saved)
-                 │
-                 ▼
-          Cloud-init runs
-          (OpenClaw installed)
-                 │
-                 ▼
-          Status → running
-```
+OriClaw é uma plataforma que provisiona automaticamente um agente de IA (baseado no OpenClaw) em uma VPS DigitalOcean exclusiva por cliente, com suporte a múltiplos canais (WhatsApp, Telegram, Discord) e múltiplos modos de IA (BYOK, Créditos OriClaw, ChatGPT Plus via OAuth).
 
-When a `customer.subscription.created` event fires:
-1. Saves a `provisioning` record to Supabase
-2. Fires off async droplet creation via DigitalOcean API
-3. Polls until the droplet gets a public IP
-4. Updates the record to `running`
-
-## API Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/health` | — | Health check |
-| POST | `/webhooks/stripe` | Stripe sig | Stripe event handler |
-| POST | `/api/instances/provision` | API_SECRET | Manually provision |
-| GET | `/api/instances/:customer_id` | — | Get instance by customer |
-| POST | `/api/instances/:instance_id/update-apikey` | API_SECRET | Update Anthropic API key |
-| GET | `/api/instances/:instance_id/status` | — | Get instance + droplet status |
-| DELETE | `/api/instances/:instance_id` | API_SECRET | Destroy instance |
-| GET | `/api/proxy/:instance_id/channels` | Supabase token | Get all channel statuses |
-| POST | `/api/proxy/:instance_id/channels/telegram` | Supabase token | Configure Telegram bot |
-| POST | `/api/proxy/:instance_id/channels/discord` | Supabase token | Configure Discord bot |
-| DELETE | `/api/proxy/:instance_id/channels/:channel` | Supabase token | Disconnect a channel |
-| GET | `/api/proxy/:instance_id/openai-status` | Supabase token | Check ChatGPT Plus connection |
-| GET | `/api/credits` | Supabase token | Get credit balance |
-| POST | `/api/credits/purchase` | Supabase token | Create Stripe PaymentIntent |
-| GET | `/api/credits/:customer_id` | API_SECRET | Admin: get balance by customer |
-| GET | `/api/auth/openai/url/:instance_id` | Supabase token | Get OpenAI OAuth URL |
-| POST | `/api/auth/openai/exchange` | — | Exchange OAuth code for token |
-
-### Auth
-
-Protected routes require the `x-api-secret` header (or `Authorization: Bearer <secret>`):
+## Arquitetura
 
 ```
-x-api-secret: oriclaw_internal_secret_2026
+┌─────────────────────────────────────────────────────────────────┐
+│                        Cliente Final                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTPS
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               Frontend — Next.js 14 (Vercel)                     │
+│           oriclaw.com.br  |  Supabase Auth                       │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ REST API
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│            Backend — Node.js/Express/TS (Railway)                │
+│   /api/instances  |  /api/billing  |  /api/channels  |  /api/ai │
+│                   Supabase (DB)  |  Stripe (billing)             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ DigitalOcean API
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│          VPS — DigitalOcean Droplet s-1vcpu-2gb                  │
+│               (uma por cliente, cloud-init)                       │
+│                                                                   │
+│   ┌─────────────────────┐   ┌──────────────────────────────┐    │
+│   │  VPS Agent :8080    │   │   OpenClaw Gateway :3000     │    │
+│   │  Express + Node.js  │──▶│  WhatsApp / Telegram / Discord│   │
+│   │  gerencia canais    │   │  Anthropic / OpenAI / Google  │   │
+│   └─────────────────────┘   └──────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## ENV Vars
+## Pré-requisitos
 
-Copy `.env.example` to `.env` and fill in:
+- **Node.js 20+**
+- **npm 9+**
+- Conta Supabase com projeto configurado
+- Conta Stripe com webhooks configurados
+- Token da API DigitalOcean
+- (Opcional) Conta OpenRouter para modo créditos OriClaw
+- (Opcional) App OAuth OpenAI para modo ChatGPT Plus
 
-| Variable | Description |
-|----------|-------------|
-| `DO_API_TOKEN` | DigitalOcean personal access token |
-| `STRIPE_SECRET_KEY` | Stripe secret key (`sk_test_...` or `sk_live_...`) |
-| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret (`whsec_...`) |
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (bypasses RLS) |
-| `API_SECRET` | Internal API secret for protected routes |
-| `PORT` | Server port (default: `3001`) |
-| `OPENAI_CLIENT_ID` | OpenAI OAuth app client ID (for ChatGPT Plus integration) |
-| `OPENAI_CLIENT_SECRET` | OpenAI OAuth app client secret |
-| `ORICLAW_OPENROUTER_KEY` | OpenRouter API key injected into VPS for Credits-mode customers |
-| `APP_URL` | Public URL of the Next.js dashboard (e.g. `https://oriclaw.com.br`) |
+## Variáveis de Ambiente
 
-## Supabase Setup
+Crie um arquivo `.env` na raiz do projeto com as seguintes variáveis:
 
-Run this SQL in your Supabase SQL editor:
+```env
+# ── Supabase ──────────────────────────────────────────────────────
+# URL do projeto Supabase (ex: https://xxxx.supabase.co)
+SUPABASE_URL=
+
+# Chave anon pública do Supabase (usada para auth no lado cliente)
+SUPABASE_ANON_KEY=
+
+# Chave service_role do Supabase (acesso admin ao banco — NUNCA expor no frontend)
+SUPABASE_SERVICE_ROLE_KEY=
+
+# ── Stripe ────────────────────────────────────────────────────────
+# Chave secreta da API Stripe (sk_live_... ou sk_test_...)
+STRIPE_SECRET_KEY=
+
+# Secret do webhook Stripe para validar assinaturas dos eventos
+STRIPE_WEBHOOK_SECRET=
+
+# ── DigitalOcean ──────────────────────────────────────────────────
+# Token de API do DigitalOcean para criar/deletar droplets
+DIGITALOCEAN_TOKEN=
+
+# ── Criptografia ──────────────────────────────────────────────────
+# Chave de criptografia AES-256-GCM — DEVE ser 64 caracteres hex
+# Gerar com: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# ATENÇÃO: Não alterar em produção sem migrar os dados criptografados existentes
+ENCRYPTION_KEY=
+
+# ── OriClaw / OpenRouter ──────────────────────────────────────────
+# Chave OpenRouter usada quando o cliente usa Créditos OriClaw (modo gerenciado)
+ORICLAW_OPENROUTER_KEY=
+
+# ── CORS ──────────────────────────────────────────────────────────
+# URL do frontend em produção (ex: https://oriclaw.com.br)
+# Usado para restringir CORS nas rotas da API
+CORS_ORIGIN=
+
+# ── Ambiente ──────────────────────────────────────────────────────
+# "development" | "production"
+NODE_ENV=development
+
+# ── OpenAI OAuth (ChatGPT Plus) ───────────────────────────────────
+# Client ID do app OAuth OpenAI — para modo ChatGPT Plus
+OPENAI_CLIENT_ID=
+
+# Client Secret do app OAuth OpenAI — para modo ChatGPT Plus
+OPENAI_CLIENT_SECRET=
+```
+
+## Rodando Localmente
+
+```bash
+# 1. Instalar dependências
+npm install
+
+# 2. Copiar e preencher variáveis de ambiente
+cp .env.example .env
+# edite o .env com suas chaves
+
+# 3. Iniciar servidor de desenvolvimento (com hot-reload)
+npm run dev
+```
+
+O servidor sobe em `http://localhost:3001` por padrão.
+
+## Deploy no Railway
+
+1. Conecte o repositório ao Railway via Dashboard ou CLI:
+   ```bash
+   railway link
+   ```
+
+2. Configure as variáveis de ambiente no Railway (Dashboard → Variables ou via CLI):
+   ```bash
+   railway variables set SUPABASE_URL=... STRIPE_SECRET_KEY=... # etc
+   ```
+
+3. O deploy acontece automaticamente a cada push na branch `main`.
+
+4. Para forçar um deploy manual:
+   ```bash
+   railway up --service oriclaw-backend --detach
+   ```
+
+5. Configure o webhook do Stripe apontando para:
+   ```
+   https://<seu-dominio-railway>/api/billing/webhook
+   ```
+
+## Estrutura de Pastas
+
+```
+oriclaw-backend/
+├── src/
+│   ├── routes/          # Rotas Express (instances, billing, channels, ai, auth)
+│   ├── services/        # Lógica de negócio
+│   │   ├── cloudInit.ts     # Geração do cloud-init para provisionar VPS
+│   │   ├── digitalOcean.ts  # Integração com API DO (criar/deletar droplets)
+│   │   ├── stripe.ts        # Integração Stripe (subscriptions, créditos)
+│   │   ├── supabase.ts      # Cliente Supabase admin
+│   │   └── crypto.ts        # encrypt() / decrypt() com AES-256-GCM
+│   ├── middleware/      # Auth, rate limiting, validação
+│   └── index.ts         # Entry point — configura Express e rotas
+├── vps-agent/
+│   └── server.js        # Código do agente que roda em cada droplet DO
+│                        # ⚠️ ESPELHADO em src/services/cloudInit.ts
+├── dist/                # Build TypeScript (gerado por npm run build)
+├── .env                 # Variáveis locais (não commitado)
+├── .env.example         # Template de variáveis
+├── package.json
+└── tsconfig.json
+```
+
+## Banco de Dados (Supabase)
+
+### Tabelas Necessárias
+
+#### `oriclaw_instances`
+Armazena cada instância de agente provisionada por cliente.
 
 ```sql
 CREATE TABLE oriclaw_instances (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at timestamptz DEFAULT now(),
-  customer_id text NOT NULL,
-  email text NOT NULL,
-  plan text NOT NULL, -- starter | pro | business
-  droplet_id bigint,
-  droplet_ip text,
-  status text DEFAULT 'provisioning', -- provisioning | running | suspended | deleted
-  stripe_subscription_id text,
-  api_key_encrypted text, -- store encrypted API key
-  metadata jsonb
+  id                            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  customer_id                   TEXT NOT NULL,          -- user_id do Supabase Auth
+  status                        TEXT NOT NULL DEFAULT 'provisioning',
+                                                        -- provisioning | active | suspended | error
+  plan                          TEXT NOT NULL,          -- starter | pro | business
+  droplet_id                    INTEGER,                -- ID do droplet no DigitalOcean
+  droplet_ip                    TEXT,                   -- IP público do droplet
+  agent_secret                  TEXT,                   -- Secret para autenticar no VPS agent (criptografado)
+  
+  -- Canais
+  whatsapp_enabled              BOOLEAN DEFAULT false,
+  telegram_enabled              BOOLEAN DEFAULT false,
+  discord_enabled               BOOLEAN DEFAULT false,
+  telegram_bot_token_encrypted  TEXT,
+  discord_bot_token_encrypted   TEXT,
+  discord_guild_id              TEXT,
+  
+  -- Modo IA
+  ai_mode                       TEXT DEFAULT 'credits', -- byok | credits | chatgpt_plus
+  ai_provider                   TEXT,                   -- anthropic | openai | google | openrouter
+  api_key_encrypted             TEXT,                   -- API key BYOK (criptografada)
+  openai_access_token_encrypted TEXT,                   -- OAuth token ChatGPT Plus (criptografado)
+  openai_refresh_token_encrypted TEXT,
+  
+  -- Stripe
+  stripe_subscription_id        TEXT,
+  stripe_customer_id            TEXT,
+  
+  created_at                    TIMESTAMPTZ DEFAULT now(),
+  updated_at                    TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX ON oriclaw_instances(customer_id);
-CREATE INDEX ON oriclaw_instances(stripe_subscription_id);
+-- RLS: usuário só vê suas próprias instâncias
+ALTER TABLE oriclaw_instances ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "owner_access" ON oriclaw_instances
+  USING (customer_id = auth.uid()::text);
+```
 
--- Credits table for pay-as-you-go customers
+#### `oriclaw_credits`
+Saldo de créditos para o modo gerenciado (OriClaw OpenRouter).
+
+```sql
 CREATE TABLE oriclaw_credits (
-  customer_id text PRIMARY KEY,
-  balance_brl numeric(10, 2) NOT NULL DEFAULT 0,
-  updated_at timestamptz DEFAULT now()
+  id          UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  customer_id TEXT NOT NULL UNIQUE,
+  balance     INTEGER NOT NULL DEFAULT 0,   -- créditos disponíveis
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  updated_at  TIMESTAMPTZ DEFAULT now()
 );
 
--- Atomic credits increment RPC (used by src/routes/credits.ts)
-CREATE OR REPLACE FUNCTION add_credits(p_customer_id text, p_amount numeric)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  INSERT INTO oriclaw_credits (customer_id, balance_brl, updated_at)
-  VALUES (p_customer_id, p_amount, now())
-  ON CONFLICT (customer_id)
-  DO UPDATE
-  SET
-    balance_brl = oriclaw_credits.balance_brl + EXCLUDED.balance_brl,
-    updated_at = now();
-END;
-$$;
+ALTER TABLE oriclaw_credits ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "owner_access" ON oriclaw_credits
+  USING (customer_id = auth.uid()::text);
+```
 
--- Stripe webhook idempotency — prevents duplicate processing on retries/replays
+#### `stripe_processed_events`
+Idempotência para webhooks Stripe — evita processar o mesmo evento duas vezes.
+
+```sql
 CREATE TABLE stripe_processed_events (
-  id text PRIMARY KEY, -- Stripe event.id (e.g. evt_xxx)
-  processed_at timestamptz DEFAULT now()
+  event_id    TEXT PRIMARY KEY,             -- stripe event ID (evt_...)
+  processed_at TIMESTAMPTZ DEFAULT now()
 );
 ```
 
-`addCredits()` calls this RPC with:
+## Fluxo de Provisionamento
 
-```ts
-await supabase.rpc('add_credits', { p_customer_id, p_amount });
+```
+1. Cliente faz checkout no Frontend (Stripe Checkout)
+         │
+         ▼
+2. Stripe dispara webhook → POST /api/billing/webhook
+         │
+         ▼
+3. Backend valida assinatura do webhook
+         │
+         ▼
+4. Evento checkout.session.completed → resolvePlan()
+         │
+         ▼
+5. createDroplet() → DigitalOcean API
+   - Cria droplet s-1vcpu-2gb na região nyc3
+   - Passa cloud-init com script de bootstrap
+         │
+         ▼
+6. cloud-init no droplet:
+   - Instala Node.js, npm, OpenClaw
+   - Copia código do VPS Agent (server.js)
+   - Configura UFW (porta 8080 liberada)
+   - Sobe VPS Agent como serviço systemd
+   - Sobe OpenClaw na porta 3000
+         │
+         ▼
+7. Backend salva instância no Supabase com status "active"
+         │
+         ▼
+8. Cliente vê painel com IP da VPS e pode conectar canais
 ```
 
-Also add `payment_intent.succeeded` to your Stripe webhook events (in addition to subscription events) so credit top-ups are processed automatically.
+## Planos Disponíveis
 
-## Deploy to Railway
+| Plano     | Preço      | Recursos                          |
+|-----------|------------|-----------------------------------|
+| Starter   | R$97/mês   | 1 canal, modo créditos            |
+| Pro       | R$147/mês  | 3 canais, BYOK ou créditos        |
+| Business  | R$247/mês  | canais ilimitados, todos os modos |
 
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
-3. Select `CaioJusto/oriclaw-backend`
-4. Add all ENV vars in the Railway dashboard (Variables tab)
-5. Railway auto-detects `npm run build` + `npm start`
-6. Copy your Railway public URL (e.g. `https://oriclaw-backend.up.railway.app`)
+## Segurança
 
-## Configure Stripe Webhook
-
-1. Go to [Stripe Dashboard → Webhooks](https://dashboard.stripe.com/webhooks)
-2. Click **Add endpoint**
-3. URL: `https://your-railway-url.up.railway.app/webhooks/stripe`
-4. Select events:
-   - `customer.subscription.created`
-   - `customer.subscription.deleted`
-   - `invoice.payment_failed`
-   - `checkout.session.completed`
-5. Copy the **Signing secret** → set as `STRIPE_WEBHOOK_SECRET` in Railway
-
-## Local Development
-
-```bash
-# Install deps
-npm install
-
-# Copy env
-cp .env.example .env
-# Fill in real values
-
-# Dev server with hot reload
-npm run dev
-
-# Build TypeScript
-npm run build
-
-# Start production build
-npm start
-```
-
-## DigitalOcean Droplet Spec
-
-| Field | Value |
-|-------|-------|
-| Region | `nyc3` (New York 3) |
-| Size | `s-1vcpu-2gb` ($12/month) |
-| Image | `ubuntu-22-04-x64` |
-| Tags | `oriclaw`, `customer:<id>` |
-
-The cloud-init script automatically installs Node.js 20 + OpenClaw globally, creates an `openclaw` system user, and sets up a systemd service that starts on boot.
+- API keys de clientes são **sempre** criptografadas com AES-256-GCM antes de salvar
+- Cada instância tem um `agent_secret` único para autenticar no VPS agent
+- VPS protegida com UFW (apenas portas 22, 8080, 3000)
+- `sanitizeInstance()` remove campos sensíveis antes de qualquer resposta ao frontend
+- Rate limiting por `user_id` (não por IP, pois o proxy Next.js compartilha IPs)
