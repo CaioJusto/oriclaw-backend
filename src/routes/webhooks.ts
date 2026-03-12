@@ -123,8 +123,26 @@ router.post(
               // Bind subscription ID to the stub created by checkout.session.completed
               await updateInstance(existingInstance.id, { stripe_subscription_id: subscription.id });
               console.log(`[webhook] Bound subscription ${subscription.id} to stub instance ${existingInstance.id}`);
+            } else if (existingInstance.stripe_subscription_id === subscription.id) {
+              // Exact same subscription delivered twice (Stripe retry) — idempotent no-op
+              console.log(`[webhook] Subscription ${subscription.id} already bound to instance ${existingInstance.id}, skipping`);
             } else {
-              console.log(`[webhook] Instance already exists for user ${supabaseUserId}, skipping`);
+              // The user already has an active subscription bound to this instance.
+              // Cancel the NEW duplicate subscription so they aren't double-billed.
+              // (The existing subscription is still valid; the user should manage it
+              // via the billing portal or update their payment method.)
+              console.warn(
+                `[webhook] User ${supabaseUserId} already has subscription ` +
+                `${existingInstance.stripe_subscription_id} — cancelling duplicate ${subscription.id}`
+              );
+              try {
+                await stripe.subscriptions.cancel(subscription.id);
+              } catch (dupCancelErr: unknown) {
+                console.error(
+                  '[webhook] Failed to cancel duplicate subscription:',
+                  dupCancelErr instanceof Error ? dupCancelErr.message : String(dupCancelErr)
+                );
+              }
             }
             break;
           }
