@@ -13,9 +13,9 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
 
 // Plan prices in centavos (BRL)
 const PLAN_PRICES: Record<string, number> = {
-  starter: 9700,
-  pro: 14700,
-  business: 24700,
+  starter: 12000,
+  pro: 24000,
+  business: 48000,
 };
 
 // ── POST /api/checkout/session ────────────────────────────────────────────────
