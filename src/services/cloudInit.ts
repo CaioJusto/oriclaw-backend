@@ -812,7 +812,7 @@ Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
 Environment=OPENCLAW_NO_RESPAWN=1
 Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway
+ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway --allow-unconfigured
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=90
