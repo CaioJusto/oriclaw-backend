@@ -1,6 +1,8 @@
 'use strict';
 
 const express = require('express');
+const https = require('https');
+const crypto = require('crypto');
 const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -11,6 +13,8 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const AGENT_SECRET = process.env.AGENT_SECRET || '';
+const TLS_CERT = process.env.TLS_CERT_PATH || '/etc/oriclaw-agent/tls/cert.pem';
+const TLS_KEY = process.env.TLS_KEY_PATH || '/etc/oriclaw-agent/tls/key.pem';
 const OPENCLAW_CONFIG_DIR = '/home/openclaw/.openclaw';
 const OPENCLAW_ENV_FILE = path.join(OPENCLAW_CONFIG_DIR, '.env');
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_CONFIG_DIR, 'config.json');
@@ -25,14 +29,62 @@ const LOCK_TIMEOUT_MS = 60_000;
 let configuringTimer = null;
 let restartingTimer = null;
 
-// ── Auth middleware ──────────────────────────────────────────────────────────
+// ── Auth rate limiting ───────────────────────────────────────────────────────
+const authFailures = new Map(); // ip → { count, lastAttempt }
+const AUTH_RATE_WINDOW_MS = 60_000;
+const AUTH_MAX_FAILURES = 5;
+
 function auth(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  // Check if IP is rate-limited
+  const record = authFailures.get(ip);
+  if (record && record.count >= AUTH_MAX_FAILURES && (now - record.lastAttempt) < AUTH_RATE_WINDOW_MS) {
+    return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+  }
+
   const secret = req.headers['x-agent-secret'];
-  if (!AGENT_SECRET || secret !== AGENT_SECRET) {
+  if (!AGENT_SECRET || !secret || typeof secret !== 'string') {
+    // Track failure
+    const current = authFailures.get(ip) || { count: 0, lastAttempt: 0 };
+    if (now - current.lastAttempt > AUTH_RATE_WINDOW_MS) {
+      current.count = 1;
+    } else {
+      current.count++;
+    }
+    current.lastAttempt = now;
+    authFailures.set(ip, current);
     return res.status(401).json({ error: 'Unauthorized' });
   }
+
+  const secretBuf = Buffer.from(secret);
+  const expectedBuf = Buffer.from(AGENT_SECRET);
+  if (secretBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(secretBuf, expectedBuf)) {
+    // Track failure
+    const current = authFailures.get(ip) || { count: 0, lastAttempt: 0 };
+    if (now - current.lastAttempt > AUTH_RATE_WINDOW_MS) {
+      current.count = 1; // reset window
+    } else {
+      current.count++;
+    }
+    current.lastAttempt = now;
+    authFailures.set(ip, current);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Successful auth — clear failures for this IP
+  authFailures.delete(ip);
   next();
 }
+
+// Cleanup stale auth failure records every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of authFailures) {
+    if (now - record.lastAttempt > AUTH_RATE_WINDOW_MS * 2) authFailures.delete(ip);
+  }
+}, 5 * 60_000);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function runCmd(cmd) {
@@ -333,11 +385,16 @@ app.post('/configure', auth, (req, res) => {
   } = req.body || {};
 
   try {
-    // Update config.json
+    // Update config.json — validate model, channel, assistant_name inputs
+    const VALID_MODELS = ['claude-sonnet-4-5', 'claude-3-5-haiku-latest', 'claude-opus-4', 'gpt-4o', 'gpt-4o-mini'];
+    const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
+    const safeModel = model && VALID_MODELS.includes(model) ? model : null;
+    const safeChannel = channel && VALID_CHANNELS.includes(channel) ? channel : null;
+    const safeName = assistant_name ? String(assistant_name).slice(0, 64).replace(/[^\w\s\-]/g, '') : null;
     const configUpdates = {};
-    if (model) configUpdates.model = model;
-    if (channel) configUpdates.channel = channel;
-    if (assistant_name) configUpdates.assistant_name = assistant_name;
+    if (safeModel) configUpdates.model = safeModel;
+    if (safeChannel) configUpdates.channel = safeChannel;
+    if (safeName) configUpdates.assistant_name = safeName;
     if (credits_mode) configUpdates.ai_mode = 'credits';
     else if (chatgpt_mode) configUpdates.ai_mode = 'chatgpt';
     else if (anthropic_key || openai_key || google_key || openrouter_key) configUpdates.ai_mode = 'byok';
@@ -509,7 +566,7 @@ app.post('/channels/telegram', auth, async (req, res) => {
   try {
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
 
-    exec('sudo systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
       if (err) console.error('[telegram] restart error:', err.message);
     });
 
@@ -520,17 +577,37 @@ app.post('/channels/telegram', auth, async (req, res) => {
 });
 
 // POST /channels/discord → body: { token, guild_id }
-app.post('/channels/discord', auth, (req, res) => {
+// Validate Discord bot token and guild_id before saving
+app.post('/channels/discord', auth, async (req, res) => {
   const { token, guild_id } = req.body || {};
   if (!token || !guild_id) {
     return res.status(400).json({ error: 'Token e ID do servidor (guild_id) são obrigatórios.' });
+  }
+
+  // Validate guild_id is numeric
+  if (!/^\d+$/.test(guild_id)) {
+    return res.status(400).json({ error: 'guild_id deve ser um número.' });
+  }
+
+  // Validate Discord bot token against the API
+  try {
+    const discordRes = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${token}` }
+    });
+    if (!discordRes.ok) {
+      return res.status(400).json({ error: 'Token Discord inválido. Verifique o bot token.' });
+    }
+    const botInfo = await discordRes.json();
+    console.log(`[channels] Discord bot verified: ${botInfo.username}`);
+  } catch (err) {
+    return res.status(500).json({ error: 'Não foi possível verificar o token Discord. Tente novamente.' });
   }
 
   try {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
     if (guild_id) writeConfig({ discord_guild_id: guild_id });
 
-    exec('sudo systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
       if (err) console.error('[discord] restart error:', err.message);
     });
 
@@ -555,11 +632,13 @@ app.delete('/channels/:channel', auth, (req, res) => {
   try {
     if (channel === 'whatsapp') {
       // Delete WhatsApp session files so the bot doesn't auto-reconnect
+      // Respond immediately, then fire-and-forget the restart
+      res.json({ success: true });
       exec(
         'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && sudo systemctl restart openclaw',
+        { timeout: 30_000 },
         (err) => {
-          if (err) console.error('[channels] WhatsApp disconnect error:', err.message);
-          setTimeout(() => res.json({ success: true }), 3000);
+          if (err) console.error('[vps-agent] restart after whatsapp disconnect failed:', err.message);
         }
       );
       return;
@@ -570,7 +649,7 @@ app.delete('/channels/:channel', auth, (req, res) => {
       fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
       try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
 
-      exec('sudo systemctl restart openclaw', (err) => {
+      exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
         if (err) console.error('[disconnect] restart error:', err.message);
       });
     }
@@ -581,7 +660,18 @@ app.delete('/channels/:channel', auth, (req, res) => {
   }
 });
 
-// ── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🌀 OriClaw VPS Agent running on port ${PORT}`);
-});
+// ── Start (HTTPS with self-signed TLS, fallback to HTTP) ─────────────────────
+try {
+  const tls = {
+    key: require('fs').readFileSync(TLS_KEY),
+    cert: require('fs').readFileSync(TLS_CERT),
+  };
+  https.createServer(tls, app).listen(PORT, () => {
+    console.log(`🔒 OriClaw VPS Agent running on HTTPS port ${PORT}`);
+  });
+} catch (err) {
+  console.warn('⚠️  TLS certs not found, falling back to HTTP:', err.message);
+  app.listen(PORT, () => {
+    console.log(`🌀 OriClaw VPS Agent running on HTTP port ${PORT} (no TLS)`);
+  });
+}

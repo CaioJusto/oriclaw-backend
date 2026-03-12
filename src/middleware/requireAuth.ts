@@ -19,12 +19,36 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   next();
 }
 
+/**
+ * Shared auth helper — extracts user ID from Bearer token.
+ * Used by routes that don't use requireAuth middleware.
+ */
+export async function getUserId(req: Request): Promise<string | null> {
+  const authHeader = req.headers['authorization'] ?? '';
+  const token = (authHeader as string).replace(/^Bearer\s+/i, '').trim();
+  if (!token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user.id;
+}
+
 // Bug fix #7: typed parameter instead of `any`
 export function sanitizeInstance(instance: OriClawInstance) {
   if (!instance) return instance;
   const { api_key_encrypted, ...rest } = instance;
   if (rest.metadata) {
-    const { agent_secret, openai_access_token, openai_access_token_encrypted, openai_api_key_encrypted, openrouter_key, ...safeMetadata } = rest.metadata;
+    const {
+      agent_secret,
+      openai_access_token,
+      openai_access_token_encrypted,
+      openai_api_key_encrypted,
+      openrouter_key,
+      droplet_name: _dropletName,
+      telegram_bot_token_encrypted: _tg,
+      discord_bot_token_encrypted: _dc,
+      openai_refresh_token_encrypted: _oauthRefresh,
+      ...safeMetadata
+    } = rest.metadata;
     rest.metadata = safeMetadata;
   }
   return rest;

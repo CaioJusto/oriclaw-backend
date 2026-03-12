@@ -163,7 +163,7 @@ async function recoverStuckProvisioningInstances() {
       console.log(`[startup] Found ${stuck.length} stuck provisioning instance(s), marking as suspended`);
 
       // Lazy-init Stripe only when needed (key already validated at startup)
-      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' });
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2026-02-25.clover' });
 
       for (const inst of stuck) {
         // Fetch existing metadata AND stripe_subscription_id to cancel the sub

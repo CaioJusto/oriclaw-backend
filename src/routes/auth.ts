@@ -12,20 +12,11 @@
  */
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
-import { getInstanceById, getInstanceByCustomerId, updateInstance, supabase } from '../services/supabase';
+import { getInstanceById, getInstanceByCustomerId, updateInstance } from '../services/supabase';
 import { encrypt } from '../services/crypto';
+import { getUserId } from '../middleware/requireAuth';
 
 const router = Router();
-
-// ── Auth helper ──────────────────────────────────────────────────────────────
-async function getUserId(req: Request): Promise<string | null> {
-  const authHeader = req.headers['authorization'] ?? '';
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return data.user.id;
-}
 
 // ── POST /api/auth/openai/key ────────────────────────────────────────────────
 // Receives an OpenAI API key, encrypts it, and stores it in the instance metadata.

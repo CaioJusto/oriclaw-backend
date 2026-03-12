@@ -52,7 +52,7 @@ export async function provisionInstance(
       status: 'provisioning',
       stripe_subscription_id: req.stripe_subscription_id ?? null,
       api_key_encrypted: req.api_key_anthropic ? encrypt(req.api_key_anthropic) : null,
-      metadata: { agent_secret: agentSecret },
+      metadata: { agent_secret: encrypt(agentSecret) },
     });
   } catch (dbErr) {
     // If the DB insert fails, release the reserved slot before re-throwing
@@ -72,7 +72,7 @@ export async function provisionInstance(
       // Bug fix #2: preserve agent_secret and add suspended_reason
       updateInstance(instance.id, {
         status: 'suspended',
-        metadata: { agent_secret: agentSecret, error: msg, suspended_reason: 'provisioning_failed' },
+        metadata: { agent_secret: encrypt(agentSecret), error: msg, suspended_reason: 'provisioning_failed' },
       }).catch(console.error);
     })
     .finally(() => {
@@ -107,7 +107,7 @@ async function cancelSubscriptionForInstance(
     } catch { /* ignore — best effort */ }
   }
   if (!subId) return;
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2026-02-25.clover' });
   try {
     await stripe.subscriptions.cancel(subId);
     console.log(`[provision] Cancelled Stripe subscription ${subId} after provisioning failure for instance ${instanceId}`);
@@ -126,8 +126,13 @@ async function createDropletAsync(
   agentSecret: string,
   stripeSubId: string | null
 ): Promise<void> {
-  // Inject agent secret into cloud-init
-  const cloudInit = CLOUD_INIT_SCRIPT.replace(/__AGENT_SECRET__/g, agentSecret);
+  // Generate gateway token for OpenClaw UI auth
+  const gatewayToken = crypto.randomBytes(32).toString('hex');
+
+  // Inject agent secret and gateway token into cloud-init
+  const cloudInit = CLOUD_INIT_SCRIPT
+    .replace(/__AGENT_SECRET__/g, agentSecret)
+    .replace(/__GATEWAY_TOKEN__/g, gatewayToken);
 
   // Get instance to determine plan-based droplet size
   const instanceForPlan = await getInstanceById(instanceId);
@@ -140,7 +145,7 @@ async function createDropletAsync(
   if (!currentAfterCreate || currentAfterCreate.status === 'deleted') return;
   await updateInstance(instanceId, {
     droplet_id: droplet.id,
-    metadata: { droplet_name: droplet.name, agent_secret: agentSecret },
+    metadata: { droplet_name: droplet.name, agent_secret: encrypt(agentSecret) },
   });
 
   // Poll for droplet IP (up to 3 minutes)
@@ -160,7 +165,7 @@ async function createDropletAsync(
       status: 'suspended',
       metadata: {
         droplet_name: droplet.name,
-        agent_secret: agentSecret,
+        agent_secret: encrypt(agentSecret),
         error: 'Droplet não obteve IP em tempo hábil',
         suspended_reason: 'provisioning_failed_no_ip',
       },
@@ -179,7 +184,7 @@ async function createDropletAsync(
       status: 'suspended',
       metadata: {
         droplet_name: droplet.name,
-        agent_secret: agentSecret,
+        agent_secret: encrypt(agentSecret),
         error: 'VPS agent não respondeu após 20 minutos',
         suspended_reason: 'provisioning_failed_agent_timeout',
       },
@@ -195,7 +200,7 @@ async function createDropletAsync(
   await updateInstance(instanceId, {
     droplet_ip: ip,
     status: 'needs_config',
-    metadata: { droplet_name: droplet.name, agent_secret: agentSecret },
+    metadata: { droplet_name: droplet.name, agent_secret: encrypt(agentSecret) },
   });
 
   console.log(`[provision] Instance ${instanceId} ready for config at ${ip}`);
@@ -220,6 +225,20 @@ export async function deprovisionInstance(subscriptionId: string): Promise<void>
         metadata: { ...(instance.metadata ?? {}), error: msg },
       });
       return;
+    }
+
+    // Verify droplet is actually gone (DO API returns 404 for deleted droplets)
+    try {
+      await getDroplet(instance.droplet_id);
+      // If we get here, droplet still exists — mark as deletion_failed
+      console.warn(`[deprovision] Droplet ${instance.droplet_id} still exists after DELETE`);
+      await updateInstance(instance.id, {
+        status: 'deletion_failed',
+        metadata: { ...(instance.metadata ?? {}), error: 'Droplet still exists after deletion request' },
+      });
+      return;
+    } catch {
+      // 404 = droplet is gone, which is what we want
     }
   }
 
@@ -318,9 +337,10 @@ async function waitForAgentReadiness(
 
   while (Date.now() < deadline) {
     try {
-      const response = await axios.get(`http://${ip}:8080/health`, {
+      const response = await axios.get(`https://${ip}:8080/health`, {
         headers: { 'x-agent-secret': agentSecret },
         timeout: 2_000,
+        httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
       });
 
       if (response.status === 200) {
@@ -351,7 +371,7 @@ async function createDropletWithInit(customerId: string, cloudInit: string, size
     name: `oriclaw-${customerId}`,
     region: 'nyc3',
     size,
-    image: 'ubuntu-22-04-x64',
+    image: 'ubuntu-24-04-x64',
     user_data: cloudInit,
     tags: ['oriclaw', `customer:${customerId}`],
     monitoring: true,

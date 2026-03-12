@@ -7,25 +7,20 @@
  */
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
+import https from 'https';
+import path from 'path';
 import { supabase } from '../services/supabase';
 import { getInstanceById, updateInstance } from '../services/supabase';
 import { decrypt, encrypt } from '../services/crypto';
+import { getUserId } from '../middleware/requireAuth';
+
+// Accept self-signed TLS certs from VPS agents
+const vpsHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 const router = Router();
 
 const COST_PER_MESSAGE_BRL = 0.02; // R$0.02 deducted per AI message in credits mode
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// ── Auth helper ──────────────────────────────────────────────────────────────
-async function getUserFromRequest(req: Request): Promise<string | null> {
-  const authHeader = req.headers['authorization'] ?? '';
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return data.user.id;
-}
 
 // ── Instance ownership check + VPS URL builder ──────────────────────────────
 async function resolveInstance(instanceId: string, userId: string, checkCredits = false) {
@@ -43,9 +38,15 @@ async function resolveInstance(instanceId: string, userId: string, checkCredits 
   if (!instance.droplet_ip) {
     throw Object.assign(new Error('Servidor ainda inicializando. Tente novamente em alguns minutos.'), { status: 503 });
   }
-  const agentSecret = (instance.metadata as Record<string, unknown>)?.agent_secret as string | undefined;
-  if (!agentSecret) {
+  const agentSecretEncrypted = (instance.metadata as Record<string, unknown>)?.agent_secret as string | undefined;
+  if (!agentSecretEncrypted) {
     throw Object.assign(new Error('Agent secret missing for instance'), { status: 500 });
+  }
+  let agentSecret: string;
+  try {
+    agentSecret = decrypt(agentSecretEncrypted);
+  } catch {
+    throw Object.assign(new Error('Failed to decrypt agent secret'), { status: 500 });
   }
 
   // ── Bug fix #5: Block proxy requests when credits balance is depleted ──────
@@ -67,11 +68,16 @@ async function resolveInstance(instanceId: string, userId: string, checkCredits 
     }
   }
 
-  return { instance, baseUrl: `http://${instance.droplet_ip}:8080`, agentSecret };
+  return { instance, baseUrl: `https://${instance.droplet_ip}:8080`, agentSecret };
 }
 
 function agentHeaders(secret: string) {
   return { 'x-agent-secret': secret, 'Content-Type': 'application/json' };
+}
+
+/** Axios config for VPS agent calls (includes TLS agent for self-signed certs) */
+function agentAxiosConfig(secret: string, timeout = 15_000) {
+  return { headers: agentHeaders(secret), timeout, httpsAgent: vpsHttpsAgent };
 }
 
 // ── Middleware: auth + resolve instance ─────────────────────────────────────
@@ -87,7 +93,7 @@ async function withInstance(
     return;
   }
   try {
-    const userId = await getUserFromRequest(req);
+    const userId = await getUserId(req);
     if (!userId) {
       res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
       return;
@@ -108,6 +114,7 @@ router.get('/:instance_id/health', async (req: Request, res: Response): Promise<
     const { data } = await axios.get(`${baseUrl}/health`, {
       headers: agentHeaders(agentSecret),
       timeout: 10_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -263,9 +270,21 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       if (error) console.warn('[audit] failed to write to DB:', error.message);
     });
 
-    const { data } = await axios.post(`${baseUrl}/configure`, body, {
+    // Whitelist allowed fields to prevent arbitrary config injection
+    const ALLOWED_CONFIGURE_FIELDS = [
+      'anthropic_key', 'openai_key', 'google_key', 'openrouter_key',
+      'openai_token', 'model', 'assistant_name', 'channel',
+      'credits_mode', 'chatgpt_mode', 'system_prompt', 'language', 'timezone',
+    ];
+    const sanitizedBody: Record<string, unknown> = {};
+    for (const key of ALLOWED_CONFIGURE_FIELDS) {
+      if (key in body) sanitizedBody[key] = body[key];
+    }
+
+    const { data } = await axios.post(`${baseUrl}/configure`, sanitizedBody, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
+      httpsAgent: vpsHttpsAgent,
     });
 
     // Persist ai_mode and status in Supabase instance record
@@ -332,6 +351,7 @@ router.post('/:instance_id/restart', async (req: Request, res: Response): Promis
     const { data } = await axios.post(`${baseUrl}/restart`, {}, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -343,6 +363,7 @@ router.get('/:instance_id/logs', async (req: Request, res: Response): Promise<vo
     const { data } = await axios.get(`${baseUrl}/logs`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -371,6 +392,7 @@ router.post('/:instance_id/channels/telegram', async (req: Request, res: Respons
     const { data } = await axios.post(`${baseUrl}/channels/telegram`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -382,6 +404,7 @@ router.post('/:instance_id/channels/discord', async (req: Request, res: Response
     const { data } = await axios.post(`${baseUrl}/channels/discord`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -391,10 +414,16 @@ router.post('/:instance_id/channels/discord', async (req: Request, res: Response
 router.delete('/:instance_id/channels/:channel', async (req: Request, res: Response): Promise<void> => {
   await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
     const channel = req.params.channel;
+    const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
+    if (!VALID_CHANNELS.includes(channel)) {
+      res.status(400).json({ error: 'Canal inválido.' });
+      return;
+    }
     console.log(`[audit] disconnect: user=${userId} instance=${instance?.id} channel=${channel} ip=${req.ip}`);
     const { data } = await axios.delete(`${baseUrl}/channels/${channel}`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
+      httpsAgent: vpsHttpsAgent,
     });
     res.json(data);
   });
@@ -424,7 +453,12 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
 */
 router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<void> => {
   await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
-    const subPath = (req.params as Record<string, string>)[0] ?? '';
+    const rawSubPath = (req.params as Record<string, string>)[0] ?? '';
+    const subPath = path.posix.normalize(rawSubPath).replace(/^\/+/, '');
+    if (subPath.includes('..')) {
+      res.status(400).json({ error: 'Invalid path.' });
+      return;
+    }
     try {
       const { data } = await axios({
         method: req.method,
@@ -432,6 +466,7 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
         headers: { ...agentHeaders(agentSecret) },
         data: req.body,
         timeout: 60_000,
+        httpsAgent: vpsHttpsAgent,
       });
 
       // Deduct per-message credit cost for credits-mode users after successful response
@@ -460,7 +495,7 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
 // Returns whether the instance has a ChatGPT Plus OAuth token stored.
 router.get('/:instance_id/openai-status', async (req: Request, res: Response): Promise<void> => {
   try {
-    const userId = await getUserFromRequest(req);
+    const userId = await getUserId(req);
     if (!userId) { res.status(401).json({ error: 'Não autorizado. Faça login novamente.' }); return; }
 
     const instance = await getInstanceById(req.params.instance_id);

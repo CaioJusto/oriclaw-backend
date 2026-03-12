@@ -11,6 +11,19 @@ const TABLE = 'oriclaw_instances';
 export async function createInstance(
   data: Omit<OriClawInstance, 'id' | 'created_at'>
 ): Promise<OriClawInstance> {
+  // Guard against duplicate provisioning from concurrent webhooks
+  const { data: existing } = await supabase
+    .from(TABLE)
+    .select('id')
+    .eq('customer_id', data.customer_id)
+    .neq('status', 'deleted')
+    .limit(1)
+    .maybeSingle();
+
+  if (existing) {
+    throw new Error(`Instance already exists for customer ${data.customer_id}`);
+  }
+
   const { data: row, error } = await supabase
     .from(TABLE)
     .insert(data)
@@ -68,6 +81,17 @@ export async function updateInstance(
   instanceId: string,
   updates: Partial<OriClawInstance>
 ): Promise<OriClawInstance> {
+  if (updates.metadata) {
+    const { data: existing } = await supabase
+      .from(TABLE)
+      .select('metadata')
+      .eq('id', instanceId)
+      .single();
+
+    const existingMeta = (existing?.metadata ?? {}) as Record<string, unknown>;
+    updates.metadata = { ...existingMeta, ...(updates.metadata as Record<string, unknown>) };
+  }
+
   const { data, error } = await supabase
     .from(TABLE)
     .update(updates)

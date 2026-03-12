@@ -15,7 +15,9 @@ export function encrypt(text: string): string {
 export function decrypt(encryptedText: string): string {
   if (!ENCRYPTION_KEY) throw new Error('ENCRYPTION_KEY not set');
   const key = Buffer.from(ENCRYPTION_KEY, 'hex');
-  const [ivHex, tagHex, dataHex] = encryptedText.split(':');
+  const parts = encryptedText.split(':');
+  if (parts.length !== 3) throw new Error('Invalid encrypted data format');
+  const [ivHex, tagHex, dataHex] = parts;
   const iv = Buffer.from(ivHex, 'hex');
   const tag = Buffer.from(tagHex, 'hex');
   const data = Buffer.from(dataHex, 'hex');

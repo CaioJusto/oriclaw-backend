@@ -8,7 +8,7 @@ import { supabase } from '../services/supabase';
 const router = Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2023-10-16',
+  apiVersion: '2026-02-25.clover',
 });
 
 // Plan prices in centavos (BRL)
@@ -49,9 +49,22 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
   }
 
   try {
+    const { data: existingInstance } = await supabase
+      .from('oriclaw_instances')
+      .select('id')
+      .eq('customer_id', supabase_user_id)
+      .neq('status', 'deleted')
+      .limit(1)
+      .maybeSingle();
+
+    if (existingInstance) {
+      res.status(409).json({ error: 'Você já possui uma instância ativa' });
+      return;
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email,
+      customer_email: user.email ?? email,
       line_items: [{
         price_data: {
           currency: 'brl',

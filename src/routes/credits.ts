@@ -8,11 +8,12 @@
 import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
 import { supabase } from '../services/supabase';
+import { getUserId } from '../middleware/requireAuth';
 
 const router = Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2023-10-16',
+  apiVersion: '2026-02-25.clover',
 });
 
 const CREDITS_TABLE = 'oriclaw_credits';
@@ -23,16 +24,6 @@ const VALID_AMOUNTS: Record<number, number> = {
   50: 3000,
   100: 7000,
 };
-
-// ── Auth helper ──────────────────────────────────────────────────────────────
-async function getUserId(req: Request): Promise<string | null> {
-  const authHeader = req.headers['authorization'] ?? '';
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  if (!token) return null;
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return data.user.id;
-}
 
 // ── GET /api/credits ─────────────────────────────────────────────────────────
 // Returns current credit balance for the authenticated user.

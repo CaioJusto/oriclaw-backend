@@ -7,7 +7,7 @@ import { supabase, getInstanceBySubscriptionId, getInstanceByCustomerId, updateI
 const router = Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2023-10-16',
+  apiVersion: '2026-02-25.clover',
 });
 
 const PROCESSED_EVENTS_TABLE = 'stripe_processed_events';
@@ -170,9 +170,8 @@ router.post(
 
         case 'invoice.payment_failed': {
           const invoice = event.data.object as Stripe.Invoice;
-          const subId = typeof invoice.subscription === 'string'
-            ? invoice.subscription
-            : invoice.subscription?.id ?? null;
+          const subRef = invoice.parent?.subscription_details?.subscription ?? null;
+          const subId = typeof subRef === 'string' ? subRef : subRef?.id ?? null;
           if (subId) {
             await suspendInstance(subId);
           }
@@ -181,9 +180,8 @@ router.post(
 
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object as Stripe.Invoice;
-          const subId = typeof invoice.subscription === 'string'
-            ? invoice.subscription
-            : (invoice.subscription as Stripe.Subscription | null)?.id ?? null;
+          const subRef2 = invoice.parent?.subscription_details?.subscription ?? null;
+          const subId = typeof subRef2 === 'string' ? subRef2 : subRef2?.id ?? null;
           if (subId) {
             try {
               await reactivateInstance(subId);

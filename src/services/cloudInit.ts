@@ -16,7 +16,7 @@ apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--fo
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git || true
 
 # ── Node.js 20 ───────────────────────────────────────────────────────────────
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
@@ -25,9 +25,17 @@ ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    # SSH
-ufw allow 8080/tcp  # OriClaw VPS Agent
-ufw allow 3000/tcp  # OpenClaw UI
+# Port 8080 (VPS Agent) — rate-limited via agent, auth via agent_secret
+# Ideally restrict to backend IP, but Railway uses dynamic IPs
+ufw allow 8080/tcp
+# Port 3000 (OpenClaw UI) — protected by OPENCLAW_GATEWAY_TOKEN
+ufw allow 3000/tcp
 ufw --force enable
+
+# ── Harden SSH ──────────────────────────────────────────────────────────────
+sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+if sshd -t -q 2>/dev/null; then systemctl restart sshd; fi
 
 # ── OpenClaw (método oficial) ─────────────────────────────────────────────────
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential python3 python3-pip || true
@@ -41,7 +49,7 @@ for attempt in 1 2 3; do
   sudo -u openclaw bash -c '
     export HOME=/home/openclaw
     export OPENCLAW_HOME=/home/openclaw/.openclaw
-    curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
+    curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard
   ' && break
   echo "[oriclaw] openclaw install attempt $attempt failed, retrying in 15s..."
   sleep 15
@@ -61,10 +69,17 @@ else
   exit 1
 fi
 
-cat > /home/openclaw/.openclaw/config.json << 'CONFIGEOF'
+cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
 {
   "model": "claude-sonnet-4-5",
-  "channel": "whatsapp"
+  "channel": "whatsapp",
+  "gateway": {
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "__GATEWAY_TOKEN__"
+    }
+  }
 }
 CONFIGEOF
 
@@ -92,6 +107,8 @@ cat > /opt/oriclaw-agent/server.js << 'SERVEREOF'
 'use strict';
 
 const express = require('express');
+const https = require('https');
+const crypto = require('crypto');
 const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -102,6 +119,8 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const AGENT_SECRET = process.env.AGENT_SECRET || '';
+const TLS_CERT = process.env.TLS_CERT_PATH || '/etc/oriclaw-agent/tls/cert.pem';
+const TLS_KEY = process.env.TLS_KEY_PATH || '/etc/oriclaw-agent/tls/key.pem';
 const OPENCLAW_CONFIG_DIR = '/home/openclaw/.openclaw';
 const OPENCLAW_ENV_FILE = path.join(OPENCLAW_CONFIG_DIR, '.env');
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_CONFIG_DIR, 'config.json');
@@ -115,14 +134,62 @@ const LOCK_TIMEOUT_MS = 60_000;
 let configuringTimer = null;
 let restartingTimer = null;
 
-// ── Auth middleware ──────────────────────────────────────────────────────────
+// ── Auth rate limiting ───────────────────────────────────────────────────────
+const authFailures = new Map(); // ip → { count, lastAttempt }
+const AUTH_RATE_WINDOW_MS = 60_000;
+const AUTH_MAX_FAILURES = 5;
+
 function auth(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  // Check if IP is rate-limited
+  const record = authFailures.get(ip);
+  if (record && record.count >= AUTH_MAX_FAILURES && (now - record.lastAttempt) < AUTH_RATE_WINDOW_MS) {
+    return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+  }
+
   const secret = req.headers['x-agent-secret'];
-  if (!AGENT_SECRET || secret !== AGENT_SECRET) {
+  if (!AGENT_SECRET || !secret || typeof secret !== 'string') {
+    // Track failure
+    const current = authFailures.get(ip) || { count: 0, lastAttempt: 0 };
+    if (now - current.lastAttempt > AUTH_RATE_WINDOW_MS) {
+      current.count = 1;
+    } else {
+      current.count++;
+    }
+    current.lastAttempt = now;
+    authFailures.set(ip, current);
     return res.status(401).json({ error: 'Unauthorized' });
   }
+
+  const secretBuf = Buffer.from(secret);
+  const expectedBuf = Buffer.from(AGENT_SECRET);
+  if (secretBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(secretBuf, expectedBuf)) {
+    // Track failure
+    const current = authFailures.get(ip) || { count: 0, lastAttempt: 0 };
+    if (now - current.lastAttempt > AUTH_RATE_WINDOW_MS) {
+      current.count = 1;
+    } else {
+      current.count++;
+    }
+    current.lastAttempt = now;
+    authFailures.set(ip, current);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Successful auth — clear failures for this IP
+  authFailures.delete(ip);
   next();
 }
+
+// Cleanup stale auth failure records every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of authFailures) {
+    if (now - record.lastAttempt > AUTH_RATE_WINDOW_MS * 2) authFailures.delete(ip);
+  }
+}, 5 * 60_000);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function runCmd(cmd) {
@@ -695,10 +762,21 @@ app.delete('/channels/:channel', auth, (req, res) => {
   }
 });
 
-// ── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(\`🌀 OriClaw VPS Agent running on port \${PORT}\`);
-});
+// ── Start (HTTPS with self-signed cert) ──────────────────────────────────────
+try {
+  const tlsOptions = {
+    key: fs.readFileSync(TLS_KEY),
+    cert: fs.readFileSync(TLS_CERT),
+  };
+  https.createServer(tlsOptions, app).listen(PORT, () => {
+    console.log(\`🌀 OriClaw VPS Agent running on HTTPS port \${PORT}\`);
+  });
+} catch (tlsErr) {
+  console.warn('[vps-agent] TLS cert not found, falling back to HTTP:', tlsErr.message);
+  app.listen(PORT, () => {
+    console.log(\`🌀 OriClaw VPS Agent running on HTTP port \${PORT} (no TLS)\`);
+  });
+}
 
 SERVEREOF
 
@@ -721,16 +799,30 @@ Group=openclaw
 WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
 Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
+Environment=OPENCLAW_NO_RESPAWN=1
+Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.local/bin/openclaw gateway start
+ExecStart=/home/openclaw/.local/bin/openclaw gateway
 Restart=on-failure
 RestartSec=10
+TimeoutStartSec=90
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
+
+mkdir -p /var/tmp/openclaw-compile-cache
+chown openclaw:openclaw /var/tmp/openclaw-compile-cache
+
+# ── Generate self-signed TLS certificate for VPS Agent ────────────────────────
+mkdir -p /etc/oriclaw-agent/tls
+openssl req -x509 -newkey rsa:2048 -keyout /etc/oriclaw-agent/tls/key.pem \
+  -out /etc/oriclaw-agent/tls/cert.pem -days 3650 -nodes \
+  -subj "/CN=oriclaw-vps-agent" 2>/dev/null
+chmod 600 /etc/oriclaw-agent/tls/key.pem
+chmod 644 /etc/oriclaw-agent/tls/cert.pem
 
 # ── VPS Agent env file (seguro) ──────────────────────────────────────────────
 cat > /etc/oriclaw-agent.env << 'ENVEOF'
@@ -762,6 +854,7 @@ chmod 440 /etc/sudoers.d/oriclaw-agent
 chown oriclaw-agent:oriclaw-agent /etc/oriclaw-agent.env
 chmod 600 /etc/oriclaw-agent.env
 chown -R oriclaw-agent:oriclaw-agent /opt/oriclaw-agent 2>/dev/null || true
+chown -R oriclaw-agent:oriclaw-agent /etc/oriclaw-agent 2>/dev/null || true
 
 # ── VPS Agent systemd service ─────────────────────────────────────────────────
 cat > /etc/systemd/system/oriclaw-agent.service << 'AGENTEOF'
