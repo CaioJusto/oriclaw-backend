@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import zlib from 'zlib';
 import axios from 'axios';
 import Stripe from 'stripe';
 import { deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
@@ -129,10 +130,18 @@ async function createDropletAsync(
   // Generate gateway token for OpenClaw UI auth
   const gatewayToken = crypto.randomBytes(32).toString('hex');
 
-  // Inject agent secret and gateway token into cloud-init
-  const cloudInit = CLOUD_INIT_SCRIPT
+  // Inject agent secret and gateway token into cloud-init, then compress
+  // to stay under DigitalOcean's 16KB user_data limit.
+  const rawScript = CLOUD_INIT_SCRIPT
     .replace(/__AGENT_SECRET__/g, agentSecret)
     .replace(/__GATEWAY_TOKEN__/g, gatewayToken);
+  const compressed = zlib.gzipSync(Buffer.from(rawScript, 'utf8'));
+  const b64 = compressed.toString('base64');
+  const cloudInit = `#!/bin/bash
+echo '${b64}' | base64 -d | gunzip > /tmp/oriclaw-init.sh
+chmod +x /tmp/oriclaw-init.sh
+/tmp/oriclaw-init.sh
+`;
 
   // Get instance to determine plan-based droplet size
   const instanceForPlan = await getInstanceById(instanceId);
