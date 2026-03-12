@@ -12,10 +12,10 @@ export NEEDRESTART_MODE=a
 
 # ── System ───────────────────────────────────────────────────────────────────
 apt-get update -y
-apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+# Skip apt-get upgrade — base image is already up-to-date, saves ~3 min
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git || true
 
-# ── Node.js 20 ───────────────────────────────────────────────────────────────
+# ── Node.js 22 ───────────────────────────────────────────────────────────────
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
 
