@@ -54,6 +54,8 @@ async function createDropletAsync(
   const droplet = await createDropletWithInit(customerId, cloudInit);
   console.log(`[provision] Droplet created: ${droplet.id} for instance ${instanceId}`);
 
+  const currentAfterCreate = await getInstanceById(instanceId);
+  if (!currentAfterCreate || currentAfterCreate.status === 'deleted') return;
   await updateInstance(instanceId, {
     droplet_id: droplet.id,
     metadata: { droplet_name: droplet.name, agent_secret: agentSecret },
@@ -95,6 +97,11 @@ async function createDropletAsync(
     return;
   }
 
+  const current = await getInstanceById(instanceId);
+  if (!current || current.status === 'suspended' || current.status === 'deleted') {
+    console.warn(`[provision] Instance ${instanceId} is ${current?.status} — aborting needs_config transition`);
+    return;
+  }
   await updateInstance(instanceId, {
     droplet_ip: ip,
     status: 'needs_config',
@@ -150,11 +157,13 @@ export async function reactivateInstance(subscriptionId: string): Promise<void> 
       // Manter suspended — o suporte precisará intervir ou re-provisionar
       return;
     }
+    const wasConfigured = !!(meta?.ai_mode);
+    const newStatus = wasConfigured ? 'running' : 'needs_config';
     await updateInstance(instance.id, {
-      status: 'running',
+      status: newStatus,
       metadata: { ...(meta ?? {}), reactivated_at: new Date().toISOString(), error: undefined },
     });
-    console.log(`[reactivate] Instance ${instance.id} reactivated`);
+    console.log(`[reactivate] Instance ${instance.id} reactivated to ${newStatus}`);
   }
 }
 
@@ -221,7 +230,7 @@ async function createDropletWithInit(customerId: string, cloudInit: string): Pro
   const response = await axios.post<DODropletResponse>(
     `${DO_API_BASE}/droplets`,
     dropletConfig,
-    { headers: getHeaders() }
+    { headers: getHeaders(), timeout: 30_000 }
   );
 
   return response.data.droplet;

@@ -15,7 +15,7 @@ function getHeaders() {
 export async function getDroplet(dropletId: number): Promise<DODroplet> {
   const response = await axios.get<DODropletResponse>(
     `${DO_API_BASE}/droplets/${dropletId}`,
-    { headers: getHeaders() }
+    { headers: getHeaders(), timeout: 15_000 }
   );
 
   return response.data.droplet;
@@ -25,6 +25,7 @@ export async function deleteDroplet(dropletId: number): Promise<void> {
   try {
     await axios.delete(`${DO_API_BASE}/droplets/${dropletId}`, {
       headers: getHeaders(),
+      timeout: 15_000,
     });
   } catch (err: unknown) {
     // Bug fix #3: treat 404 as success — droplet was already deleted (idempotent)
