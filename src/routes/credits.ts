@@ -93,7 +93,8 @@ router.post('/purchase', async (req: Request, res: Response): Promise<void> => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Stripe error';
     console.error('[credits/purchase]', msg);
-    res.status(500).json({ error: msg });
+    const isDev = process.env.NODE_ENV !== 'production';
+    res.status(500).json({ error: isDev ? msg : 'Erro ao processar solicitação. Tente novamente.' });
   }
 });
 

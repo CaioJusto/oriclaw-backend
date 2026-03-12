@@ -49,7 +49,8 @@ router.post('/portal', requireAuth, async (req: Request, res: Response) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to create portal session';
     console.error('[billing/portal] Error:', msg);
-    res.status(500).json({ error: msg });
+    const isDev = process.env.NODE_ENV !== 'production';
+    res.status(500).json({ error: isDev ? msg : 'Erro ao processar solicitação. Tente novamente.' });
   }
 });
 

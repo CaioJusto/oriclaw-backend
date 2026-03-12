@@ -13,6 +13,8 @@ import { decrypt, encrypt } from '../services/crypto';
 
 const router = Router();
 
+const COST_PER_MESSAGE_BRL = 0.02; // R$0.02 deducted per AI message in credits mode
+
 // ── Auth helper ──────────────────────────────────────────────────────────────
 async function getUserFromRequest(req: Request): Promise<string | null> {
   const authHeader = req.headers['authorization'] ?? '';
@@ -229,7 +231,20 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       }
     }
 
-    console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${body.credits_mode ? 'credits' : 'byok'} ip=${req.ip}`);
+    // Validate language and timezone before forwarding to VPS agent
+    const VALID_LANGUAGES = ['pt-BR', 'en-US', 'es-ES', 'fr-FR', 'de-DE', 'it-IT', 'ja-JP', 'zh-CN', 'ar-SA'];
+    const TIMEZONE_REGEX = /^[A-Za-z][A-Za-z0-9_\-+/]{1,50}$/;
+
+    if (body.language && !VALID_LANGUAGES.includes(body.language as string)) {
+      res.status(400).json({ error: 'Idioma inválido.' });
+      return;
+    }
+    if (body.timezone && !TIMEZONE_REGEX.test(body.timezone as string)) {
+      res.status(400).json({ error: 'Fuso horário inválido.' });
+      return;
+    }
+
+    console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${body.credits_mode ? 'credits' : body.chatgpt_mode ? 'chatgpt' : 'byok'} ip=${req.ip}`);
 
     const { data } = await axios.post(`${baseUrl}/configure`, body, {
       headers: agentHeaders(agentSecret),
@@ -238,15 +253,28 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
 
     // Persist ai_mode and status in Supabase instance record
     if (instance) {
-      const existingMeta = (instance.metadata ?? {}) as Record<string, unknown>;
+      // Fetch current metadata to preserve ai_mode when only updating persona/language/timezone
+      const { data: existingInstance } = await supabase
+        .from('oriclaw_instances')
+        .select('metadata')
+        .eq('id', instance.id)
+        .single();
+      const existingMeta = ((existingInstance?.metadata ?? instance.metadata ?? {}) as Record<string, unknown>);
+      const existingAiMode = existingMeta.ai_mode as string | undefined;
+
       const metaUpdates: Record<string, unknown> = { ...existingMeta };
+
       if (body.credits_mode) {
         metaUpdates.ai_mode = 'credits';
       } else if (body.chatgpt_mode) {
         metaUpdates.ai_mode = 'chatgpt';
-      } else {
+      } else if (body.model || body.anthropic_key || body.openai_key || body.google_key || body.openrouter_key) {
+        // Explicitly reconfiguring BYOK keys/model — update ai_mode
         metaUpdates.ai_mode = 'byok';
         if (body.model) metaUpdates.model = body.model as string;
+      } else {
+        // Only updating persona/language/timezone — preserve the existing ai_mode
+        if (existingAiMode) metaUpdates.ai_mode = existingAiMode;
       }
       await updateInstance(instance.id, { status: 'running', metadata: metaUpdates });
 
@@ -262,21 +290,16 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         }
       }
 
-      // ── Bug fix #5: Deduct a small setup credit when configuring in credits mode ─
-      // Ongoing per-message deduction is handled via the Supabase RPC deduct_credits.
-      // CREATE OR REPLACE FUNCTION deduct_credits(p_customer_id uuid, p_amount numeric)
-      //   RETURNS void LANGUAGE plpgsql AS $$
-      //   BEGIN
-      //     UPDATE oriclaw_credits
-      //     SET balance_brl = balance_brl - p_amount, updated_at = now()
-      //     WHERE customer_id = p_customer_id;
-      //   END;
-      // $$;
+      // Deduct setup fee when first configuring in credits mode.
+      // Per-message deduction is handled in the ai/* route handler.
       if (body.credits_mode) {
-        try {
-          await supabase.rpc('deduct_credits', { p_customer_id: userId, p_amount: 0.05 });
-        } catch (deductErr) {
-          console.warn('[proxy/configure] Failed to deduct credits (non-fatal):', deductErr);
+        const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
+          p_customer_id: userId,
+          p_amount: 0.05,
+        });
+        if (deductErr || !deducted) {
+          console.warn('[proxy/configure] deduct_credits (setup fee) insufficient or error:', deductErr?.message);
+          // non-fatal — instance is configured; balance may have already been checked above
         }
       }
     }
@@ -361,9 +384,29 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
 });
 
 // ── ALL /api/proxy/:instance_id/* catch-all — forwards AI messages to VPS ────
-// Bug fix #4: enable credit check so depleted-balance users can't use credits mode
+// Credit check enabled so depleted-balance users can't use credits mode.
+// After a successful response, deduct R$0.02 per message for credits-mode users.
+//
+// SQL function required (with atomic balance guard to prevent going negative):
+/*
+  CREATE OR REPLACE FUNCTION deduct_credits(p_customer_id uuid, p_amount numeric)
+    RETURNS boolean
+    LANGUAGE plpgsql AS $$
+    DECLARE
+      rows_affected integer;
+    BEGIN
+      UPDATE oriclaw_credits
+      SET balance_brl = balance_brl - p_amount, updated_at = now()
+      WHERE customer_id = p_customer_id
+        AND balance_brl >= p_amount;  -- atomic guard: prevents negative balance
+
+      GET DIAGNOSTICS rows_affected = ROW_COUNT;
+      RETURN rows_affected > 0;  -- false = insufficient balance
+    END;
+  $$;
+*/
 router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
     const subPath = (req.params as Record<string, string>)[0] ?? '';
     try {
       const { data } = await axios({
@@ -373,13 +416,27 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
         data: req.body,
         timeout: 60_000,
       });
+
+      // Deduct per-message credit cost for credits-mode users after successful response
+      const meta = (instance?.metadata ?? {}) as Record<string, unknown>;
+      if (meta.ai_mode === 'credits') {
+        const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
+          p_customer_id: userId,
+          p_amount: COST_PER_MESSAGE_BRL,
+        });
+        if (deductErr || !deducted) {
+          console.warn('[proxy/ai] deduct_credits insufficient balance or error:', deductErr?.message);
+          // non-fatal: message already delivered, just log
+        }
+      }
+
       res.json(data);
     } catch (err: unknown) {
       const axErr = err as { response?: { status?: number; data?: unknown } };
       const status = axErr.response?.status ?? 502;
       res.status(status).json(axErr.response?.data ?? { error: 'AI proxy request failed' });
     }
-  }, { checkCredits: true }); // Bug 4: credit check enabled
+  }, { checkCredits: true });
 });
 
 // ── GET /api/proxy/:instance_id/openai-status ────────────────────────────────

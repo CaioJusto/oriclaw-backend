@@ -21,6 +21,7 @@ const REQUIRED_ENV_VARS = [
   'STRIPE_WEBHOOK_SECRET',
   'ENCRYPTION_KEY',
   'ORICLAW_OPENROUTER_KEY',
+  'API_SECRET', // required by requireApiSecret middleware on provisioning endpoints
 ];
 
 const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
@@ -82,6 +83,21 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'oriclaw-backend', ts: new Date().toISOString() });
 });
 
+// ── Auth resolver: runs before rate limiters to enable per-user keying ───────
+// Without this, req.user?.id is always undefined in keyGenerator because auth
+// middleware runs inside route handlers, not before the rate limiter.
+async function resolveUser(req: express.Request, _res: express.Response, next: express.NextFunction): Promise<void> {
+  const authHeader = req.headers['authorization'] ?? '';
+  const token = (authHeader as string).replace(/^Bearer\s+/i, '').trim();
+  if (token) {
+    try {
+      const { data } = await supabase.auth.getUser(token);
+      if (data?.user) (req as any).user = { id: data.user.id };
+    } catch { /* ignore — rate limit will fall back to IP */ }
+  }
+  next();
+}
+
 // ── Per-user rate limits for proxy routes ────────────────────────────────────
 const proxyRateLimit = rateLimit({
   windowMs: 60_000, // 1 minuto
@@ -102,6 +118,7 @@ const restartRateLimit = rateLimit({
 // ── Routes ───────────────────────────────────────────────────────────────────
 app.use('/webhooks', webhookRoutes);
 app.use('/api/instances', instanceRoutes);
+app.use('/api/proxy', resolveUser);
 app.use('/api/proxy', proxyRateLimit);
 app.use('/api/proxy/:id/restart', restartRateLimit);
 app.use('/api/proxy', proxyRoutes);
@@ -117,8 +134,11 @@ app.use((_req, res) => {
 
 // ── Global error handler ─────────────────────────────────────────────────────
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('[unhandled]', err.message);
-  res.status(500).json({ error: err.message });
+  const isDev = process.env.NODE_ENV !== 'production';
+  console.error('[unhandled]', err.message, err.stack);
+  res.status(500).json({
+    error: isDev ? err.message : 'Erro interno do servidor. Tente novamente.',
+  });
 });
 
 // ── Startup recovery ─────────────────────────────────────────────────────────
