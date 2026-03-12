@@ -270,7 +270,7 @@ function readEnvFile() {
  * Sanitize env values — strip newlines and null bytes to prevent injection.
  */
 function sanitizeEnvValue(v) {
-  return String(v).replace(/[\r\n\0]/g, '');
+  return String(v).replace(/[\\r\\n\\0]/g, '');
 }
 
 /**
