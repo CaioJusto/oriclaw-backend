@@ -14,6 +14,7 @@ import { decrypt, encrypt } from '../services/crypto';
 const router = Router();
 
 const COST_PER_MESSAGE_BRL = 0.02; // R$0.02 deducted per AI message in credits mode
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── Auth helper ──────────────────────────────────────────────────────────────
 async function getUserFromRequest(req: Request): Promise<string | null> {
@@ -80,6 +81,11 @@ async function withInstance(
   handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>>; userId: string }) => Promise<void>,
   { checkCredits = false } = {}
 ): Promise<void> {
+  // Reject non-UUID instance_id early to avoid PostgreSQL parse errors
+  if (!UUID_RE.test(req.params.instance_id)) {
+    res.status(400).json({ error: 'ID de instância inválido.' });
+    return;
+  }
   try {
     const userId = await getUserFromRequest(req);
     if (!userId) {

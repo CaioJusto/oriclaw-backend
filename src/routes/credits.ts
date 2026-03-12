@@ -58,7 +58,7 @@ router.post('/purchase', async (req: Request, res: Response): Promise<void> => {
   const userId = await getUserId(req);
   if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
 
-  const { amount_brl } = req.body as { amount_brl?: number; instance_id?: string };
+  const { amount_brl } = (req.body ?? {}) as { amount_brl?: number; instance_id?: string };
   if (!amount_brl || !VALID_AMOUNTS[amount_brl]) {
     res.status(400).json({
       error: `Invalid amount. Must be one of: ${Object.keys(VALID_AMOUNTS).join(', ')}`,

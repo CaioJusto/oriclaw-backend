@@ -23,7 +23,7 @@ const PLAN_PRICES: Record<string, number> = {
 // Body: { plan: 'starter' | 'pro' | 'business', email?: string }
 // Returns: { url }
 router.post('/session', async (req: Request, res: Response): Promise<void> => {
-  const { plan, email, supabase_user_id } = req.body as { plan?: string; email?: string; supabase_user_id?: string };
+  const { plan, email, supabase_user_id } = (req.body ?? {}) as { plan?: string; email?: string; supabase_user_id?: string };
 
   if (!plan || !PLAN_PRICES[plan]) {
     res.status(400).json({ error: 'Invalid plan. Must be: starter | pro | business' });

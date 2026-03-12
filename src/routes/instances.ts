@@ -13,7 +13,7 @@ const router = Router();
 
 // POST /api/instances/provision — internal, protected
 router.post('/provision', requireApiSecret, async (req: Request, res: Response): Promise<void> => {
-  const { customer_id, plan, email, api_key_anthropic, stripe_subscription_id } = req.body as {
+  const { customer_id, plan, email, api_key_anthropic, stripe_subscription_id } = (req.body ?? {}) as {
     customer_id?: string;
     plan?: string;
     email?: string;
@@ -48,8 +48,14 @@ router.post('/provision', requireApiSecret, async (req: Request, res: Response):
   }
 });
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // GET /api/instances/:customer_id — requires Supabase JWT; returns only own instance
 router.get('/:customer_id', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  if (!UUID_RE.test(req.params.customer_id)) {
+    res.status(400).json({ error: 'Invalid customer_id format' });
+    return;
+  }
   const userId = req.user?.id;
   // Verify the requesting user matches the customer_id in the URL
   if (userId !== req.params.customer_id) {
@@ -77,7 +83,7 @@ router.get('/:customer_id', requireAuth, async (req: Request, res: Response): Pr
 
 // POST /api/instances/:instance_id/update-apikey — internal
 router.post('/:instance_id/update-apikey', requireApiSecret, async (req: Request, res: Response): Promise<void> => {
-  const { api_key } = req.body as { api_key?: string };
+  const { api_key } = (req.body ?? {}) as { api_key?: string };
 
   if (!api_key) {
     res.status(400).json({ error: 'api_key is required' });
@@ -95,6 +101,10 @@ router.post('/:instance_id/update-apikey', requireApiSecret, async (req: Request
 
 // GET /api/instances/:instance_id/status — requires Supabase JWT + ownership
 router.get('/:instance_id/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
+  if (!UUID_RE.test(req.params.instance_id)) {
+    res.status(400).json({ error: 'Invalid instance_id format' });
+    return;
+  }
   const userId = req.user?.id;
   try {
     const instance = await getInstanceById(req.params.instance_id);
