@@ -439,18 +439,102 @@ function isWhatsAppConnected(isRunning, logs) {
   );
 }
 
+// ── WhatsApp login process management ────────────────────────────────────────
+let whatsappLoginProcess = null;
+let whatsappLoginOutput = '';
+let whatsappLoginStartedAt = 0;
+
+const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
+const OPENCLAW_ENV_VARS = {
+  HOME: '/home/openclaw',
+  OPENCLAW_HOME: '/home/openclaw/.openclaw',
+  PATH: '/home/openclaw/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+};
+
+function ensureWhatsAppSetup() {
+  try {
+    runCmd(\`sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw \${OPENCLAW_CMD} plugins enable whatsapp 2>/dev/null || true\`);
+    runCmd(\`sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw \${OPENCLAW_CMD} channels add --channel whatsapp 2>/dev/null || true\`);
+    console.log('[whatsapp] ensureWhatsAppSetup completed');
+  } catch (err) {
+    console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
+  }
+}
+
+function startWhatsAppLogin() {
+  if (whatsappLoginProcess && !whatsappLoginProcess.killed) return;
+  if (Date.now() - whatsappLoginStartedAt < 10_000) return;
+
+  ensureWhatsAppSetup();
+  whatsappLoginOutput = '';
+  whatsappLoginStartedAt = Date.now();
+
+  console.log('[whatsapp] starting channels login process');
+  const child = exec(
+    \`sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw \${OPENCLAW_CMD} channels login --channel whatsapp\`,
+    { timeout: 120_000 }
+  );
+  whatsappLoginProcess = child;
+
+  child.stdout.on('data', (data) => {
+    whatsappLoginOutput += data.toString();
+    console.log('[whatsapp-login] stdout chunk received, total length:', whatsappLoginOutput.length);
+  });
+
+  child.stderr.on('data', (data) => {
+    whatsappLoginOutput += data.toString();
+  });
+
+  child.on('close', (code) => {
+    console.log('[whatsapp-login] exited with code:', code);
+    whatsappLoginProcess = null;
+  });
+
+  child.on('error', (err) => {
+    console.error('[whatsapp-login] error:', err.message);
+    whatsappLoginProcess = null;
+  });
+}
+
+function readOpenClawLogQR() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const logFile = \`/tmp/openclaw/openclaw-\${today}.log\`;
+    if (!fs.existsSync(logFile)) return null;
+    const content = fs.readFileSync(logFile, 'utf8');
+    const recent = content.slice(-8000);
+    return extractQRData(recent);
+  } catch {
+    return null;
+  }
+}
+
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogsSinceLastStart(200);
   const isRunning = getOpenclawStatus() === 'running';
 
   if (isWhatsAppConnected(isRunning, logs)) {
+    if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
+      whatsappLoginProcess.kill();
+      whatsappLoginProcess = null;
+    }
     return res.json({ connected: true, qr: null });
   }
 
-  const qrData = extractQRData(logs);
+  let qrData = extractQRData(logs);
+
+  if (!qrData && whatsappLoginOutput) {
+    qrData = extractQRData(whatsappLoginOutput);
+  }
+
   if (!qrData) {
-    return res.status(404).json({ error: 'QR not available yet', connected: false });
+    qrData = readOpenClawLogQR();
+  }
+
+  if (!qrData) {
+    startWhatsAppLogin();
+    return res.status(404).json({ error: 'QR not available yet', connected: false, login_started: true });
   }
 
   try {
@@ -886,6 +970,11 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 AGENTEOF
+
+# ── Pre-configure WhatsApp plugin ─────────────────────────────────────────────
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw plugins enable whatsapp 2>/dev/null || true
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw channels add --channel whatsapp 2>/dev/null || true
+echo "[oriclaw] WhatsApp plugin enabled and channel added"
 
 # ── Enable and start services ─────────────────────────────────────────────────
 systemctl daemon-reload
