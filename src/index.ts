@@ -22,6 +22,7 @@ const REQUIRED_ENV_VARS = [
   'ENCRYPTION_KEY',
   'ORICLAW_OPENROUTER_KEY',
   'API_SECRET', // required by requireApiSecret middleware on provisioning endpoints
+  'APP_URL',    // required for Stripe redirect URLs in checkout.ts and credits.ts
 ];
 
 const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);

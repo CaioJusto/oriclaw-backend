@@ -244,7 +244,18 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       return;
     }
 
-    console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${body.credits_mode ? 'credits' : body.chatgpt_mode ? 'chatgpt' : 'byok'} ip=${req.ip}`);
+    const auditAiMode = body.credits_mode ? 'credits' : body.chatgpt_mode ? 'chatgpt' : 'byok';
+    console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${auditAiMode} ip=${req.ip}`);
+    supabase.from('oriclaw_audit_log').insert({
+      user_id: userId,
+      instance_id: instance?.id,
+      action: 'configure',
+      ip: req.ip,
+      metadata: { ai_mode: auditAiMode },
+      created_at: new Date().toISOString(),
+    }).then(({ error }) => {
+      if (error) console.warn('[audit] failed to write to DB:', error.message);
+    });
 
     const { data } = await axios.post(`${baseUrl}/configure`, body, {
       headers: agentHeaders(agentSecret),

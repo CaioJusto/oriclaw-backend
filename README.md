@@ -168,6 +168,20 @@ oriclaw-backend/
 
 ## Banco de Dados (Supabase)
 
+### ⚠️ Migrations — RLS obrigatório
+
+Execute o arquivo `supabase/migrations/001_rls.sql` no Supabase SQL Editor (ou via `supabase db push`) para habilitar Row Level Security (RLS) em todas as tabelas e criar a tabela de audit log.
+
+```bash
+# Via Supabase CLI
+supabase db push
+
+# Ou manualmente: copie o conteúdo de supabase/migrations/001_rls.sql
+# e execute no SQL Editor do painel Supabase
+```
+
+> ⚠️ Sem as políticas RLS, usuários com acesso direto à API Supabase (via chave `anon`) conseguem ver dados de outros clientes. O backend usa a chave de `service_role` que contorna RLS — isso é intencional para operações internas.
+
 ### Tabelas Necessárias
 
 #### `oriclaw_instances`

@@ -16,7 +16,7 @@ const PROCESSED_EVENTS_TABLE = 'stripe_processed_events';
 async function reserveEventProcessing(eventId: string): Promise<boolean> {
   const { count, error } = await supabase
     .from(PROCESSED_EVENTS_TABLE)
-    .upsert({ id: eventId }, { onConflict: 'id', ignoreDuplicates: true, count: 'exact' });
+    .upsert({ id: eventId, processed_at: new Date().toISOString() }, { onConflict: 'id', ignoreDuplicates: true, count: 'exact' });
 
   if (error) {
     throw new Error(`Failed to reserve webhook event: ${error.message}`);
@@ -192,6 +192,15 @@ router.post(
         default:
           console.log(`[webhook] Unhandled event type: ${event.type}`);
       }
+
+      // Prune processed events older than 7 days to prevent unbounded growth
+      supabase
+        .from('stripe_processed_events')
+        .delete()
+        .lt('processed_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
+        .then(({ error: cleanupErr }) => {
+          if (cleanupErr) console.warn('[webhook] cleanup old events failed:', cleanupErr.message);
+        });
 
       res.json({ received: true });
     } catch (err: unknown) {

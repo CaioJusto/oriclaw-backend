@@ -43,6 +43,12 @@ export async function provisionInstance(
   return { instance_id: instance.id, status: 'provisioning' };
 }
 
+const PLAN_SIZES: Record<string, string> = {
+  'starter': 's-1vcpu-2gb',
+  'pro': 's-2vcpu-4gb',
+  'business': 's-4vcpu-8gb',
+};
+
 async function createDropletAsync(
   instanceId: string,
   customerId: string,
@@ -51,7 +57,11 @@ async function createDropletAsync(
   // Inject agent secret into cloud-init
   const cloudInit = CLOUD_INIT_SCRIPT.replace(/__AGENT_SECRET__/g, agentSecret);
 
-  const droplet = await createDropletWithInit(customerId, cloudInit);
+  // Get instance to determine plan-based droplet size
+  const instanceForPlan = await getInstanceById(instanceId);
+  const planSize = PLAN_SIZES[instanceForPlan?.plan ?? 'starter'] ?? 's-1vcpu-2gb';
+
+  const droplet = await createDropletWithInit(customerId, cloudInit, planSize);
   console.log(`[provision] Droplet created: ${droplet.id} for instance ${instanceId}`);
 
   const currentAfterCreate = await getInstanceById(instanceId);
@@ -215,11 +225,11 @@ function getHeaders() {
   };
 }
 
-async function createDropletWithInit(customerId: string, cloudInit: string): Promise<DODroplet> {
+async function createDropletWithInit(customerId: string, cloudInit: string, size: string = 's-1vcpu-2gb'): Promise<DODroplet> {
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
     region: 'nyc3',
-    size: 's-1vcpu-2gb',
+    size,
     image: 'ubuntu-22-04-x64',
     user_data: cloudInit,
     tags: ['oriclaw', `customer:${customerId}`],

@@ -11,6 +11,7 @@
  *  3. Dashboard calls POST /api/proxy/:id/configure (chatgpt_mode: true) → VPS configured
  */
 import { Router, Request, Response } from 'express';
+import axios from 'axios';
 import { getInstanceById, getInstanceByCustomerId, updateInstance, supabase } from '../services/supabase';
 import { encrypt } from '../services/crypto';
 
@@ -47,6 +48,26 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
   if (!api_key.startsWith('sk-') || api_key.length < 20) {
     res.status(400).json({ error: 'Chave de API OpenAI inválida. Deve começar com "sk-".' });
     return;
+  }
+
+  // Test the key against the OpenAI API to verify it actually works
+  try {
+    const testRes = await axios.get('https://api.openai.com/v1/models', {
+      headers: { 'Authorization': `Bearer ${api_key}` },
+      timeout: 5000,
+    });
+    if (testRes.status !== 200) {
+      res.status(400).json({ error: 'API Key OpenAI inválida ou sem permissão.' });
+      return;
+    }
+  } catch (err: unknown) {
+    const axErr = err as { response?: { status?: number } };
+    if (axErr.response?.status === 401) {
+      res.status(400).json({ error: 'API Key OpenAI inválida. Verifique a chave e tente novamente.' });
+      return;
+    }
+    // Other errors (network timeout, etc.) — allow the key to be saved
+    console.warn('[auth/openai] key validation test failed:', err);
   }
 
   // Ownership check — prevent IDOR write

@@ -13,14 +13,14 @@ export NEEDRESTART_MODE=a
 # ── System ───────────────────────────────────────────────────────────────────
 apt-get update -y
 apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git || true
 
 # ── Node.js 20 ───────────────────────────────────────────────────────────────
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
 
 # ── Firewall ─────────────────────────────────────────────────────────────────
-apt-get install -y ufw
+apt-get install -y ufw || true
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
@@ -30,18 +30,22 @@ ufw allow 3000/tcp  # OpenClaw UI
 ufw --force enable
 
 # ── OpenClaw (método oficial) ─────────────────────────────────────────────────
-apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential python3 python3-pip
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" build-essential python3 python3-pip || true
 
 # Cria usuário dedicado para openclaw
 useradd -m -s /bin/bash openclaw || true
 mkdir -p /home/openclaw/.openclaw
 
-# Instala openclaw como o usuário openclaw via script oficial
-sudo -u openclaw bash -c '
-  export HOME=/home/openclaw
-  export OPENCLAW_HOME=/home/openclaw/.openclaw
-  curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
-'
+# Instala openclaw como o usuário openclaw via script oficial (com retry)
+for attempt in 1 2 3; do
+  sudo -u openclaw bash -c '
+    export HOME=/home/openclaw
+    export OPENCLAW_HOME=/home/openclaw/.openclaw
+    curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard
+  ' && break
+  echo "[oriclaw] openclaw install attempt $attempt failed, retrying in 15s..."
+  sleep 15
+done
 
 # Symlink seguro — só cria se o binário existir
 OPENCLAW_BIN=$(sudo -u openclaw bash -c 'which openclaw 2>/dev/null || echo ""')
@@ -436,7 +440,7 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    exec('sudo systemctl restart openclaw', (restartErr) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30000 }, (restartErr) => {
       if (restartErr) {
         isConfiguring = false;
         return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
@@ -473,7 +477,7 @@ app.post('/restart', auth, (req, res) => {
 
   const previous_status = getOpenclawStatus();
 
-  exec('sudo systemctl restart openclaw', (err) => {
+  exec('sudo systemctl restart openclaw', { timeout: 30000 }, (err) => {
     if (err) {
       isRestarting = false;
       return res.status(500).json({ error: err.message, previous_status, restarted: false });
@@ -584,7 +588,7 @@ app.post('/channels/telegram', auth, async (req, res) => {
   try {
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
 
-    exec('sudo systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30000 }, (err) => {
       if (err) console.error('[telegram] restart error:', err.message);
     });
 
@@ -625,7 +629,7 @@ app.post('/channels/discord', auth, async (req, res) => {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
     if (guild_id) writeConfig({ discord_guild_id: guild_id });
 
-    exec('sudo systemctl restart openclaw', (err) => {
+    exec('sudo systemctl restart openclaw', { timeout: 30000 }, (err) => {
       if (err) console.error('[discord] restart error:', err.message);
     });
 
@@ -650,11 +654,13 @@ app.delete('/channels/:channel', auth, (req, res) => {
   try {
     if (channel === 'whatsapp') {
       // Delete WhatsApp session files so the bot doesn't auto-reconnect
+      // Respond immediately, then fire-and-forget the restart
+      res.json({ success: true });
       exec(
         'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && sudo systemctl restart openclaw',
+        { timeout: 30000 },
         (err) => {
-          if (err) console.error('[channels] WhatsApp disconnect error:', err.message);
-          setTimeout(() => res.json({ success: true }), 3000);
+          if (err) console.error('[vps-agent] restart after whatsapp disconnect failed:', err.message);
         }
       );
       return;
@@ -665,7 +671,7 @@ app.delete('/channels/:channel', auth, (req, res) => {
       fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
       try { runCmd(\`chown -R openclaw:openclaw \${OPENCLAW_CONFIG_DIR}\`); } catch { /* ignore */ }
 
-      exec('sudo systemctl restart openclaw', (err) => {
+      exec('sudo systemctl restart openclaw', { timeout: 30000 }, (err) => {
         if (err) console.error('[disconnect] restart error:', err.message);
       });
     }
@@ -683,7 +689,11 @@ app.listen(PORT, () => {
 
 SERVEREOF
 
-cd /opt/oriclaw-agent && npm install --omit=dev
+cd /opt/oriclaw-agent && for attempt in 1 2 3; do
+  npm install --omit=dev && break
+  echo "[oriclaw] npm install attempt $attempt failed, retrying in 10s..."
+  sleep 10
+done
 
 # ── OpenClaw systemd service ──────────────────────────────────────────────────
 cat > /etc/systemd/system/openclaw.service << 'SVCEOF'
