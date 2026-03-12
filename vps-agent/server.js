@@ -311,6 +311,13 @@ app.get('/health/detailed', auth, (req, res) => {
   }
 });
 
+// ── OpenClaw command helpers ─────────────────────────────────────────────────
+const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
+
+function openclawExec(args) {
+  return `sudo -u openclaw OPENCLAW_HOME=/home/openclaw/.openclaw HOME=/home/openclaw ${OPENCLAW_CMD} ${args}`;
+}
+
 // ── WhatsApp connection check helper ─────────────────────────────────────────
 function isWhatsAppConnected(isRunning, logs) {
   if (!isRunning) return false;
@@ -324,22 +331,28 @@ function isWhatsAppConnected(isRunning, logs) {
   );
 }
 
+/**
+ * Check WhatsApp link status via OpenClaw gateway RPC.
+ */
+function isWhatsAppLinkedViaRPC() {
+  try {
+    const out = runCmd(`${openclawExec('gateway call status --json')} 2>/dev/null`);
+    const status = JSON.parse(out);
+    return status.linkChannel && status.linkChannel.linked === true;
+  } catch {
+    return false;
+  }
+}
+
 // ── WhatsApp login process management ────────────────────────────────────────
 let whatsappLoginProcess = null;
 let whatsappLoginOutput = '';
 let whatsappLoginStartedAt = 0;
 
-const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
-const OPENCLAW_ENV = {
-  HOME: '/home/openclaw',
-  OPENCLAW_HOME: '/home/openclaw/.openclaw',
-  PATH: '/home/openclaw/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-};
-
 function ensureWhatsAppSetup() {
   try {
-    runCmd(`sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw ${OPENCLAW_CMD} plugins enable whatsapp 2>/dev/null || true`);
-    runCmd(`sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw ${OPENCLAW_CMD} channels add --channel whatsapp 2>/dev/null || true`);
+    runCmd(`${openclawExec('plugins enable whatsapp')} 2>/dev/null || true`);
+    runCmd(`${openclawExec('channels add --channel whatsapp')} 2>/dev/null || true`);
     console.log('[whatsapp] ensureWhatsAppSetup completed');
   } catch (err) {
     console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
@@ -357,7 +370,7 @@ function startWhatsAppLogin() {
 
   console.log('[whatsapp] starting channels login process');
   const child = exec(
-    `sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw ${OPENCLAW_CMD} channels login --channel whatsapp`,
+    openclawExec('channels login --channel whatsapp'),
     { timeout: 120_000 }
   );
   whatsappLoginProcess = child;
@@ -396,12 +409,41 @@ function readOpenClawLogQR() {
   }
 }
 
+/**
+ * Extract ASCII art QR code from the login process output.
+ * Returns the QR block as a string (unicode block characters).
+ */
+function extractQRAsciiArt(output) {
+  if (!output) return null;
+  const lines = output.split('\n');
+  const qrLines = [];
+  let inQR = false;
+  for (const line of lines) {
+    // QR art starts with a line of ▄ characters
+    if (!inQR && line.includes('▄▄▄▄▄▄▄▄▄▄')) {
+      inQR = true;
+    }
+    if (inQR) {
+      qrLines.push(line);
+      // QR art ends with a line of █ and ▄ characters (bottom border)
+      if (qrLines.length > 5 && (line.includes('█▄▄▄▄▄▄▄▄') || line.includes('▄███'))) {
+        // Check if this looks like the last line
+        if (!line.includes('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄')) {
+          break;
+        }
+      }
+    }
+  }
+  return qrLines.length > 10 ? qrLines.join('\n') : null;
+}
+
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const logs = getJournalLogsSinceLastStart(200);
   const isRunning = getOpenclawStatus() === 'running';
 
-  if (isWhatsAppConnected(isRunning, logs)) {
+  // Check connection via both log heuristics and gateway RPC
+  if (isWhatsAppConnected(isRunning, logs) || (isRunning && isWhatsAppLinkedViaRPC())) {
     // Kill login process if connected
     if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
       whatsappLoginProcess.kill();
@@ -410,36 +452,62 @@ app.get('/qr', auth, async (req, res) => {
     return res.json({ connected: true, qr: null });
   }
 
-  // Try to extract QR from multiple sources
+  // Try to extract QR data string from multiple sources
   let qrData = extractQRData(logs);
 
-  // Check login process output
   if (!qrData && whatsappLoginOutput) {
     qrData = extractQRData(whatsappLoginOutput);
   }
 
-  // Check OpenClaw log file
   if (!qrData) {
     qrData = readOpenClawLogQR();
   }
 
-  // If no QR data found, trigger login process
-  if (!qrData) {
-    startWhatsAppLogin();
-    return res.status(404).json({ error: 'QR not available yet', connected: false, login_started: true });
+  // If we have raw QR data, generate PNG
+  if (qrData) {
+    try {
+      const pngBase64 = await QRCode.toDataURL(qrData, {
+        errorCorrectionLevel: 'M',
+        type: 'image/png',
+        width: 300,
+        margin: 2,
+      });
+      return res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
+    } catch (err) {
+      // Fall through to ASCII art
+    }
   }
 
-  try {
-    const pngBase64 = await QRCode.toDataURL(qrData, {
-      errorCorrectionLevel: 'M',
-      type: 'image/png',
-      width: 300,
-      margin: 2,
-    });
-    res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to generate QR: ' + err.message });
+  // Try to extract ASCII art QR from login process output
+  let asciiQR = extractQRAsciiArt(whatsappLoginOutput);
+
+  // Also check OpenClaw log file for ASCII art
+  if (!asciiQR) {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const logFile = `/tmp/openclaw/openclaw-${today}.log`;
+      if (fs.existsSync(logFile)) {
+        const content = fs.readFileSync(logFile, 'utf8');
+        const recent = content.slice(-15000);
+        // Log file stores QR in JSON format with "0" key containing the art
+        const qrMatches = [...recent.matchAll(/"0":"(▄[^"]+)"/g)];
+        if (qrMatches.length > 0) {
+          const lastMatch = qrMatches[qrMatches.length - 1][1];
+          // Unescape JSON string
+          const unescaped = lastMatch.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+          asciiQR = unescaped;
+        }
+      }
+    } catch { /* ignore */ }
   }
+
+  if (asciiQR) {
+    return res.json({ connected: false, qr: null, qr_ascii: asciiQR, generated_at: Date.now() });
+  }
+
+  // No QR data found — trigger login process
+  startWhatsAppLogin();
+  return res.status(404).json({ error: 'QR not available yet', connected: false, login_started: true });
 });
 
 // POST /configure
@@ -616,7 +684,7 @@ app.get('/channels', auth, (req, res) => {
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(100);
     const isRunning = getOpenclawStatus() === 'running';
-    const waConnected = isWhatsAppConnected(isRunning, logs);
+    const waConnected = isWhatsAppConnected(isRunning, logs) || (isRunning && isWhatsAppLinkedViaRPC());
 
     res.json({
       whatsapp: {
