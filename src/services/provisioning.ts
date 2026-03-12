@@ -139,7 +139,7 @@ async function createDropletAsync(
   const planSize = PLAN_SIZES[instanceForPlan?.plan ?? 'starter'] ?? 's-1vcpu-2gb';
 
   const droplet = await createDropletWithInit(customerId, cloudInit, planSize);
-  console.log(`[provision] Droplet created: ${droplet.id} for instance ${instanceId}`);
+  console.log(`[provision] Droplet created: ${droplet.id} (status=${droplet.status}) for instance ${instanceId}`);
 
   const currentAfterCreate = await getInstanceById(instanceId);
   if (!currentAfterCreate || currentAfterCreate.status === 'deleted') return;
@@ -152,9 +152,24 @@ async function createDropletAsync(
   let ip: string | null = null;
   for (let i = 0; i < 18; i++) {
     await sleep(10_000);
-    const updated = await getDroplet(droplet.id);
-    ip = getDropletPublicIP(updated);
-    if (ip) break;
+    try {
+      const updated = await getDroplet(droplet.id);
+      console.log(`[provision] Poll ${i+1}/18: droplet ${droplet.id} status=${updated.status}`);
+      ip = getDropletPublicIP(updated);
+      if (ip) break;
+    } catch (pollErr: unknown) {
+      const axErr = pollErr as { response?: { status?: number; data?: unknown }; message?: string };
+      console.error(`[provision] Poll ${i+1}/18: GET droplet ${droplet.id} failed:`, {
+        status: axErr.response?.status,
+        data: axErr.response?.data,
+        message: axErr.message ?? String(pollErr),
+      });
+      // If 404, droplet was destroyed — break early
+      if (axErr.response?.status === 404) {
+        console.error(`[provision] Droplet ${droplet.id} returned 404 — was likely destroyed by DigitalOcean`);
+        break;
+      }
+    }
   }
 
   if (!ip) {
@@ -367,6 +382,9 @@ function getHeaders() {
 }
 
 async function createDropletWithInit(customerId: string, cloudInit: string, size: string = 's-1vcpu-2gb'): Promise<DODroplet> {
+  console.log(`[provision] cloud-init size: ${Buffer.byteLength(cloudInit, 'utf8')} bytes`);
+  console.log(`[provision] Creating droplet: region=nyc3 size=${size} image=ubuntu-24-04-x64`);
+
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
     region: 'nyc3',
@@ -383,6 +401,28 @@ async function createDropletWithInit(customerId: string, cloudInit: string, size
     dropletConfig,
     { headers: getHeaders(), timeout: 30_000 }
   );
+
+  console.log(`[provision] DO API response status: ${response.status}`);
+
+  // Verify immediately that we can read back the droplet
+  try {
+    await sleep(2_000);
+    const verify = await axios.get(
+      `${DO_API_BASE}/droplets/${response.data.droplet.id}`,
+      { headers: getHeaders(), timeout: 15_000 }
+    );
+    console.log(`[provision] Immediate verify: droplet ${response.data.droplet.id} status=${verify.data.droplet.status}`);
+  } catch (verifyErr: unknown) {
+    const axErr = verifyErr as { response?: { status?: number; data?: unknown }; message?: string };
+    console.error(`[provision] Immediate verify FAILED for droplet ${response.data.droplet.id}:`, {
+      status: axErr.response?.status,
+      data: JSON.stringify(axErr.response?.data),
+      message: axErr.message,
+    });
+    // Also log the token prefix to verify it's the right token (first 8 chars only)
+    const tokenPrefix = (process.env.DO_API_TOKEN ?? '').substring(0, 8);
+    console.error(`[provision] DO_API_TOKEN prefix: ${tokenPrefix}...`);
+  }
 
   return response.data.droplet;
 }
