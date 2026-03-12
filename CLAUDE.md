@@ -13,7 +13,7 @@ O **OriClaw Backend** é uma API REST em **Node.js + Express + TypeScript** que 
 - **Modos de IA**: BYOK (Anthropic/OpenAI/Google/OpenRouter), Créditos OriClaw (OpenRouter gerenciado), ChatGPT Plus (OAuth)
 - **Auth**: delegada ao Supabase Auth — o backend valida JWTs do Supabase em cada request
 
-Deploy em **Railway**. Banco de dados em **Supabase (PostgreSQL)**.
+Deploy em **DigitalOcean App Platform** (região NYC). Banco de dados em **Supabase (PostgreSQL)**. Frontend em **Vercel**.
 
 ## Comandos Úteis
 

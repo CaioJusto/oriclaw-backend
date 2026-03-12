@@ -383,7 +383,7 @@ function getHeaders() {
 
 async function createDropletWithInit(customerId: string, cloudInit: string, size: string = 's-1vcpu-2gb'): Promise<DODroplet> {
   console.log(`[provision] cloud-init size: ${Buffer.byteLength(cloudInit, 'utf8')} bytes`);
-  console.log(`[provision] Creating droplet: region=nyc3 size=${size} image=ubuntu-24-04-x64`);
+  console.log(`[provision] Creating droplet: region=nyc1 size=${size} image=ubuntu-24-04-x64`);
 
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
