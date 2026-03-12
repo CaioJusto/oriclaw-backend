@@ -44,6 +44,10 @@ apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--fo
 useradd -m -s /bin/bash openclaw || true
 mkdir -p /home/openclaw/.openclaw
 
+# Garante que npm global bin está no PATH do user openclaw
+echo 'export PATH="/home/openclaw/.npm-global/bin:$PATH"' >> /home/openclaw/.bashrc
+chown openclaw:openclaw /home/openclaw/.bashrc
+
 # Instala openclaw como o usuário openclaw via script oficial (com retry)
 for attempt in 1 2 3; do
   sudo -u openclaw bash -c '
@@ -56,9 +60,15 @@ for attempt in 1 2 3; do
 done
 
 # Symlink seguro — só cria se o binário existir
-OPENCLAW_BIN=$(sudo -u openclaw bash -c 'which openclaw 2>/dev/null || echo ""')
+OPENCLAW_BIN=$(sudo -u openclaw bash -c 'export PATH="/home/openclaw/.npm-global/bin:$PATH"; which openclaw 2>/dev/null || echo ""')
 if [ -z "$OPENCLAW_BIN" ]; then
-  OPENCLAW_BIN="/home/openclaw/.local/bin/openclaw"
+  # Fallback paths where npm might have installed it
+  for candidate in /home/openclaw/.npm-global/bin/openclaw /home/openclaw/.local/bin/openclaw; do
+    if [ -f "$candidate" ]; then
+      OPENCLAW_BIN="$candidate"
+      break
+    fi
+  done
 fi
 
 if [ -f "$OPENCLAW_BIN" ]; then
@@ -802,7 +812,7 @@ Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
 Environment=OPENCLAW_NO_RESPAWN=1
 Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.local/bin/openclaw gateway
+ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=90

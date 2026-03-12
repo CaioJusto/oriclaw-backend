@@ -89,6 +89,54 @@ const PLAN_SIZES: Record<string, string> = {
   'business': 's-4vcpu-8gb',
 };
 
+// If set, provision from a pre-built snapshot instead of cloud-init.
+// This reduces provisioning time from ~7 min to ~1 min.
+const SNAPSHOT_ID = process.env.ORICLAW_SNAPSHOT_ID || '';
+
+/**
+ * Minimal cloud-init for snapshot-based provisioning.
+ * Only injects secrets and restarts services — everything else is pre-installed.
+ */
+function buildSnapshotCloudInit(agentSecret: string, gatewayToken: string): string {
+  return `#!/bin/bash
+set -e
+
+# Stop services before overwriting secrets
+systemctl stop oriclaw-agent 2>/dev/null || true
+systemctl stop openclaw 2>/dev/null || true
+
+# Inject agent secret
+cat > /etc/oriclaw-agent.env << 'ENVEOF'
+AGENT_SECRET=${agentSecret}
+PORT=8080
+ENVEOF
+chmod 600 /etc/oriclaw-agent.env
+chown oriclaw-agent:oriclaw-agent /etc/oriclaw-agent.env
+
+# Inject gateway token in OpenClaw config
+OPENCLAW_CONFIG=/home/openclaw/.openclaw/config.json
+if [ -f "$OPENCLAW_CONFIG" ]; then
+  # Update token in-place using python3 (always available on Ubuntu)
+  python3 -c "
+import json, sys
+with open('$OPENCLAW_CONFIG') as f: cfg = json.load(f)
+cfg.setdefault('gateway', {}).setdefault('auth', {})['token'] = '${gatewayToken}'
+with open('$OPENCLAW_CONFIG', 'w') as f: json.dump(cfg, f, indent=2)
+"
+  chown openclaw:openclaw "$OPENCLAW_CONFIG"
+fi
+
+# Clean any leftover state from snapshot
+rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys 2>/dev/null || true
+
+# Start services
+systemctl daemon-reload
+systemctl start oriclaw-agent
+
+echo "ORICLAW_READY" > /var/lib/cloud/instance/oriclaw-status
+`;
+}
+
 /**
  * cancelSubscriptionForInstance — best-effort: cancel Stripe subscription for an
  * instance whose provisioning failed so the user isn't billed for a broken VPS.
@@ -130,24 +178,33 @@ async function createDropletAsync(
   // Generate gateway token for OpenClaw UI auth
   const gatewayToken = crypto.randomBytes(32).toString('hex');
 
-  // Inject agent secret and gateway token into cloud-init, then compress
-  // to stay under DigitalOcean's 16KB user_data limit.
-  const rawScript = CLOUD_INIT_SCRIPT
-    .replace(/__AGENT_SECRET__/g, agentSecret)
-    .replace(/__GATEWAY_TOKEN__/g, gatewayToken);
-  const compressed = zlib.gzipSync(Buffer.from(rawScript, 'utf8'));
-  const b64 = compressed.toString('base64');
-  const cloudInit = `#!/bin/bash
-echo '${b64}' | base64 -d | gunzip > /tmp/oriclaw-init.sh
-chmod +x /tmp/oriclaw-init.sh
-/tmp/oriclaw-init.sh
-`;
-
   // Get instance to determine plan-based droplet size
   const instanceForPlan = await getInstanceById(instanceId);
   const planSize = PLAN_SIZES[instanceForPlan?.plan ?? 'starter'] ?? 's-1vcpu-2gb';
 
-  const droplet = await createDropletWithInit(customerId, cloudInit, planSize);
+  let droplet: DODroplet;
+
+  if (SNAPSHOT_ID) {
+    // ── Snapshot-based provisioning (~1 min) ──
+    // Uses a pre-built golden image; cloud-init only injects secrets.
+    console.log(`[provision] Using snapshot ${SNAPSHOT_ID} for instance ${instanceId}`);
+    const cloudInit = buildSnapshotCloudInit(agentSecret, gatewayToken);
+    droplet = await createDropletWithInit(customerId, cloudInit, planSize, SNAPSHOT_ID);
+  } else {
+    // ── Full cloud-init provisioning (~7 min) ──
+    // Compresses the full script with gzip+base64 to stay under DO's 16KB user_data limit.
+    const rawScript = CLOUD_INIT_SCRIPT
+      .replace(/__AGENT_SECRET__/g, agentSecret)
+      .replace(/__GATEWAY_TOKEN__/g, gatewayToken);
+    const compressed = zlib.gzipSync(Buffer.from(rawScript, 'utf8'));
+    const b64 = compressed.toString('base64');
+    const cloudInit = `#!/bin/bash
+echo '${b64}' | base64 -d | gunzip > /tmp/oriclaw-init.sh
+chmod +x /tmp/oriclaw-init.sh
+/tmp/oriclaw-init.sh
+`;
+    droplet = await createDropletWithInit(customerId, cloudInit, planSize);
+  }
   console.log(`[provision] Droplet created: ${droplet.id} (status=${droplet.status}) for instance ${instanceId}`);
 
   const currentAfterCreate = await getInstanceById(instanceId);
@@ -198,7 +255,9 @@ chmod +x /tmp/oriclaw-init.sh
   }
 
   // Wait until VPS agent is responding on /health before exposing needs_config.
-  const agentReady = await waitForAgentReadiness(ip, agentSecret, 20 * 60 * 1000);
+  // Snapshot deploys are much faster (~1 min), so use a shorter timeout.
+  const agentTimeoutMs = SNAPSHOT_ID ? 5 * 60 * 1000 : 20 * 60 * 1000;
+  const agentReady = await waitForAgentReadiness(ip, agentSecret, agentTimeoutMs);
   if (!agentReady) {
     // Cancel Stripe subscription — user shouldn't be billed for an unresponsive VPS
     await cancelSubscriptionForInstance(instanceId, stripeSubId);
@@ -390,15 +449,21 @@ function getHeaders() {
   };
 }
 
-async function createDropletWithInit(customerId: string, cloudInit: string, size: string = 's-1vcpu-2gb'): Promise<DODroplet> {
+async function createDropletWithInit(
+  customerId: string,
+  cloudInit: string,
+  size: string = 's-1vcpu-2gb',
+  snapshotId?: string
+): Promise<DODroplet> {
+  const image: string | number = snapshotId ? Number(snapshotId) : 'ubuntu-24-04-x64';
   console.log(`[provision] cloud-init size: ${Buffer.byteLength(cloudInit, 'utf8')} bytes`);
-  console.log(`[provision] Creating droplet: region=nyc1 size=${size} image=ubuntu-24-04-x64`);
+  console.log(`[provision] Creating droplet: region=nyc1 size=${size} image=${image}${snapshotId ? ' (snapshot)' : ''}`);
 
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
     region: 'nyc1',
     size,
-    image: 'ubuntu-24-04-x64',
+    image,
     user_data: cloudInit,
     tags: ['oriclaw', `customer:${customerId}`],
     monitoring: true,
