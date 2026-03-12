@@ -3,6 +3,7 @@ import express, { Request as ExpressRequest } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import Stripe from 'stripe';
 import webhookRoutes from './routes/webhooks';
 import instanceRoutes from './routes/instances';
 import proxyRoutes from './routes/proxy';
@@ -64,21 +65,26 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-api-secret'],
 }));
 
-// ── Rate limiting ────────────────────────────────────────────────────────────
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
-  message: { error: 'Too many requests, please try again later' },
-  standardHeaders: true,
-  legacyHeaders: false,
-}));
-
 // ── Body parsing ─────────────────────────────────────────────────────────────
-// Stripe webhooks need raw body for signature verification
+// Stripe webhooks need raw body for signature verification — registered BEFORE
+// the global rate limiter so the raw Buffer is available for signature checks
+// and webhook deliveries are never accidentally rate-limited by IP.
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
 
 // All other routes use JSON
 app.use(express.json());
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+// Webhook routes are excluded: Stripe sends from known IPs, validates with
+// HMAC signature, and must never be rate-limited by client IP.
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  skip: (req) => req.path.startsWith('/webhooks/'),
+  message: { error: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -155,15 +161,36 @@ async function recoverStuckProvisioningInstances() {
 
     if (stuck && stuck.length > 0) {
       console.log(`[startup] Found ${stuck.length} stuck provisioning instance(s), marking as suspended`);
+
+      // Lazy-init Stripe only when needed (key already validated at startup)
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' });
+
       for (const inst of stuck) {
-        // Bug 7: fetch existing metadata first to preserve agent_secret and droplet_name
+        // Fetch existing metadata AND stripe_subscription_id to cancel the sub
         const { data: stuckInst } = await supabase
           .from('oriclaw_instances')
-          .select('metadata')
+          .select('metadata, stripe_subscription_id')
           .eq('id', inst.id)
           .single();
+
         const existingMeta = ((stuckInst?.metadata ?? {}) as Record<string, unknown>);
-        // Bug fix #2: include suspended_reason so dashboard can show meaningful message
+
+        // Cancel the Stripe subscription so the user isn't billed for a VPS
+        // that never finished provisioning due to a server restart.
+        const subId = stuckInst?.stripe_subscription_id as string | null ?? null;
+        if (subId) {
+          try {
+            await stripe.subscriptions.cancel(subId);
+            console.log(`[startup] Cancelled Stripe subscription ${subId} for stuck instance ${inst.id}`);
+          } catch (cancelErr: unknown) {
+            // already_cancelled / resource_missing are expected — log and continue
+            console.warn(
+              `[startup] Could not cancel subscription ${subId} for stuck instance ${inst.id}:`,
+              cancelErr instanceof Error ? cancelErr.message : String(cancelErr)
+            );
+          }
+        }
+
         await supabase.from('oriclaw_instances').update({
           status: 'suspended',
           metadata: {
