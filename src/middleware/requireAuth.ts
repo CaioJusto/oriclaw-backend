@@ -1,11 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
-import { createClient } from '@supabase/supabase-js';
+// Bug fix #8: use the shared Supabase singleton instead of creating a second client
+import { supabase } from '../services/supabase';
 import { OriClawInstance } from '../types';
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
@@ -23,6 +19,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   next();
 }
 
+// Bug fix #7: typed parameter instead of `any`
 export function sanitizeInstance(instance: OriClawInstance) {
   if (!instance) return instance;
   const { api_key_encrypted, ...rest } = instance;

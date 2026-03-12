@@ -90,14 +90,24 @@ router.post(
             break;
           }
 
-          // Uniqueness check: skip if already provisioned for this user
+          // Bug fix #1: checkout.session.completed may have already created a stub
+          // instance (status='provisioning', stripe_subscription_id=null) to prevent
+          // the dashboard from seeing null during the 5-30s webhook delivery window.
+          // If that stub exists, just bind the subscription ID and skip re-provisioning.
           const existingInstance = await getInstanceByCustomerId(supabaseUserId);
           if (existingInstance && existingInstance.status !== 'deleted') {
-            console.log(`[webhook] Instance already exists for user ${supabaseUserId}, skipping`);
+            if (!existingInstance.stripe_subscription_id) {
+              // Bind subscription ID to the stub created by checkout.session.completed
+              await updateInstance(existingInstance.id, { stripe_subscription_id: subscription.id });
+              console.log(`[webhook] Bound subscription ${subscription.id} to stub instance ${existingInstance.id}`);
+            } else {
+              console.log(`[webhook] Instance already exists for user ${supabaseUserId}, skipping`);
+            }
             break;
           }
 
-          // Fetch customer email from Stripe
+          // No stub exists — provision from scratch (fallback for cases where
+          // checkout.session.completed didn't fire or was processed out of order)
           const customerId = subscription.customer as string;
           const customer = await stripe.customers.retrieve(customerId);
           const email = 'email' in customer ? (customer.email ?? '') : '';
@@ -174,8 +184,40 @@ router.post(
               await addCredits(customerId, amountBrl);
               console.log(`[webhook] Added R$${amountBrl} credits to ${customerId}`);
             }
+          } else if (session.mode === 'subscription') {
+            // Bug fix #1: Create stub instance immediately so the dashboard returns
+            // status='provisioning' instead of 404 during the 5-30s window before
+            // customer.subscription.created fires.
+            const supabaseUserId = session.metadata?.supabase_user_id;
+            const sessionPlan = session.metadata?.plan ?? 'starter';
+            const safeSessionPlan: 'starter' | 'pro' | 'business' =
+              (['starter', 'pro', 'business'] as const).includes(sessionPlan as 'starter' | 'pro' | 'business')
+                ? (sessionPlan as 'starter' | 'pro' | 'business')
+                : 'starter';
+
+            if (supabaseUserId) {
+              const existing = await getInstanceByCustomerId(supabaseUserId);
+              if (!existing || existing.status === 'deleted') {
+                // Fetch customer email for the record
+                let email = '';
+                if (session.customer) {
+                  try {
+                    const stripeCustomer = await stripe.customers.retrieve(session.customer as string);
+                    email = 'email' in stripeCustomer ? (stripeCustomer.email ?? '') : '';
+                  } catch { /* non-fatal — email is informational */ }
+                }
+                // stripe_subscription_id not yet available here; subscription.created
+                // will bind it via the updateInstance call above.
+                await provisionInstance({
+                  customer_id: supabaseUserId,
+                  plan: safeSessionPlan,
+                  email,
+                  // No stripe_subscription_id yet — bound in subscription.created
+                });
+                console.log(`[webhook] Stub instance created for ${supabaseUserId} (checkout.session.completed)`);
+              }
+            }
           }
-          // For subscription mode, customer.subscription.created handles provisioning
           console.log(`[webhook] checkout.session.completed: ${session.id}`);
           break;
         }

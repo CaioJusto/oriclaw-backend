@@ -11,6 +11,7 @@ import authRoutes from './routes/auth';
 import checkoutRoutes from './routes/checkout';
 import billingRoutes from './routes/billing';
 import { supabase } from './services/supabase';
+import { retryPendingDeletions } from './services/provisioning';
 
 // ── Required environment variable validation ──────────────────────────────────
 const REQUIRED_ENV_VARS = [
@@ -93,7 +94,7 @@ async function resolveUser(req: express.Request, _res: express.Response, next: e
   if (token) {
     try {
       const { data } = await supabase.auth.getUser(token);
-      if (data?.user) (req as any).user = { id: data.user.id };
+      if (data?.user) req.user = { id: data.user.id };
     } catch { /* ignore — rate limit will fall back to IP */ }
   }
   next();
@@ -162,11 +163,13 @@ async function recoverStuckProvisioningInstances() {
           .eq('id', inst.id)
           .single();
         const existingMeta = ((stuckInst?.metadata ?? {}) as Record<string, unknown>);
+        // Bug fix #2: include suspended_reason so dashboard can show meaningful message
         await supabase.from('oriclaw_instances').update({
           status: 'suspended',
           metadata: {
             ...existingMeta,
             error: 'Timeout de provisionamento — servidor não respondeu a tempo.',
+            suspended_reason: 'provisioning_timeout',
           }
         }).eq('id', inst.id);
       }
@@ -177,6 +180,8 @@ async function recoverStuckProvisioningInstances() {
 }
 
 recoverStuckProvisioningInstances();
+// Bug fix #3: retry instances stuck in deletion_failed on startup
+retryPendingDeletions();
 
 app.listen(PORT, () => {
   console.log(`🌀 OriClaw backend running on port ${PORT}`);

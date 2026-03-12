@@ -6,20 +6,36 @@ import {
   getInstanceById,
   getInstanceBySubscriptionId,
   updateInstance,
+  supabase,
 } from './supabase';
 import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest, DODroplet, DODropletResponse } from '../types';
 import { encrypt, decrypt } from './crypto';
+
+// ── DO API rate-limit guard ───────────────────────────────────────────────────
+// Limits simultaneous droplet creations to avoid hitting DigitalOcean's rate
+// limit (typically 10 droplets/minute). Counter tracks async createDropletAsync
+// coroutines in flight; decremented in the finally block of each.
+let activeProvisioningCount = 0;
+const MAX_CONCURRENT_PROVISIONING = 2;
 
 export async function provisionInstance(
   req: ProvisionRequest
 ): Promise<{ instance_id: string; status: string }> {
   console.log(`[provision] Starting for customer: ${req.customer_id}`);
 
+  // Bug fix #5: Reject early if too many droplets are being provisioned simultaneously
+  if (activeProvisioningCount >= MAX_CONCURRENT_PROVISIONING) {
+    throw new Error(
+      `Limite de provisionamentos simultâneos atingido (${MAX_CONCURRENT_PROVISIONING}). ` +
+      'Tente novamente em alguns minutos.'
+    );
+  }
+
   // Generate random agent secret for this instance
   const agentSecret = crypto.randomBytes(32).toString('hex');
 
-  // Create DB record first
+  // Create DB record first (status='provisioning' — dashboard sees this immediately)
   const instance = await createInstance({
     customer_id: req.customer_id,
     email: req.email,
@@ -32,13 +48,22 @@ export async function provisionInstance(
     metadata: { agent_secret: agentSecret },
   });
 
+  // Bug fix #5: increment counter before async work; decrement when done
+  activeProvisioningCount++;
+
   // Create DO Droplet (non-blocking — status will update async)
-  createDropletAsync(instance.id, req.customer_id, agentSecret).catch((err) => {
-    console.error(`[provision] Droplet creation failed for ${instance.id}:`, err.message);
-    updateInstance(instance.id, { status: 'suspended', metadata: { error: err.message } }).catch(
-      console.error
-    );
-  });
+  createDropletAsync(instance.id, req.customer_id, agentSecret)
+    .catch((err) => {
+      console.error(`[provision] Droplet creation failed for ${instance.id}:`, err.message);
+      // Bug fix #2: preserve agent_secret and add suspended_reason
+      updateInstance(instance.id, {
+        status: 'suspended',
+        metadata: { agent_secret: agentSecret, error: err.message, suspended_reason: 'provisioning_failed' },
+      }).catch(console.error);
+    })
+    .finally(() => {
+      activeProvisioningCount--;
+    });
 
   return { instance_id: instance.id, status: 'provisioning' };
 }
@@ -81,12 +106,14 @@ async function createDropletAsync(
   }
 
   if (!ip) {
+    // Bug fix #2: add suspended_reason so dashboard can show meaningful message
     await updateInstance(instanceId, {
       status: 'suspended',
       metadata: {
         droplet_name: droplet.name,
         agent_secret: agentSecret,
         error: 'Droplet não obteve IP em tempo hábil',
+        suspended_reason: 'provisioning_failed_no_ip',
       },
     });
     return;
@@ -95,6 +122,7 @@ async function createDropletAsync(
   // Wait until VPS agent is responding on /health before exposing needs_config.
   const agentReady = await waitForAgentReadiness(ip, agentSecret, 20 * 60 * 1000);
   if (!agentReady) {
+    // Bug fix #2: add suspended_reason
     await updateInstance(instanceId, {
       droplet_ip: ip,
       status: 'suspended',
@@ -102,6 +130,7 @@ async function createDropletAsync(
         droplet_name: droplet.name,
         agent_secret: agentSecret,
         error: 'VPS agent não respondeu após 20 minutos',
+        suspended_reason: 'provisioning_failed_agent_timeout',
       },
     });
     return;
@@ -146,10 +175,16 @@ export async function deprovisionInstance(subscriptionId: string): Promise<void>
   await updateInstance(instance.id, { status: 'deleted' });
 }
 
-export async function suspendInstance(subscriptionId: string): Promise<void> {
+export async function suspendInstance(subscriptionId: string, reason = 'payment_failed'): Promise<void> {
   const instance = await getInstanceBySubscriptionId(subscriptionId);
   if (!instance) return;
-  await updateInstance(instance.id, { status: 'suspended' });
+  // Bug fix #2: preserve existing metadata and add suspended_reason so the
+  // dashboard can distinguish "payment suspended" from "provisioning failed"
+  const existingMeta = (instance.metadata ?? {}) as Record<string, unknown>;
+  await updateInstance(instance.id, {
+    status: 'suspended',
+    metadata: { ...existingMeta, suspended_reason: reason },
+  });
 }
 
 export async function reactivateInstance(subscriptionId: string): Promise<void> {
@@ -180,6 +215,41 @@ export async function reactivateInstance(subscriptionId: string): Promise<void> 
 export async function updateApiKey(instanceId: string, apiKey: string): Promise<void> {
   await updateInstance(instanceId, { api_key_encrypted: encrypt(apiKey) });
   console.log(`[updateApiKey] Stored new encrypted API key for instance ${instanceId} (configure via /proxy)`);
+}
+
+/**
+ * Bug fix #3: retryPendingDeletions — called at startup to resolve instances
+ * stuck in 'deletion_failed' state. deleteDroplet treats 404 as success, so
+ * retrying is safe and idempotent.
+ */
+export async function retryPendingDeletions(): Promise<void> {
+  try {
+    const { data: failing } = await supabase
+      .from('oriclaw_instances')
+      .select('id, droplet_id, metadata')
+      .eq('status', 'deletion_failed');
+
+    if (!failing || failing.length === 0) return;
+
+    console.log(`[startup] Found ${failing.length} deletion_failed instance(s), retrying`);
+
+    for (const inst of failing) {
+      try {
+        if (inst.droplet_id) {
+          await deleteDroplet(inst.droplet_id as number);
+        }
+        await updateInstance(inst.id, { status: 'deleted' });
+        console.log(`[startup] Retry deletion succeeded for instance ${inst.id}`);
+      } catch (err) {
+        console.warn(
+          `[startup] Retry deletion failed for ${inst.id}:`,
+          err instanceof Error ? err.message : err
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[startup] Could not check for deletion_failed instances:', err);
+  }
 }
 
 export { decrypt };
