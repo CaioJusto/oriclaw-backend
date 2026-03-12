@@ -448,9 +448,10 @@ function isWhatsAppConnected(isRunning, logs) {
 
 function isWhatsAppLinkedViaRPC() {
   try {
-    const out = runCmd(\`\${openclawExec('gateway call status --json')} 2>/dev/null\`);
-    const status = JSON.parse(out);
-    return status.linkChannel && status.linkChannel.linked === true;
+    const out = runCmd(\`\${openclawExec('gateway call health --json')} 2>/dev/null\`);
+    const health = JSON.parse(out);
+    const wa = health.channels && health.channels.whatsapp;
+    return wa && (wa.connected === true || wa.linked === true);
   } catch {
     return false;
   }
