@@ -134,9 +134,19 @@ async function recoverStuckProvisioningInstances() {
     if (stuck && stuck.length > 0) {
       console.log(`[startup] Found ${stuck.length} stuck provisioning instance(s), marking as suspended`);
       for (const inst of stuck) {
+        // Bug 7: fetch existing metadata first to preserve agent_secret and droplet_name
+        const { data: stuckInst } = await supabase
+          .from('oriclaw_instances')
+          .select('metadata')
+          .eq('id', inst.id)
+          .single();
+        const existingMeta = ((stuckInst?.metadata ?? {}) as Record<string, unknown>);
         await supabase.from('oriclaw_instances').update({
           status: 'suspended',
-          metadata: { error: 'Timeout de provisionamento — servidor não respondeu a tempo.' }
+          metadata: {
+            ...existingMeta,
+            error: 'Timeout de provisionamento — servidor não respondeu a tempo.',
+          }
         }).eq('id', inst.id);
       }
     }

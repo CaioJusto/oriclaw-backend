@@ -264,13 +264,17 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
 
       // ── Bug fix #5: Deduct a small setup credit when configuring in credits mode ─
       // Ongoing per-message deduction is handled via the Supabase RPC deduct_credits.
-      // SQL function: CREATE OR REPLACE FUNCTION deduct_credits(p_user_id uuid, p_amount numeric)
-      //   RETURNS void LANGUAGE plpgsql AS $$ BEGIN
-      //     UPDATE oriclaw_credits SET balance_brl = balance_brl - p_amount WHERE user_id = p_user_id;
-      //   END; $$;
+      // CREATE OR REPLACE FUNCTION deduct_credits(p_customer_id uuid, p_amount numeric)
+      //   RETURNS void LANGUAGE plpgsql AS $$
+      //   BEGIN
+      //     UPDATE oriclaw_credits
+      //     SET balance_brl = balance_brl - p_amount, updated_at = now()
+      //     WHERE customer_id = p_customer_id;
+      //   END;
+      // $$;
       if (body.credits_mode) {
         try {
-          await supabase.rpc('deduct_credits', { p_user_id: userId, p_amount: 0.05 });
+          await supabase.rpc('deduct_credits', { p_customer_id: userId, p_amount: 0.05 });
         } catch (deductErr) {
           console.warn('[proxy/configure] Failed to deduct credits (non-fatal):', deductErr);
         }
@@ -354,6 +358,28 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
     });
     res.json(data);
   });
+});
+
+// ── ALL /api/proxy/:instance_id/* catch-all — forwards AI messages to VPS ────
+// Bug fix #4: enable credit check so depleted-balance users can't use credits mode
+router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+    const subPath = (req.params as Record<string, string>)[0] ?? '';
+    try {
+      const { data } = await axios({
+        method: req.method,
+        url: `${baseUrl}/ai/${subPath}`,
+        headers: { ...agentHeaders(agentSecret) },
+        data: req.body,
+        timeout: 60_000,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'AI proxy request failed' });
+    }
+  }, { checkCredits: true }); // Bug 4: credit check enabled
 });
 
 // ── GET /api/proxy/:instance_id/openai-status ────────────────────────────────

@@ -719,6 +719,15 @@ chown root:root /etc/oriclaw-agent.env
 
 # ── Criar usuário dedicado para o agente ─────────────────────────────────────
 useradd -r -s /usr/sbin/nologin oriclaw-agent 2>/dev/null || true
+usermod -aG systemd-journal oriclaw-agent   # Bug 2: read journald logs for QR/status
+usermod -aG openclaw oriclaw-agent           # Bug 1: write to /home/openclaw/.openclaw
+
+# Set group-writable permissions on openclaw config dir (Bug 1)
+chmod 775 /home/openclaw/.openclaw
+chmod 664 /home/openclaw/.openclaw/.env 2>/dev/null || true
+chmod 664 /home/openclaw/.openclaw/config.json 2>/dev/null || true
+# Ensure new files created in that dir are also group-writable
+chmod g+s /home/openclaw/.openclaw
 
 # Sudoers limitado para o agente
 cat > /etc/sudoers.d/oriclaw-agent << 'SUDOEOF'
