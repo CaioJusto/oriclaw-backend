@@ -77,7 +77,9 @@ router.get('/:customer_id', requireAuth, async (req: Request, res: Response): Pr
     res.json(sanitizeInstance(instance));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Query failed';
-    res.status(500).json({ error: msg });
+    console.error('[GET /instances/:customer_id]', msg);
+    const isDev = process.env.NODE_ENV !== 'production';
+    res.status(500).json({ error: isDev ? msg : 'Erro ao buscar instância. Tente novamente.' });
   }
 });
 
@@ -139,7 +141,9 @@ router.get('/:instance_id/status', requireAuth, async (req: Request, res: Respon
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Query failed';
-    res.status(500).json({ error: msg });
+    console.error('[GET /instances/:instance_id/status]', msg);
+    const isDev = process.env.NODE_ENV !== 'production';
+    res.status(500).json({ error: isDev ? msg : 'Erro ao buscar status da instância. Tente novamente.' });
   }
 });
 
