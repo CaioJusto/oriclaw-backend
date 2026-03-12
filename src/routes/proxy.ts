@@ -127,6 +127,7 @@ router.get('/:instance_id/health/detailed', async (req: Request, res: Response):
       const { data } = await axios.get(`${baseUrl}/health/detailed`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
+        httpsAgent: vpsHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -144,6 +145,7 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
       const { data } = await axios.get(`${baseUrl}/chat-url`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
+        httpsAgent: vpsHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -161,6 +163,7 @@ router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void
       const { data } = await axios.get(`${baseUrl}/qr`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
+        httpsAgent: vpsHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -376,6 +379,7 @@ router.get('/:instance_id/channels', async (req: Request, res: Response): Promis
       const { data } = await axios.get(`${baseUrl}/channels`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
+        httpsAgent: vpsHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
