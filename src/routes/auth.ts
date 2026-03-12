@@ -37,7 +37,7 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     return;
   }
 
-  const { instance_id, api_key } = req.body as { instance_id?: string; api_key?: string };
+  const { instance_id, api_key } = (req.body ?? {}) as { instance_id?: string; api_key?: string };
 
   if (!instance_id || !api_key) {
     res.status(400).json({ error: 'instance_id e api_key são obrigatórios.' });
@@ -66,8 +66,11 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
       res.status(400).json({ error: 'API Key OpenAI inválida. Verifique a chave e tente novamente.' });
       return;
     }
-    // Other errors (network timeout, etc.) — allow the key to be saved
-    console.warn('[auth/openai] key validation test failed:', err);
+    // Other errors (network timeout, etc.) — allow the key to be saved.
+    // Do NOT log the raw error object — axios error includes config.headers.Authorization
+    // which would expose the API key in plaintext in server logs.
+    const safeMsg = err instanceof Error ? err.message : String(err);
+    console.warn('[auth/openai] key validation test failed (non-fatal):', safeMsg);
   }
 
   // Ownership check — prevent IDOR write
@@ -100,8 +103,8 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     console.log(`[auth/openai/key] API key stored for instance=${instance_id} user=${userId}`);
     res.json({ success: true });
   } catch (err: unknown) {
-    console.error('[auth/openai/key]', err);
     const msg = err instanceof Error ? err.message : 'Failed to store API key';
+    console.error('[auth/openai/key]', msg);
     res.status(500).json({ error: msg });
   }
 });
