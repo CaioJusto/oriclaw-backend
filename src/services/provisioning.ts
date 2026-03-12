@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import axios from 'axios';
+import Stripe from 'stripe';
 import { deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
 import {
   createInstance,
@@ -32,33 +33,46 @@ export async function provisionInstance(
     );
   }
 
+  // Bug fix: reserve the semaphore slot BEFORE any async operation so that two
+  // concurrent calls can't both pass the >= check before either increments.
+  activeProvisioningCount++;
+
   // Generate random agent secret for this instance
   const agentSecret = crypto.randomBytes(32).toString('hex');
 
-  // Create DB record first (status='provisioning' — dashboard sees this immediately)
-  const instance = await createInstance({
-    customer_id: req.customer_id,
-    email: req.email,
-    plan: req.plan,
-    droplet_id: null,
-    droplet_ip: null,
-    status: 'provisioning',
-    stripe_subscription_id: req.stripe_subscription_id ?? null,
-    api_key_encrypted: req.api_key_anthropic ? encrypt(req.api_key_anthropic) : null,
-    metadata: { agent_secret: agentSecret },
-  });
-
-  // Bug fix #5: increment counter before async work; decrement when done
-  activeProvisioningCount++;
+  let instance: Awaited<ReturnType<typeof createInstance>>;
+  try {
+    // Create DB record first (status='provisioning' — dashboard sees this immediately)
+    instance = await createInstance({
+      customer_id: req.customer_id,
+      email: req.email,
+      plan: req.plan,
+      droplet_id: null,
+      droplet_ip: null,
+      status: 'provisioning',
+      stripe_subscription_id: req.stripe_subscription_id ?? null,
+      api_key_encrypted: req.api_key_anthropic ? encrypt(req.api_key_anthropic) : null,
+      metadata: { agent_secret: agentSecret },
+    });
+  } catch (dbErr) {
+    // If the DB insert fails, release the reserved slot before re-throwing
+    activeProvisioningCount--;
+    throw dbErr;
+  }
 
   // Create DO Droplet (non-blocking — status will update async)
-  createDropletAsync(instance.id, req.customer_id, agentSecret)
-    .catch((err) => {
-      console.error(`[provision] Droplet creation failed for ${instance.id}:`, err.message);
+  createDropletAsync(instance.id, req.customer_id, agentSecret, req.stripe_subscription_id ?? null)
+    .catch(async (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[provision] Droplet creation failed for ${instance.id}:`, msg);
+      // Attempt to cancel the Stripe subscription so the user isn't billed for a
+      // failed provisioning. Re-fetch the instance to get the subscription ID in
+      // case it was bound by customer.subscription.created after checkout.
+      await cancelSubscriptionForInstance(instance.id, req.stripe_subscription_id ?? null);
       // Bug fix #2: preserve agent_secret and add suspended_reason
       updateInstance(instance.id, {
         status: 'suspended',
-        metadata: { agent_secret: agentSecret, error: err.message, suspended_reason: 'provisioning_failed' },
+        metadata: { agent_secret: agentSecret, error: msg, suspended_reason: 'provisioning_failed' },
       }).catch(console.error);
     })
     .finally(() => {
@@ -74,10 +88,43 @@ const PLAN_SIZES: Record<string, string> = {
   'business': 's-4vcpu-8gb',
 };
 
+/**
+ * cancelSubscriptionForInstance — best-effort: cancel Stripe subscription for an
+ * instance whose provisioning failed so the user isn't billed for a broken VPS.
+ * Re-fetches the instance to get the latest stripe_subscription_id (it may have
+ * been bound by customer.subscription.created after checkout.session.completed).
+ */
+async function cancelSubscriptionForInstance(
+  instanceId: string,
+  knownSubId: string | null
+): Promise<void> {
+  if (!process.env.STRIPE_SECRET_KEY) return;
+  let subId = knownSubId;
+  if (!subId) {
+    try {
+      const latest = await getInstanceById(instanceId);
+      subId = latest?.stripe_subscription_id ?? null;
+    } catch { /* ignore — best effort */ }
+  }
+  if (!subId) return;
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
+  try {
+    await stripe.subscriptions.cancel(subId);
+    console.log(`[provision] Cancelled Stripe subscription ${subId} after provisioning failure for instance ${instanceId}`);
+  } catch (cancelErr: unknown) {
+    // 'already_cancelled' or similar errors are expected — just log and move on
+    console.error(
+      `[provision] Failed to cancel subscription ${subId}:`,
+      cancelErr instanceof Error ? cancelErr.message : String(cancelErr)
+    );
+  }
+}
+
 async function createDropletAsync(
   instanceId: string,
   customerId: string,
-  agentSecret: string
+  agentSecret: string,
+  stripeSubId: string | null
 ): Promise<void> {
   // Inject agent secret into cloud-init
   const cloudInit = CLOUD_INIT_SCRIPT.replace(/__AGENT_SECRET__/g, agentSecret);
@@ -106,6 +153,8 @@ async function createDropletAsync(
   }
 
   if (!ip) {
+    // Cancel Stripe subscription — user shouldn't be billed for a VPS without IP
+    await cancelSubscriptionForInstance(instanceId, stripeSubId);
     // Bug fix #2: add suspended_reason so dashboard can show meaningful message
     await updateInstance(instanceId, {
       status: 'suspended',
@@ -122,6 +171,8 @@ async function createDropletAsync(
   // Wait until VPS agent is responding on /health before exposing needs_config.
   const agentReady = await waitForAgentReadiness(ip, agentSecret, 20 * 60 * 1000);
   if (!agentReady) {
+    // Cancel Stripe subscription — user shouldn't be billed for an unresponsive VPS
+    await cancelSubscriptionForInstance(instanceId, stripeSubId);
     // Bug fix #2: add suspended_reason
     await updateInstance(instanceId, {
       droplet_ip: ip,
