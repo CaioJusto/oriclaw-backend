@@ -96,6 +96,29 @@ router.post(
           // If that stub exists, just bind the subscription ID and skip re-provisioning.
           const existingInstance = await getInstanceByCustomerId(supabaseUserId);
           if (existingInstance && existingInstance.status !== 'deleted') {
+            // Edge case: provisioning failed fast (before this webhook was delivered).
+            // The instance is already suspended — cancel the subscription immediately
+            // so the user isn't billed for a VPS that never came up.
+            if (existingInstance.status === 'suspended') {
+              const suspMeta = (existingInstance.metadata ?? {}) as Record<string, unknown>;
+              const isProvFail = typeof suspMeta.suspended_reason === 'string' &&
+                suspMeta.suspended_reason.startsWith('provisioning_failed');
+              if (isProvFail) {
+                console.warn(
+                  `[webhook] Instance ${existingInstance.id} already suspended (provisioning failure) — cancelling subscription ${subscription.id}`
+                );
+                try {
+                  await stripe.subscriptions.cancel(subscription.id);
+                } catch (cancelErr: unknown) {
+                  console.error('[webhook] Failed to cancel subscription for suspended instance:',
+                    cancelErr instanceof Error ? cancelErr.message : String(cancelErr));
+                }
+                // Bind for record-keeping (enables idempotency if webhook retries)
+                await updateInstance(existingInstance.id, { stripe_subscription_id: subscription.id });
+                break;
+              }
+            }
+
             if (!existingInstance.stripe_subscription_id) {
               // Bind subscription ID to the stub created by checkout.session.completed
               await updateInstance(existingInstance.id, { stripe_subscription_id: subscription.id });
