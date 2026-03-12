@@ -21,5 +21,5 @@ export function decrypt(encryptedText: string): string {
   const data = Buffer.from(dataHex, 'hex');
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
-  return decipher.update(data) + decipher.final('utf8');
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
 }

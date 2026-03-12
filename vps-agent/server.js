@@ -62,6 +62,18 @@ function getJournalLogs(lines = 200) {
   }
 }
 
+function getJournalLogsSinceLastStart(lines = 200) {
+  try {
+    const startTs = runCmd('systemctl show openclaw --property=ActiveEnterTimestamp --value').trim();
+    if (startTs && startTs !== 'n/a' && startTs !== '') {
+      return runCmd(`journalctl -u openclaw -n ${lines} --no-pager --output=short-iso --since "${startTs}"`);
+    }
+    return runCmd(`journalctl -u openclaw -n ${lines} --no-pager --output=short-iso`);
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Read and parse the .env file into a plain object.
  */
@@ -256,7 +268,7 @@ function isWhatsAppConnected(isRunning, logs) {
 
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
-  const logs = getJournalLogs(200);
+  const logs = getJournalLogsSinceLastStart(200);
   const isRunning = getOpenclawStatus() === 'running';
 
   if (isWhatsAppConnected(isRunning, logs)) {
@@ -275,7 +287,7 @@ app.get('/qr', auth, async (req, res) => {
       width: 300,
       margin: 2,
     });
-    res.json({ connected: false, qr: pngBase64 });
+    res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
   } catch (err) {
     res.status(500).json({ error: 'Failed to generate QR: ' + err.message });
   }
@@ -437,7 +449,7 @@ app.get('/channels', auth, (req, res) => {
   try {
     const config = readConfig();
     const env = readEnvFile();
-    const logs = getJournalLogs(100);
+    const logs = getJournalLogsSinceLastStart(100);
     const isRunning = getOpenclawStatus() === 'running';
     const waConnected = isWhatsAppConnected(isRunning, logs);
 

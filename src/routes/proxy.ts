@@ -55,7 +55,7 @@ function agentHeaders(secret: string) {
 async function withInstance(
   req: Request,
   res: Response,
-  handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>> }) => Promise<void>
+  handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>>; userId: string }) => Promise<void>
 ): Promise<void> {
   try {
     const userId = await getUserFromRequest(req);
@@ -64,7 +64,7 @@ async function withInstance(
       return;
     }
     const ctx = await resolveInstance(req.params.instance_id, userId);
-    await handler(ctx);
+    await handler({ ...ctx, userId });
   } catch (err: unknown) {
     const e = err as Error & { status?: number };
     const status = e.status ?? 500;
@@ -137,7 +137,14 @@ router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void
 
 // ── POST /api/proxy/:instance_id/configure ──────────────────────────────────
 router.post('/:instance_id/configure', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret, instance }) => {
+  const MAX_SYSTEM_PROMPT_BYTES = 8_000;
+  if (typeof req.body.system_prompt === 'string' &&
+      Buffer.byteLength(req.body.system_prompt, 'utf8') > MAX_SYSTEM_PROMPT_BYTES) {
+    res.status(413).json({ error: `system_prompt excede o limite de ${MAX_SYSTEM_PROMPT_BYTES} bytes (8KB).` });
+    return;
+  }
+
+  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
     const body = { ...req.body } as Record<string, unknown>;
 
     // Inject ORICLAW_OPENROUTER_KEY server-side when credits mode is requested
@@ -185,6 +192,8 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       body.openai_token = openaiToken;
     }
 
+    console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${body.credits_mode ? 'credits' : 'byok'} ip=${req.ip}`);
+
     const { data } = await axios.post(`${baseUrl}/configure`, body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
@@ -223,7 +232,8 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
 
 // ── POST /api/proxy/:instance_id/restart ────────────────────────────────────
 router.post('/:instance_id/restart', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+    console.log(`[audit] restart: user=${userId} instance=${instance?.id} ip=${req.ip}`);
     const { data } = await axios.post(`${baseUrl}/restart`, {}, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
@@ -284,8 +294,10 @@ router.post('/:instance_id/channels/discord', async (req: Request, res: Response
 
 // ── DELETE /api/proxy/:instance_id/channels/:channel ─────────────────────────
 router.delete('/:instance_id/channels/:channel', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
-    const { data } = await axios.delete(`${baseUrl}/channels/${req.params.channel}`, {
+  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+    const channel = req.params.channel;
+    console.log(`[audit] disconnect: user=${userId} instance=${instance?.id} channel=${channel} ip=${req.ip}`);
+    const { data } = await axios.delete(`${baseUrl}/channels/${channel}`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
     });
