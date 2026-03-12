@@ -1,5 +1,4 @@
 import axios from 'axios';
-import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { DODroplet, DODropletResponse } from '../types';
 
 const DO_API_BASE = 'https://api.digitalocean.com/v2';
@@ -11,26 +10,7 @@ function getHeaders() {
   };
 }
 
-export async function createDroplet(customerId: string): Promise<DODroplet> {
-  const dropletConfig = {
-    name: `oriclaw-${customerId}`,
-    region: 'nyc3',
-    size: 's-1vcpu-2gb',
-    image: 'ubuntu-22-04-x64',
-    user_data: CLOUD_INIT_SCRIPT,
-    tags: ['oriclaw', `customer:${customerId}`],
-    monitoring: true,
-    ipv6: false,
-  };
-
-  const response = await axios.post<DODropletResponse>(
-    `${DO_API_BASE}/droplets`,
-    dropletConfig,
-    { headers: getHeaders() }
-  );
-
-  return response.data.droplet;
-}
+// NOTE: createDroplet was removed — provisioning uses createDropletWithInit exclusively.
 
 export async function getDroplet(dropletId: number): Promise<DODroplet> {
   const response = await axios.get<DODropletResponse>(
@@ -42,9 +22,16 @@ export async function getDroplet(dropletId: number): Promise<DODroplet> {
 }
 
 export async function deleteDroplet(dropletId: number): Promise<void> {
-  await axios.delete(`${DO_API_BASE}/droplets/${dropletId}`, {
-    headers: getHeaders(),
-  });
+  try {
+    await axios.delete(`${DO_API_BASE}/droplets/${dropletId}`, {
+      headers: getHeaders(),
+    });
+  } catch (err: unknown) {
+    // Bug fix #3: treat 404 as success — droplet was already deleted (idempotent)
+    const axErr = err as { response?: { status?: number } };
+    if (axErr.response?.status === 404) return;
+    throw err;
+  }
 }
 
 export function getDropletPublicIP(droplet: DODroplet): string | null {

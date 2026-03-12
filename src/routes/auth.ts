@@ -1,23 +1,20 @@
 /**
- * Auth routes — OpenAI OAuth flow for ChatGPT Plus integration.
+ * Auth routes — OpenAI API Key storage for ChatGPT/GPT-4 integration.
  *
- * Flow:
- *  1. Dashboard calls GET /api/auth/openai/url/:instance_id → gets OAuth URL
- *  2. User is redirected to OpenAI to approve access
- *  3. OpenAI redirects to APP_URL/auth/openai/callback?code=X&state=instance_id
- *  4. Callback page calls POST /api/auth/openai/exchange → token stored in Supabase
- *  5. Dashboard polls GET /api/proxy/:instance_id/openai-status until connected
+ * NOTE: The original OAuth flow using https://auth.openai.com/authorize and
+ * https://auth.openai.com/oauth/token was removed because OpenAI does NOT
+ * offer public OAuth for ChatGPT Plus subscribers. Those endpoints do not exist.
+ *
+ * Replacement flow (BYOK — Bring Your Own Key):
+ *  1. User enters their OpenAI API key in the dashboard
+ *  2. Dashboard calls POST /api/auth/openai/key → key encrypted and stored in Supabase
+ *  3. Dashboard calls POST /api/proxy/:id/configure (chatgpt_mode: true) → VPS configured
  */
 import { Router, Request, Response } from 'express';
-import axios from 'axios';
 import { getInstanceById, getInstanceByCustomerId, updateInstance, supabase } from '../services/supabase';
 import { encrypt } from '../services/crypto';
 
 const router = Router();
-
-const OPENAI_CLIENT_ID = process.env.OPENAI_CLIENT_ID ?? '';
-const OPENAI_CLIENT_SECRET = process.env.OPENAI_CLIENT_SECRET ?? '';
-const APP_URL = process.env.APP_URL ?? 'https://oriclaw.com.br';
 
 // ── Auth helper ──────────────────────────────────────────────────────────────
 async function getUserId(req: Request): Promise<string | null> {
@@ -29,109 +26,79 @@ async function getUserId(req: Request): Promise<string | null> {
   return data.user.id;
 }
 
-// ── GET /api/auth/openai/url/:instance_id ────────────────────────────────────
-// Returns the OpenAI OAuth authorization URL.
-router.get('/openai/url/:instance_id', async (req: Request, res: Response): Promise<void> => {
-  const userId = await getUserId(req);
-  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
-
-  const instance = await getInstanceById(req.params.instance_id);
-  if (!instance || instance.customer_id !== userId) {
-    res.status(403).json({ error: 'Forbidden' }); return;
-  }
-
-  if (!OPENAI_CLIENT_ID) {
-    res.status(500).json({ error: 'OpenAI OAuth not configured on server' }); return;
-  }
-
-  const redirectUri = `${APP_URL}/auth/openai/callback`;
-  const state = req.params.instance_id;
-
-  const url = [
-    'https://auth.openai.com/authorize',
-    `?client_id=${encodeURIComponent(OPENAI_CLIENT_ID)}`,
-    `&redirect_uri=${encodeURIComponent(redirectUri)}`,
-    `&response_type=code`,
-    `&scope=openid+email+profile`,
-    `&state=${encodeURIComponent(state)}`,
-  ].join('');
-
-  res.json({ url });
-});
-
-// ── POST /api/auth/openai/exchange ───────────────────────────────────────────
-// Exchanges an authorization code for an OpenAI access token and stores it
-// in the instance metadata so the configure route can inject it into the VPS.
-// Body: { code: string, instance_id: string, redirect_uri?: string }
-router.post('/openai/exchange', async (req: Request, res: Response): Promise<void> => {
-  const { code, instance_id, redirect_uri } = req.body as {
-    code?: string;
-    instance_id?: string;
-    redirect_uri?: string;
-  };
-
-  if (!code || !instance_id) {
-    res.status(400).json({ error: 'Missing code or instance_id' }); return;
-  }
-
-  // Ownership check — prevent IDOR write
+// ── POST /api/auth/openai/key ────────────────────────────────────────────────
+// Receives an OpenAI API key, encrypts it, and stores it in the instance metadata.
+// Body: { instance_id: string, api_key: string }
+router.post('/openai/key', async (req: Request, res: Response): Promise<void> => {
   const userId = await getUserId(req);
   if (!userId) {
     res.status(401).json({ error: 'Autenticação obrigatória.' });
     return;
   }
 
+  const { instance_id, api_key } = req.body as { instance_id?: string; api_key?: string };
+
+  if (!instance_id || !api_key) {
+    res.status(400).json({ error: 'instance_id e api_key são obrigatórios.' });
+    return;
+  }
+
+  // Basic API key format validation (sk-... or sk-proj-...)
+  if (!api_key.startsWith('sk-') || api_key.length < 20) {
+    res.status(400).json({ error: 'Chave de API OpenAI inválida. Deve começar com "sk-".' });
+    return;
+  }
+
+  // Ownership check — prevent IDOR write
   const ownedInstance = await getInstanceByCustomerId(userId);
   if (!ownedInstance || ownedInstance.id !== instance_id) {
     res.status(403).json({ error: 'Acesso negado.' });
     return;
   }
 
-  if (!OPENAI_CLIENT_ID || !OPENAI_CLIENT_SECRET) {
-    res.status(500).json({ error: 'OpenAI OAuth credentials not configured on server' }); return;
+  const instance = await getInstanceById(instance_id);
+  if (!instance) {
+    res.status(404).json({ error: 'Instância não encontrada.' });
+    return;
   }
 
-  const callbackUri = redirect_uri ?? `${APP_URL}/auth/openai/callback`;
-
   try {
-    // Exchange code for access token
-    const tokenRes = await axios.post<{ access_token: string; token_type: string }>(
-      'https://auth.openai.com/oauth/token',
-      {
-        client_id: OPENAI_CLIENT_ID,
-        client_secret: OPENAI_CLIENT_SECRET,
-        code,
-        grant_type: 'authorization_code',
-        redirect_uri: callbackUri,
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15_000 }
-    );
-
-    const { access_token } = tokenRes.data;
-
-    // Store token in Supabase instance metadata (encrypted)
-    const instance = await getInstanceById(instance_id);
-    if (!instance) { res.status(404).json({ error: 'Instância não encontrada.' }); return; }
-
-    const encryptedToken = encrypt(access_token);
+    const encryptedKey = encrypt(api_key);
     const existingMeta = (instance.metadata ?? {}) as Record<string, unknown>;
-    // Remove plaintext token if present
-    const { openai_access_token: _plaintext, ...cleanMeta } = existingMeta as Record<string, unknown> & { openai_access_token?: unknown };
     await updateInstance(instance_id, {
       metadata: {
-        ...cleanMeta,
+        ...existingMeta,
         chatgpt_connected: true,
-        openai_access_token_encrypted: encryptedToken,
+        openai_api_key_encrypted: encryptedKey,
+        // Remove any legacy OAuth fields if present
+        openai_access_token_encrypted: undefined,
+        openai_access_token: undefined,
       },
     });
 
+    console.log(`[auth/openai/key] API key stored for instance=${instance_id} user=${userId}`);
     res.json({ success: true });
   } catch (err: unknown) {
-    console.error('[openai/exchange]', err);
-    const axErr = err as { response?: { data?: unknown; status?: number } };
-    const detail = axErr.response?.data ?? (err instanceof Error ? err.message : 'OAuth exchange failed');
-    res.status(axErr.response?.status ?? 500).json({ error: detail });
+    console.error('[auth/openai/key]', err);
+    const msg = err instanceof Error ? err.message : 'Failed to store API key';
+    res.status(500).json({ error: msg });
   }
+});
+
+// ── GET /api/auth/openai/status/:instance_id ─────────────────────────────────
+// Returns whether the instance has an OpenAI API key stored.
+// (Kept for backwards compatibility with polling logic in the dashboard)
+router.get('/openai/status/:instance_id', async (req: Request, res: Response): Promise<void> => {
+  const userId = await getUserId(req);
+  if (!userId) { res.status(401).json({ error: 'Não autorizado.' }); return; }
+
+  const instance = await getInstanceById(req.params.instance_id);
+  if (!instance || instance.customer_id !== userId) {
+    res.status(403).json({ error: 'Acesso negado.' }); return;
+  }
+
+  const meta = (instance.metadata ?? {}) as Record<string, unknown>;
+  res.json({ connected: !!meta.chatgpt_connected });
 });
 
 export default router;

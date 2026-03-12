@@ -180,15 +180,12 @@ router.post(
           break;
         }
 
-        // Legacy: keep payment_intent.succeeded handling for old PaymentIntent-based flows
+        // Bug fix #10: payment_intent.succeeded intentionally does NOT handle credits.
+        // Stripe fires BOTH checkout.session.completed AND payment_intent.succeeded for
+        // the same purchase. Credits are exclusively handled in checkout.session.completed
+        // (mode: 'payment') to prevent double-crediting. Do NOT add credit logic here.
         case 'payment_intent.succeeded': {
-          const pi = event.data.object as Stripe.PaymentIntent;
-          const customerId = pi.metadata?.customer_id;
-          const creditsBrl = parseFloat(pi.metadata?.credits_brl ?? '0');
-          if (customerId && creditsBrl > 0) {
-            await addCredits(customerId, creditsBrl);
-            console.log(`[webhook] Added R$${creditsBrl} credits to ${customerId} (legacy PaymentIntent)`);
-          }
+          console.log(`[webhook] payment_intent.succeeded received — no action taken (credits handled in checkout.session.completed)`);
           break;
         }
 

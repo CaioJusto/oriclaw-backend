@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import axios from 'axios';
-import { createDroplet, deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
+import { deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
 import {
   createInstance,
   getInstanceById,

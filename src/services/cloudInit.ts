@@ -408,11 +408,16 @@ app.post('/configure', auth, (req, res) => {
   } = req.body || {};
 
   try {
-    // Update config.json
+    // Update config.json — Bug fix #7: validate model, channel, assistant_name inputs
+    const VALID_MODELS = ['claude-sonnet-4-5', 'claude-3-5-haiku-latest', 'claude-opus-4', 'gpt-4o', 'gpt-4o-mini'];
+    const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
+    const safeModel = model && VALID_MODELS.includes(model) ? model : null;
+    const safeChannel = channel && VALID_CHANNELS.includes(channel) ? channel : null;
+    const safeName = assistant_name ? String(assistant_name).slice(0, 64).replace(/[^\w\s\-]/g, '') : null;
     const configUpdates = {};
-    if (model) configUpdates.model = model;
-    if (channel) configUpdates.channel = channel;
-    if (assistant_name) configUpdates.assistant_name = assistant_name;
+    if (safeModel) configUpdates.model = safeModel;
+    if (safeChannel) configUpdates.channel = safeChannel;
+    if (safeName) configUpdates.assistant_name = safeName;
     if (credits_mode) configUpdates.ai_mode = 'credits';
     else if (chatgpt_mode) configUpdates.ai_mode = 'chatgpt';
     else if (anthropic_key || openai_key || google_key || openrouter_key) configUpdates.ai_mode = 'byok';
@@ -590,10 +595,30 @@ app.post('/channels/telegram', auth, async (req, res) => {
 });
 
 // POST /channels/discord → body: { token, guild_id }
-app.post('/channels/discord', auth, (req, res) => {
+// Bug fix #8: validate Discord bot token and guild_id before saving
+app.post('/channels/discord', auth, async (req, res) => {
   const { token, guild_id } = req.body || {};
   if (!token || !guild_id) {
     return res.status(400).json({ error: 'Token e ID do servidor (guild_id) são obrigatórios.' });
+  }
+
+  // Validate guild_id is numeric
+  if (!/^\d+$/.test(guild_id)) {
+    return res.status(400).json({ error: 'guild_id deve ser um número.' });
+  }
+
+  // Validate Discord bot token against the API
+  try {
+    const discordRes = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: \`Bot \${token}\` }
+    });
+    if (!discordRes.ok) {
+      return res.status(400).json({ error: 'Token Discord inválido. Verifique o bot token.' });
+    }
+    const botInfo = await discordRes.json();
+    console.log(\`[channels] Discord bot verified: \${botInfo.username}\`);
+  } catch (err) {
+    return res.status(500).json({ error: 'Não foi possível verificar o token Discord. Tente novamente.' });
   }
 
   try {

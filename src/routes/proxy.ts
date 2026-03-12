@@ -25,7 +25,7 @@ async function getUserFromRequest(req: Request): Promise<string | null> {
 }
 
 // ── Instance ownership check + VPS URL builder ──────────────────────────────
-async function resolveInstance(instanceId: string, userId: string) {
+async function resolveInstance(instanceId: string, userId: string, checkCredits = false) {
   const instance = await getInstanceById(instanceId);
   if (!instance) throw Object.assign(new Error('Instância não encontrada.'), { status: 404 });
   if (instance.customer_id !== userId) {
@@ -44,6 +44,26 @@ async function resolveInstance(instanceId: string, userId: string) {
   if (!agentSecret) {
     throw Object.assign(new Error('Agent secret missing for instance'), { status: 500 });
   }
+
+  // ── Bug fix #5: Block proxy requests when credits balance is depleted ──────
+  if (checkCredits) {
+    const meta = (instance.metadata ?? {}) as Record<string, unknown>;
+    if (meta.ai_mode === 'credits') {
+      const { data: creditsRow } = await supabase
+        .from('oriclaw_credits')
+        .select('balance_brl')
+        .eq('customer_id', userId)
+        .maybeSingle();
+      const balance = (creditsRow as { balance_brl: number } | null)?.balance_brl ?? 0;
+      if (balance <= 0) {
+        throw Object.assign(
+          new Error('Saldo insuficiente. Recarregue seus créditos.'),
+          { status: 402 }
+        );
+      }
+    }
+  }
+
   return { instance, baseUrl: `http://${instance.droplet_ip}:8080`, agentSecret };
 }
 
@@ -55,7 +75,8 @@ function agentHeaders(secret: string) {
 async function withInstance(
   req: Request,
   res: Response,
-  handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>>; userId: string }) => Promise<void>
+  handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>>; userId: string }) => Promise<void>,
+  { checkCredits = false } = {}
 ): Promise<void> {
   try {
     const userId = await getUserFromRequest(req);
@@ -63,7 +84,7 @@ async function withInstance(
       res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
       return;
     }
-    const ctx = await resolveInstance(req.params.instance_id, userId);
+    const ctx = await resolveInstance(req.params.instance_id, userId, checkCredits);
     await handler({ ...ctx, userId });
   } catch (err: unknown) {
     const e = err as Error & { status?: number };
@@ -147,8 +168,20 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
   await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
     const body = { ...req.body } as Record<string, unknown>;
 
-    // Inject ORICLAW_OPENROUTER_KEY server-side when credits mode is requested
+    // ── Bug fix #5: Credits mode — enforce balance check before configuring ──
     if (body.credits_mode) {
+      const { data: creditsRow } = await supabase
+        .from('oriclaw_credits')
+        .select('balance_brl')
+        .eq('customer_id', userId)
+        .maybeSingle();
+      const balance = (creditsRow as { balance_brl: number } | null)?.balance_brl ?? 0;
+      if (balance <= 0) {
+        res.status(402).json({ error: 'Saldo insuficiente. Recarregue seus créditos.' });
+        return;
+      }
+
+      // Inject ORICLAW_OPENROUTER_KEY server-side when credits mode is requested
       const orKey = process.env.ORICLAW_OPENROUTER_KEY;
       if (!orKey) {
         res.status(500).json({ error: 'OriClaw OpenRouter key not configured on server' });
@@ -178,18 +211,22 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       }
     }
 
-    // Inject stored OpenAI OAuth token when ChatGPT Plus mode is requested
+    // ── Bug fix #2: ChatGPT mode now uses stored API key (not OAuth token) ──
     if (body.chatgpt_mode) {
       const meta = (instance?.metadata ?? {}) as Record<string, unknown>;
-      const encryptedToken = meta.openai_access_token_encrypted as string | undefined;
-      const openaiToken = encryptedToken
-        ? decrypt(encryptedToken)
-        : (meta.openai_access_token as string | undefined);
-      if (!openaiToken) {
-        res.status(400).json({ error: 'ChatGPT Plus não conectado. Complete o OAuth primeiro.' });
+      // Support new api_key_encrypted field (BYOK) and legacy OAuth token field
+      const encryptedKey = (meta.openai_api_key_encrypted ?? meta.openai_access_token_encrypted) as string | undefined;
+      if (!encryptedKey) {
+        res.status(400).json({ error: 'Chave OpenAI não configurada. Adicione sua API key OpenAI primeiro.' });
         return;
       }
-      body.openai_token = openaiToken;
+      try {
+        body.openai_key = decrypt(encryptedKey);
+      } catch (decryptErr) {
+        console.error('[proxy/configure] Failed to decrypt OpenAI key:', decryptErr);
+        res.status(500).json({ error: 'Falha ao decriptar chave OpenAI. Reconfigure sua API key.' });
+        return;
+      }
     }
 
     console.log(`[audit] configure: user=${userId} instance=${instance?.id} ai_mode=${body.credits_mode ? 'credits' : 'byok'} ip=${req.ip}`);
@@ -222,6 +259,20 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         } catch (cryptoErr) {
           console.warn('[proxy/configure] Failed to persist API key:', cryptoErr);
           // Non-fatal — continua
+        }
+      }
+
+      // ── Bug fix #5: Deduct a small setup credit when configuring in credits mode ─
+      // Ongoing per-message deduction is handled via the Supabase RPC deduct_credits.
+      // SQL function: CREATE OR REPLACE FUNCTION deduct_credits(p_user_id uuid, p_amount numeric)
+      //   RETURNS void LANGUAGE plpgsql AS $$ BEGIN
+      //     UPDATE oriclaw_credits SET balance_brl = balance_brl - p_amount WHERE user_id = p_user_id;
+      //   END; $$;
+      if (body.credits_mode) {
+        try {
+          await supabase.rpc('deduct_credits', { p_user_id: userId, p_amount: 0.05 });
+        } catch (deductErr) {
+          console.warn('[proxy/configure] Failed to deduct credits (non-fatal):', deductErr);
         }
       }
     }
