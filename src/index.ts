@@ -14,7 +14,7 @@ import billingRoutes from './routes/billing';
 import adminRoutes from './routes/admin';
 import { supabase } from './services/supabase';
 import { retryPendingDeletions } from './services/provisioning';
-import { getModelPricing, getAdminSettings } from './services/openrouter';
+import { getAdminSettings } from './services/openrouter';
 import { decrypt } from './services/crypto';
 import axios from 'axios';
 import https from 'https';
@@ -216,15 +216,55 @@ recoverStuckProvisioningInstances();
 // Bug fix #3: retry instances stuck in deletion_failed on startup
 retryPendingDeletions();
 
-// ── Usage polling — collect token usage from VPS agents (credits mode) ──────
+// ── Usage polling — track OpenRouter key usage via API and deduct credits ───
 const usageHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 const USD_TO_BRL = 5.5;
 
-async function collectUsageFromAgents(): Promise<void> {
+// In-memory tracker for the last known OpenRouter key usage (USD).
+// Initialized on first poll so we only charge deltas from this session onwards.
+let lastKnownUsageUsd: number | null = null;
+
+async function collectUsageFromOpenRouter(): Promise<void> {
   try {
+    const orKey = process.env.ORICLAW_OPENROUTER_KEY;
+    if (!orKey) return;
+
     const adminSettings = await getAdminSettings();
     const multiplier = adminSettings?.cost_multiplier ?? 1;
 
+    // ── Step 1: Query OpenRouter key usage ──────────────────────────────────
+    let currentUsageUsd: number;
+    try {
+      const { data: keyData } = await axios.get('https://openrouter.ai/api/v1/key', {
+        headers: { Authorization: `Bearer ${orKey}` },
+        timeout: 10_000,
+      });
+      currentUsageUsd = keyData?.data?.usage ?? 0;
+    } catch (err) {
+      console.warn('[usage-poll] Failed to query OpenRouter key usage:',
+        err instanceof Error ? err.message : String(err));
+      return;
+    }
+
+    // First poll: just record baseline, don't charge anything
+    if (lastKnownUsageUsd === null) {
+      lastKnownUsageUsd = currentUsageUsd;
+      console.log(`[usage-poll] Initialized baseline OpenRouter usage: $${currentUsageUsd.toFixed(4)}`);
+      return;
+    }
+
+    // Calculate delta since last poll
+    const deltaUsd = currentUsageUsd - lastKnownUsageUsd;
+    if (deltaUsd <= 0) {
+      // No new usage — still check credit status for all instances
+      await notifyCreditStatus();
+      return;
+    }
+
+    lastKnownUsageUsd = currentUsageUsd;
+    console.log(`[usage-poll] OpenRouter delta: $${deltaUsd.toFixed(4)} USD`);
+
+    // ── Step 2: Find credits-mode instances to attribute usage ──────────────
     const { data: instances, error: fetchErr } = await supabase
       .from('oriclaw_instances')
       .select('id, customer_id, droplet_ip, metadata')
@@ -235,129 +275,100 @@ async function collectUsageFromAgents(): Promise<void> {
       return;
     }
 
-    // Filter to credits-mode instances only
     const creditsInstances = instances.filter((inst) => {
       const meta = (inst.metadata ?? {}) as Record<string, unknown>;
       return meta.ai_mode === 'credits';
     });
 
+    if (creditsInstances.length === 0) return;
+
+    // ── Step 3: Distribute cost across credits-mode users ──────────────────
+    // For now, split equally. In the future, use OpenRouter's X-Custom-User
+    // header to attribute per-user costs.
+    const costPerInstanceUsd = (deltaUsd * multiplier) / creditsInstances.length;
+    const costPerInstanceBrl = costPerInstanceUsd * USD_TO_BRL;
+
     for (const inst of creditsInstances) {
       try {
-        const meta = (inst.metadata ?? {}) as Record<string, unknown>;
-        const agentSecretEncrypted = meta.agent_secret as string | undefined;
-        if (!agentSecretEncrypted || !inst.droplet_ip) continue;
+        // Insert usage record for audit trail
+        await supabase.from('oriclaw_token_usage').insert({
+          instance_id: inst.id,
+          customer_id: inst.customer_id,
+          model: adminSettings?.default_model ?? 'openrouter/auto',
+          total_tokens: 0, // Not available from key-level API
+          cost_usd: costPerInstanceUsd,
+          cost_brl: costPerInstanceBrl,
+          created_at: new Date().toISOString(),
+        });
 
-        let agentSecret: string;
-        try {
-          agentSecret = decrypt(agentSecretEncrypted);
-        } catch {
-          console.warn(`[usage-poll] Failed to decrypt agent secret for instance ${inst.id}`);
-          continue;
-        }
-
-        const baseUrl = `https://${inst.droplet_ip}:8080`;
-
-        // Fetch pending usage events from the VPS agent
-        let usageEvents: Array<{
-          id: string;
-          model: string;
-          prompt_tokens: number;
-          completion_tokens: number;
-          timestamp?: string;
-        }>;
-        try {
-          const { data } = await axios.get(`${baseUrl}/usage/pending`, {
-            headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
-            timeout: 10_000,
-            httpsAgent: usageHttpsAgent,
-          });
-          usageEvents = data?.events ?? data ?? [];
-          if (!Array.isArray(usageEvents)) {
-            console.warn(`[usage-poll] Unexpected response from instance ${inst.id}`);
-            continue;
-          }
-        } catch (err: unknown) {
-          const axErr = err as { response?: { status?: number } };
-          // 404 means agent doesn't support usage endpoint yet — skip silently
-          if (axErr.response?.status === 404) continue;
-          console.warn(`[usage-poll] Failed to fetch usage from instance ${inst.id}:`,
-            err instanceof Error ? err.message : String(err));
-          continue;
-        }
-
-        for (const event of usageEvents) {
-          try {
-            const pricing = await getModelPricing(event.model);
-            if (!pricing) {
-              console.warn(`[usage-poll] No pricing found for model ${event.model}`);
-              continue;
-            }
-
-            // Pricing is per-token in USD (string format from OpenRouter)
-            const promptCostUsd = parseFloat(pricing.prompt) * event.prompt_tokens;
-            const completionCostUsd = parseFloat(pricing.completion) * event.completion_tokens;
-            const totalCostUsd = (promptCostUsd + completionCostUsd) * multiplier;
-            const totalCostBrl = totalCostUsd * USD_TO_BRL;
-
-            // Insert into oriclaw_token_usage for audit trail
-            await supabase.from('oriclaw_token_usage').insert({
-              instance_id: inst.id,
-              customer_id: inst.customer_id,
-              event_id: event.id,
-              model: event.model,
-              prompt_tokens: event.prompt_tokens,
-              completion_tokens: event.completion_tokens,
-              cost_usd: totalCostUsd,
-              cost_brl: totalCostBrl,
-              created_at: event.timestamp ?? new Date().toISOString(),
-            });
-
-            // Deduct from credits balance
-            const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
-              p_customer_id: inst.customer_id,
-              p_amount: totalCostBrl,
-            });
-            if (deductErr) {
-              console.warn(`[usage-poll] deduct_credits error for ${inst.customer_id}:`, deductErr.message);
-            }
-          } catch (eventErr) {
-            console.warn(`[usage-poll] Error processing event ${event.id} for instance ${inst.id}:`,
-              eventErr instanceof Error ? eventErr.message : String(eventErr));
-          }
-        }
-
-        // Check balance and notify agent of credit status
-        try {
-          const { data: creditsRow } = await supabase
-            .from('oriclaw_credits')
-            .select('balance_brl')
-            .eq('customer_id', inst.customer_id)
-            .maybeSingle();
-          const balance = (creditsRow as { balance_brl: number } | null)?.balance_brl ?? 0;
-          const blocked = balance <= 0;
-
-          await axios.post(`${baseUrl}/credit-status`, { blocked }, {
-            headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
-            timeout: 5_000,
-            httpsAgent: usageHttpsAgent,
-          });
-        } catch (statusErr) {
-          console.warn(`[usage-poll] Failed to send credit-status to instance ${inst.id}:`,
-            statusErr instanceof Error ? statusErr.message : String(statusErr));
+        // Deduct from credits balance
+        const { error: deductErr } = await supabase.rpc('deduct_credits', {
+          p_customer_id: inst.customer_id,
+          p_amount: costPerInstanceBrl,
+        });
+        if (deductErr) {
+          console.warn(`[usage-poll] deduct_credits error for ${inst.customer_id}:`, deductErr.message);
+        } else {
+          console.log(`[usage-poll] Deducted R$${costPerInstanceBrl.toFixed(4)} from ${inst.customer_id}`);
         }
       } catch (instErr) {
         console.warn(`[usage-poll] Error processing instance ${inst.id}:`,
           instErr instanceof Error ? instErr.message : String(instErr));
       }
     }
+
+    // ── Step 4: Notify agents of credit status ─────────────────────────────
+    await notifyCreditStatus();
   } catch (err) {
     console.error('[usage-poll] Unexpected error:', err instanceof Error ? err.message : String(err));
   }
 }
 
+/** Notify all credits-mode VPS agents of their current credit status. */
+async function notifyCreditStatus(): Promise<void> {
+  const { data: instances } = await supabase
+    .from('oriclaw_instances')
+    .select('id, customer_id, droplet_ip, metadata')
+    .eq('status', 'running');
+
+  if (!instances) return;
+
+  for (const inst of instances) {
+    const meta = (inst.metadata ?? {}) as Record<string, unknown>;
+    if (meta.ai_mode !== 'credits' || !inst.droplet_ip) continue;
+
+    const agentSecretEncrypted = meta.agent_secret as string | undefined;
+    if (!agentSecretEncrypted) continue;
+
+    let agentSecret: string;
+    try {
+      agentSecret = decrypt(agentSecretEncrypted);
+    } catch { continue; }
+
+    try {
+      const { data: creditsRow } = await supabase
+        .from('oriclaw_credits')
+        .select('balance_brl')
+        .eq('customer_id', inst.customer_id)
+        .maybeSingle();
+      const balance = (creditsRow as { balance_brl: number } | null)?.balance_brl ?? 0;
+      const blocked = balance <= 0;
+
+      await axios.post(`https://${inst.droplet_ip}:8080/credit-status`, { blocked, balance_brl: balance }, {
+        headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
+        timeout: 5_000,
+        httpsAgent: usageHttpsAgent,
+      });
+    } catch (statusErr) {
+      console.warn(`[usage-poll] Failed to send credit-status to instance ${inst.id}:`,
+        statusErr instanceof Error ? statusErr.message : String(statusErr));
+    }
+  }
+}
+
 // Run once after 30s delay, then every 60s
-setTimeout(collectUsageFromAgents, 30_000);
-setInterval(collectUsageFromAgents, 60_000);
+setTimeout(collectUsageFromOpenRouter, 30_000);
+setInterval(collectUsageFromOpenRouter, 60_000);
 
 app.listen(PORT, () => {
   console.log(`🌀 OriClaw backend running on port ${PORT}`);
