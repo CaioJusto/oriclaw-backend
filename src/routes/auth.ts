@@ -13,12 +13,13 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import axios from 'axios';
-import https from 'https';
 import { getInstanceById, getInstanceByCustomerId, updateInstance } from '../services/supabase';
 import { encrypt, decrypt } from '../services/crypto';
 import { getUserId } from '../middleware/requireAuth';
+import { agentHttpsAgent, resolveAgentBaseUrl } from '../services/agentNetwork';
 
 const router = Router();
+type OpenAIValidationStatus = 'verified' | 'saved_unverified';
 
 // ── POST /api/auth/openai/key ────────────────────────────────────────────────
 // Receives an OpenAI API key, encrypts it, and stores it in the instance metadata.
@@ -43,11 +44,14 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     return;
   }
 
+  let validationStatus: OpenAIValidationStatus = 'verified';
+  let validationWarning: string | null = null;
+
   // Test the key against the OpenAI API to verify it actually works
   try {
     const testRes = await axios.get('https://api.openai.com/v1/models', {
       headers: { 'Authorization': `Bearer ${api_key}` },
-      timeout: 5000,
+      timeout: 10_000,
     });
     if (testRes.status !== 200) {
       res.status(400).json({ error: 'API Key OpenAI inválida ou sem permissão.' });
@@ -64,6 +68,8 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     // which would expose the API key in plaintext in server logs.
     const safeMsg = err instanceof Error ? err.message : String(err);
     console.warn('[auth/openai] key validation test failed (non-fatal):', safeMsg);
+    validationStatus = 'saved_unverified';
+    validationWarning = safeMsg;
   }
 
   // Ownership check — prevent IDOR write
@@ -85,7 +91,13 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     await updateInstance(instance_id, {
       metadata: {
         ...existingMeta,
-        chatgpt_connected: true,
+        chatgpt_connected: validationStatus === 'verified' || !!existingMeta.chatgpt_connected,
+        openai_key_saved: true,
+        openai_key_validation_status: validationStatus,
+        openai_key_validation_error: validationStatus === 'saved_unverified' ? validationWarning : undefined,
+        openai_key_validated_at: validationStatus === 'verified'
+          ? new Date().toISOString()
+          : (existingMeta.openai_key_validated_at ?? undefined),
         openai_api_key_encrypted: encryptedKey,
         // Remove any legacy OAuth fields if present
         openai_access_token_encrypted: undefined,
@@ -94,7 +106,13 @@ router.post('/openai/key', async (req: Request, res: Response): Promise<void> =>
     });
 
     console.log(`[auth/openai/key] API key stored for instance=${instance_id} user=${userId}`);
-    res.json({ success: true });
+    res.json({
+      success: true,
+      connected: validationStatus === 'verified',
+      key_saved: true,
+      validation_status: validationStatus,
+      warning: validationWarning,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to store API key';
     console.error('[auth/openai/key]', msg);
@@ -115,7 +133,11 @@ router.get('/openai/status/:instance_id', async (req: Request, res: Response): P
   }
 
   const meta = (instance.metadata ?? {}) as Record<string, unknown>;
-  res.json({ connected: !!meta.chatgpt_connected });
+  res.json({
+    connected: !!meta.chatgpt_connected,
+    key_saved: !!meta.openai_api_key_encrypted || !!meta.openai_key_saved,
+    validation_status: (meta.openai_key_validation_status as string | undefined) ?? null,
+  });
 });
 
 // ── POST /api/auth/openai-codex/init ──────────────────────────────────────────
@@ -187,21 +209,21 @@ router.post('/openai-codex/exchange', async (req: Request, res: Response): Promi
 
     // Send OAuth data to VPS agent
     const agentSecretEnc = meta.agent_secret as string | undefined;
-    if (!agentSecretEnc || !instance.droplet_ip) {
+    const baseUrl = await resolveAgentBaseUrl(instance);
+    if (!agentSecretEnc || !baseUrl) {
       res.status(500).json({ error: 'Instância sem agent configurado.' });
       return;
     }
 
     const agentSecret = decrypt(agentSecretEnc);
-    const vpsAgent = new https.Agent({ rejectUnauthorized: false });
 
     await axios.post(
-      `https://${instance.droplet_ip}:8080/configure-codex-oauth`,
+      `${baseUrl}/configure-codex-oauth`,
       { oauth_data: { key: apiKey, provider: 'openai-codex' } },
       {
         headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
         timeout: 30_000,
-        httpsAgent: vpsAgent,
+        httpsAgent: agentHttpsAgent,
       }
     );
 
@@ -211,6 +233,10 @@ router.post('/openai-codex/exchange', async (req: Request, res: Response): Promi
         ...meta,
         ai_mode: 'chatgpt',
         chatgpt_connected: true,
+        openai_key_saved: true,
+        openai_key_validation_status: 'verified',
+        openai_key_validation_error: undefined,
+        openai_key_validated_at: new Date().toISOString(),
         codex_code_verifier: undefined,
       },
     });

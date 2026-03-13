@@ -1,3 +1,5 @@
+const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
+
 /**
  * Cloud-init script for OriClaw droplets.
  * Installs OpenClaw + the OriClaw VPS agent side-by-side.
@@ -25,9 +27,8 @@ ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    # SSH
-# Port 8080 (VPS Agent) — rate-limited via agent, auth via agent_secret
-# Ideally restrict to backend IP, but Railway uses dynamic IPs
-ufw allow 8080/tcp
+# Port 8080 (VPS Agent) — private-only via DigitalOcean VPC
+ufw allow from ${AGENT_PRIVATE_CIDR} to any port 8080 proto tcp
 # Port 443 (OpenClaw Gateway UI via nginx HTTPS proxy) — protected by gateway token auth
 ufw allow 443/tcp
 ufw --force enable

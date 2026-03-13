@@ -17,8 +17,8 @@ import { retryPendingDeletions } from './services/provisioning';
 import { calculateOpenRouterCostUsd, getAdminSettings, normalizeOpenRouterModelId } from './services/openrouter';
 import { decrypt } from './services/crypto';
 import { notifyCreditStatusForAllCreditsInstances } from './services/creditStatus';
+import { agentHttpsAgent, resolveAgentBaseUrl } from './services/agentNetwork';
 import axios from 'axios';
-import https from 'https';
 
 // ── Required environment variable validation ──────────────────────────────────
 const REQUIRED_ENV_VARS = [
@@ -218,7 +218,6 @@ recoverStuckProvisioningInstances();
 retryPendingDeletions();
 
 // ── Usage polling — collect per-instance usage from VPS agents ───────────────
-const usageHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 const USD_TO_BRL = 5.5;
 
 type CreditUsageEvent = {
@@ -232,6 +231,7 @@ type CreditUsageEvent = {
 type RunningInstance = {
   id: string;
   customer_id: string;
+  droplet_id: number | null;
   droplet_ip: string | null;
   metadata: Record<string, unknown> | null;
 };
@@ -246,16 +246,16 @@ async function getCustomerCreditBalance(customerId: string): Promise<number> {
   return (data as { balance_brl: number } | null)?.balance_brl ?? 0;
 }
 
-async function acknowledgeUsageEvents(dropletIp: string, agentSecret: string, eventIds: string[]): Promise<void> {
-  if (!dropletIp || eventIds.length === 0) return;
+async function acknowledgeUsageEvents(baseUrl: string, agentSecret: string, eventIds: string[]): Promise<void> {
+  if (!baseUrl || eventIds.length === 0) return;
 
   await axios.post(
-    `https://${dropletIp}:8080/usage/ack`,
+    `${baseUrl}/usage/ack`,
     { ids: eventIds },
     {
       headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
       timeout: 10_000,
-      httpsAgent: usageHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     }
   );
 }
@@ -268,7 +268,7 @@ async function collectUsageFromAgents(): Promise<void> {
 
     const { data: instances, error: fetchErr } = await supabase
       .from('oriclaw_instances')
-      .select('id, customer_id, droplet_ip, metadata')
+      .select('id, customer_id, droplet_id, droplet_ip, metadata')
       .eq('status', 'running');
 
     if (fetchErr || !instances) {
@@ -287,8 +287,6 @@ async function collectUsageFromAgents(): Promise<void> {
     }
 
     for (const inst of creditsInstances) {
-      if (!inst.droplet_ip) continue;
-
       const meta = (inst.metadata ?? {}) as Record<string, unknown>;
       const configuredModel = normalizeOpenRouterModelId((meta.model as string | undefined) ?? null);
       const agentSecretEncrypted = meta.agent_secret as string | undefined;
@@ -301,11 +299,14 @@ async function collectUsageFromAgents(): Promise<void> {
         continue;
       }
 
+      const baseUrl = await resolveAgentBaseUrl(inst);
+      if (!baseUrl) continue;
+
       try {
-        const { data: usageData } = await axios.get(`https://${inst.droplet_ip}:8080/usage/pending`, {
+        const { data: usageData } = await axios.get(`${baseUrl}/usage/pending`, {
           headers: { 'x-agent-secret': agentSecret },
           timeout: 10_000,
-          httpsAgent: usageHttpsAgent,
+          httpsAgent: agentHttpsAgent,
         });
 
         const events = Array.isArray(usageData?.events) ? (usageData.events as CreditUsageEvent[]) : [];
@@ -380,7 +381,7 @@ async function collectUsageFromAgents(): Promise<void> {
         const totalCostBrl = usageRows.reduce((sum, row) => sum + row.cost_brl, 0);
         if (totalCostBrl <= 0) {
           if (processedEventIds.length > 0) {
-            await acknowledgeUsageEvents(inst.droplet_ip, agentSecret, processedEventIds);
+            await acknowledgeUsageEvents(baseUrl, agentSecret, processedEventIds);
           }
           continue;
         }
@@ -458,7 +459,7 @@ async function collectUsageFromAgents(): Promise<void> {
 
         if (shouldAckProcessedEvents && processedEventIds.length > 0) {
           try {
-            await acknowledgeUsageEvents(inst.droplet_ip, agentSecret, processedEventIds);
+            await acknowledgeUsageEvents(baseUrl, agentSecret, processedEventIds);
           } catch (ackErr) {
             console.warn(
               `[usage-poll] Failed to acknowledge usage events for ${inst.id}:`,

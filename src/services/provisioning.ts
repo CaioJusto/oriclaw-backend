@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 import axios from 'axios';
 import Stripe from 'stripe';
-import { deleteDroplet, getDroplet, getDropletPublicIP } from './digitalocean';
+import { deleteDroplet, getDroplet, getDropletPrivateIP, getDropletPublicIP } from './digitalocean';
 import {
   createInstance,
   getInstanceById,
@@ -13,6 +13,7 @@ import {
 import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest, DODroplet, DODropletResponse } from '../types';
 import { encrypt, decrypt } from './crypto';
+import { AGENT_PRIVATE_CIDR } from './agentNetwork';
 
 // ── DO API rate-limit guard ───────────────────────────────────────────────────
 // Limits simultaneous droplet creations to avoid hitting DigitalOcean's rate
@@ -89,21 +90,56 @@ const PLAN_SIZES: Record<string, string> = {
   'business': 's-4vcpu-8gb',
 };
 
+const DEFAULT_DROPLET_REGION = process.env.ORICLAW_DROPLET_REGION || 'nyc1';
+const DEFAULT_VPC_ID = process.env.ORICLAW_VPC_ID || '';
+const SNAPSHOT_BOOTSTRAP_REPO = process.env.ORICLAW_BACKEND_REPO || 'CaioJusto/oriclaw-backend';
+const SNAPSHOT_BOOTSTRAP_REF = process.env.ORICLAW_BOOTSTRAP_REF || 'main';
+const SNAPSHOT_AGENT_BASE_URL =
+  `https://raw.githubusercontent.com/${SNAPSHOT_BOOTSTRAP_REPO}/${SNAPSHOT_BOOTSTRAP_REF}/vps-agent`;
+
 // If set, provision from a pre-built snapshot instead of cloud-init.
 // This reduces provisioning time from ~7 min to ~1 min.
 const SNAPSHOT_ID = process.env.ORICLAW_SNAPSHOT_ID || '';
 
 /**
- * Minimal cloud-init for snapshot-based provisioning.
- * Only injects secrets and restarts services — everything else is pre-installed.
+ * Patch-oriented cloud-init for snapshot-based provisioning.
+ * Refreshes the agent/runtime configuration at boot so golden snapshots do not
+ * need to be rebuilt for every code deploy.
  */
 function buildSnapshotCloudInit(agentSecret: string, gatewayToken: string): string {
   return `#!/bin/bash
 set -e
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export AGENT_PRIVATE_CIDR='${AGENT_PRIVATE_CIDR}'
+export SNAPSHOT_AGENT_BASE_URL='${SNAPSHOT_AGENT_BASE_URL}'
+export GATEWAY_TOKEN='${gatewayToken}'
 
 # Stop services before overwriting secrets
-systemctl stop oriclaw-agent 2>/dev/null || true
 systemctl stop openclaw 2>/dev/null || true
+systemctl stop oriclaw-agent 2>/dev/null || true
+
+PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || true)
+PRIVATE_IP=$(curl -s --max-time 5 http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address 2>/dev/null || true)
+if [ -z "$PUBLIC_IP" ]; then
+  PUBLIC_IP=$(hostname -I | awk '{print $1}')
+fi
+SSLIP_DOMAIN=""
+if [ -n "$PUBLIC_IP" ]; then
+  SSLIP_DOMAIN=$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io
+fi
+
+apt-get update -y
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git ufw nginx openssl python3 python3-pip build-essential || true
+
+useradd -m -s /bin/bash openclaw 2>/dev/null || true
+mkdir -p /home/openclaw/.openclaw /home/openclaw/.openclaw/.openclaw
+mkdir -p /var/tmp/openclaw-compile-cache
+chown -R openclaw:openclaw /home/openclaw /var/tmp/openclaw-compile-cache
+
+useradd -r -s /usr/sbin/nologin oriclaw-agent 2>/dev/null || true
+usermod -aG systemd-journal oriclaw-agent 2>/dev/null || true
+usermod -aG openclaw oriclaw-agent 2>/dev/null || true
 
 # Inject agent secret
 cat > /etc/oriclaw-agent.env << 'ENVEOF'
@@ -113,24 +149,194 @@ ENVEOF
 chmod 600 /etc/oriclaw-agent.env
 chown oriclaw-agent:oriclaw-agent /etc/oriclaw-agent.env
 
-# Inject gateway token in OpenClaw config
-OPENCLAW_CONFIG=/home/openclaw/.openclaw/config.json
-if [ -f "$OPENCLAW_CONFIG" ]; then
-  # Update token in-place using python3 (always available on Ubuntu)
-  python3 -c "
-import json, sys
-with open('$OPENCLAW_CONFIG') as f: cfg = json.load(f)
-cfg.setdefault('gateway', {}).setdefault('auth', {})['token'] = '${gatewayToken}'
-with open('$OPENCLAW_CONFIG', 'w') as f: json.dump(cfg, f, indent=2)
-"
-  chown openclaw:openclaw "$OPENCLAW_CONFIG"
+mkdir -p /opt/oriclaw-agent
+for attempt in 1 2 3; do
+  curl -fsSL "$SNAPSHOT_AGENT_BASE_URL/package.json" -o /opt/oriclaw-agent/package.json && break
+  echo "[oriclaw] package.json download attempt $attempt failed, retrying in 5s..."
+  sleep 5
+done
+for attempt in 1 2 3; do
+  curl -fsSL "$SNAPSHOT_AGENT_BASE_URL/server.js" -o /opt/oriclaw-agent/server.js && break
+  echo "[oriclaw] server.js download attempt $attempt failed, retrying in 5s..."
+  sleep 5
+done
+if [ ! -s /opt/oriclaw-agent/server.js ]; then
+  echo "[oriclaw] ERROR: failed to refresh vps-agent from $SNAPSHOT_AGENT_BASE_URL" >&2
+  exit 1
 fi
+chown -R oriclaw-agent:oriclaw-agent /opt/oriclaw-agent
+
+cd /opt/oriclaw-agent
+for attempt in 1 2 3; do
+  npm install --omit=dev --no-fund --no-audit && break
+  echo "[oriclaw] npm install attempt $attempt failed, retrying in 10s..."
+  sleep 10
+done
+
+mkdir -p /etc/oriclaw-agent/tls
+if [ ! -f /etc/oriclaw-agent/tls/key.pem ] || [ ! -f /etc/oriclaw-agent/tls/cert.pem ]; then
+  openssl req -x509 -newkey rsa:2048 -keyout /etc/oriclaw-agent/tls/key.pem \\
+    -out /etc/oriclaw-agent/tls/cert.pem -days 3650 -nodes \\
+    -subj "/CN=oriclaw-vps-agent" 2>/dev/null
+fi
+chmod 600 /etc/oriclaw-agent/tls/key.pem
+chmod 644 /etc/oriclaw-agent/tls/cert.pem
+
+cat > /etc/systemd/system/openclaw.service << 'SVCEOF'
+[Unit]
+Description=OpenClaw Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/home/openclaw
+Environment=HOME=/home/openclaw
+Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
+Environment=OPENCLAW_NO_RESPAWN=1
+Environment=NODE_OPTIONS=--max-old-space-size=1280
+Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
+EnvironmentFile=-/home/openclaw/.openclaw/.env
+ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway run --allow-unconfigured --bind lan
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+mkdir -p /etc/systemd/system/openclaw.service.d
+touch /etc/systemd/system/openclaw.service.d/openrouter.conf
+chmod 600 /etc/systemd/system/openclaw.service.d/openrouter.conf
+
+cat > /etc/sudoers.d/oriclaw-agent << 'SUDOEOF'
+oriclaw-agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart openclaw, /usr/bin/systemctl start openclaw, /usr/bin/systemctl stop openclaw, /usr/bin/systemctl is-active openclaw, /usr/bin/systemctl status openclaw
+Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
+oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(root) NOPASSWD: /bin/mkdir -p /etc/systemd/system/openclaw.service.d
+oriclaw-agent ALL=(root) NOPASSWD: /usr/bin/tee /etc/systemd/system/openclaw.service.d/*
+oriclaw-agent ALL=(root) NOPASSWD: /bin/chmod 600 /etc/systemd/system/openclaw.service.d/*
+oriclaw-agent ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+SUDOEOF
+chmod 440 /etc/sudoers.d/oriclaw-agent
+
+cat > /etc/systemd/system/oriclaw-agent.service << 'AGENTEOF'
+[Unit]
+Description=OriClaw VPS Agent
+After=network.target
+
+[Service]
+Type=simple
+User=oriclaw-agent
+WorkingDirectory=/opt/oriclaw-agent
+EnvironmentFile=/etc/oriclaw-agent.env
+ExecStart=/usr/bin/node /opt/oriclaw-agent/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+AGENTEOF
+
+chmod 775 /home/openclaw/.openclaw
+chmod 664 /home/openclaw/.openclaw/.env 2>/dev/null || true
+chmod 664 /home/openclaw/.openclaw/config.json 2>/dev/null || true
+chmod g+s /home/openclaw/.openclaw
+
+python3 <<'PY'
+import json
+import os
+from pathlib import Path
+
+gateway_token = os.environ.get('GATEWAY_TOKEN', '')
+public_ip = os.environ.get('PUBLIC_IP', '')
+sslip_domain = os.environ.get('SSLIP_DOMAIN', '')
+allowed_origins = []
+if sslip_domain:
+    allowed_origins.append(f"https://{sslip_domain}")
+if public_ip:
+    allowed_origins.append(f"http://{public_ip}:18789")
+
+paths = [
+    Path('/home/openclaw/.openclaw/.openclaw/openclaw.json'),
+    Path('/home/openclaw/.openclaw/openclaw.json'),
+    Path('/home/openclaw/.openclaw/config.json'),
+]
+
+for config_path in paths:
+    if not config_path.exists():
+        continue
+    try:
+        raw = config_path.read_text()
+        cfg = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        cfg = {}
+
+    cfg.setdefault('gateway', {})
+    cfg['gateway']['bind'] = 'lan'
+    cfg['gateway'].setdefault('auth', {})
+    cfg['gateway']['auth']['mode'] = 'token'
+    cfg['gateway']['auth']['token'] = gateway_token
+    cfg['gateway'].setdefault('controlUi', {})
+    cfg['gateway']['controlUi']['dangerouslyAllowHostHeaderOriginFallback'] = True
+    if allowed_origins:
+        cfg['gateway']['controlUi']['allowedOrigins'] = allowed_origins
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(cfg, indent=2))
+PY
+chown -R openclaw:openclaw /home/openclaw/.openclaw
 
 # Clean any leftover state from snapshot
 rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys 2>/dev/null || true
+rm -rf /home/openclaw/.openclaw/credentials/whatsapp /home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth /home/openclaw/.openclaw/channels/whatsapp/default/auth 2>/dev/null || true
+
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow from "$AGENT_PRIVATE_CIDR" to any port 8080 proto tcp
+ufw allow 443/tcp
+ufw --force enable
+
+if [ -n "$SSLIP_DOMAIN" ]; then
+  cat > /etc/nginx/sites-available/openclaw-gateway << NGXEOF
+server {
+    listen 443 ssl;
+    server_name $SSLIP_DOMAIN;
+
+    ssl_certificate /etc/oriclaw-agent/tls/cert.pem;
+    ssl_certificate_key /etc/oriclaw-agent/tls/key.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:18789;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \\\$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \\\$host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+    }
+}
+NGXEOF
+  ln -sf /etc/nginx/sites-available/openclaw-gateway /etc/nginx/sites-enabled/openclaw-gateway
+  rm -f /etc/nginx/sites-enabled/default
+fi
 
 # Start services
 systemctl daemon-reload
+systemctl enable openclaw oriclaw-agent nginx 2>/dev/null || true
+systemctl restart nginx 2>/dev/null || true
+systemctl restart openclaw
 systemctl start oriclaw-agent
 
 echo "ORICLAW_READY" > /var/lib/cloud/instance/oriclaw-status
@@ -186,7 +392,7 @@ async function createDropletAsync(
 
   if (SNAPSHOT_ID) {
     // ── Snapshot-based provisioning (~1 min) ──
-    // Uses a pre-built golden image; cloud-init only injects secrets.
+    // Uses a pre-built golden image plus a patch script that refreshes runtime files.
     console.log(`[provision] Using snapshot ${SNAPSHOT_ID} for instance ${instanceId}`);
     const cloudInit = buildSnapshotCloudInit(agentSecret, gatewayToken);
     droplet = await createDropletWithInit(customerId, cloudInit, planSize, SNAPSHOT_ID);
@@ -216,13 +422,15 @@ chmod +x /tmp/oriclaw-init.sh
 
   // Poll for droplet IP (up to 3 minutes)
   let ip: string | null = null;
+  let privateIp: string | null = null;
   for (let i = 0; i < 18; i++) {
     await sleep(10_000);
     try {
       const updated = await getDroplet(droplet.id);
       console.log(`[provision] Poll ${i+1}/18: droplet ${droplet.id} status=${updated.status}`);
       ip = getDropletPublicIP(updated);
-      if (ip) break;
+      privateIp = getDropletPrivateIP(updated);
+      if (ip && privateIp) break;
     } catch (pollErr: unknown) {
       const axErr = pollErr as { response?: { status?: number; data?: unknown }; message?: string };
       console.error(`[provision] Poll ${i+1}/18: GET droplet ${droplet.id} failed:`, {
@@ -257,7 +465,8 @@ chmod +x /tmp/oriclaw-init.sh
   // Wait until VPS agent is responding on /health before exposing needs_config.
   // Snapshot deploys are much faster (~1 min), so use a shorter timeout.
   const agentTimeoutMs = SNAPSHOT_ID ? 5 * 60 * 1000 : 20 * 60 * 1000;
-  const agentReady = await waitForAgentReadiness(ip, agentSecret, agentTimeoutMs);
+  const agentHosts = [privateIp, ip].filter((value): value is string => Boolean(value));
+  const agentReady = await waitForAgentReadiness(agentHosts, agentSecret, agentTimeoutMs);
   if (!agentReady) {
     // Cancel Stripe subscription — user shouldn't be billed for an unresponsive VPS
     await cancelSubscriptionForInstance(instanceId, stripeSubId);
@@ -268,6 +477,8 @@ chmod +x /tmp/oriclaw-init.sh
       metadata: {
         droplet_name: droplet.name,
         agent_secret: encrypt(agentSecret),
+        agent_private_ip: privateIp,
+        agent_public_ip: ip,
         error: 'VPS agent não respondeu após 20 minutos',
         suspended_reason: 'provisioning_failed_agent_timeout',
       },
@@ -283,7 +494,12 @@ chmod +x /tmp/oriclaw-init.sh
   await updateInstance(instanceId, {
     droplet_ip: ip,
     status: 'needs_config',
-    metadata: { droplet_name: droplet.name, agent_secret: encrypt(agentSecret) },
+    metadata: {
+      droplet_name: droplet.name,
+      agent_secret: encrypt(agentSecret),
+      agent_private_ip: privateIp,
+      agent_public_ip: ip,
+    },
   });
 
   console.log(`[provision] Instance ${instanceId} ready for config at ${ip}`);
@@ -412,25 +628,28 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function waitForAgentReadiness(
-  ip: string,
+  hosts: string[],
   agentSecret: string,
   maxWaitMs: number
 ): Promise<boolean> {
+  if (hosts.length === 0) return false;
   const deadline = Date.now() + maxWaitMs;
 
   while (Date.now() < deadline) {
-    try {
-      const response = await axios.get(`https://${ip}:8080/health`, {
-        headers: { 'x-agent-secret': agentSecret },
-        timeout: 2_000,
-        httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
-      });
+    for (const host of hosts) {
+      try {
+        const response = await axios.get(`https://${host}:8080/health`, {
+          headers: { 'x-agent-secret': agentSecret },
+          timeout: 2_000,
+          httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
+        });
 
-      if (response.status === 200) {
-        return true;
+        if (response.status === 200) {
+          return true;
+        }
+      } catch {
+        // keep retrying until timeout
       }
-    } catch {
-      // keep retrying until timeout
     }
 
     await sleep(5_000);
@@ -457,17 +676,18 @@ async function createDropletWithInit(
 ): Promise<DODroplet> {
   const image: string | number = snapshotId ? Number(snapshotId) : 'ubuntu-24-04-x64';
   console.log(`[provision] cloud-init size: ${Buffer.byteLength(cloudInit, 'utf8')} bytes`);
-  console.log(`[provision] Creating droplet: region=nyc1 size=${size} image=${image}${snapshotId ? ' (snapshot)' : ''}`);
+  console.log(`[provision] Creating droplet: region=${DEFAULT_DROPLET_REGION} size=${size} image=${image}${snapshotId ? ' (snapshot)' : ''}`);
 
   const dropletConfig = {
     name: `oriclaw-${customerId}`,
-    region: 'nyc1',
+    region: DEFAULT_DROPLET_REGION,
     size,
     image,
     user_data: cloudInit,
     tags: ['oriclaw', `customer:${customerId}`],
     monitoring: true,
     ipv6: false,
+    ...(DEFAULT_VPC_ID ? { vpc_uuid: DEFAULT_VPC_ID } : {}),
   };
 
   const response = await axios.post<DODropletResponse>(

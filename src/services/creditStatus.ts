@@ -1,13 +1,12 @@
 import axios from 'axios';
-import https from 'https';
 import { decrypt } from './crypto';
 import { supabase } from './supabase';
-
-const creditStatusHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+import { agentHttpsAgent, resolveAgentBaseUrl } from './agentNetwork';
 
 type CreditManagedInstance = {
   id: string;
   customer_id: string;
+  droplet_id: number | null;
   droplet_ip: string | null;
   metadata: Record<string, unknown> | null;
 };
@@ -28,8 +27,6 @@ async function getCustomerBalance(customerId: string): Promise<number> {
 }
 
 async function sendCreditStatus(instance: CreditManagedInstance, balance: number): Promise<void> {
-  if (!instance.droplet_ip) return;
-
   const meta = (instance.metadata ?? {}) as Record<string, unknown>;
   const agentSecretEncrypted = meta.agent_secret as string | undefined;
   if (!agentSecretEncrypted) return;
@@ -42,8 +39,11 @@ async function sendCreditStatus(instance: CreditManagedInstance, balance: number
   }
 
   const blocked = balance <= 0;
+  const baseUrl = await resolveAgentBaseUrl(instance);
+  if (!baseUrl) return;
+
   await axios.post(
-    `https://${instance.droplet_ip}:8080/credit-status`,
+    `${baseUrl}/credit-status`,
     { blocked, balance_brl: balance },
     {
       headers: {
@@ -51,7 +51,7 @@ async function sendCreditStatus(instance: CreditManagedInstance, balance: number
         'Content-Type': 'application/json',
       },
       timeout: 5_000,
-      httpsAgent: creditStatusHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     }
   );
 }
@@ -60,7 +60,7 @@ export async function notifyCreditStatusForCustomer(customerId: string): Promise
   const balance = await getCustomerBalance(customerId);
   const { data: instances } = await supabase
     .from('oriclaw_instances')
-    .select('id, customer_id, droplet_ip, metadata')
+    .select('id, customer_id, droplet_id, droplet_ip, metadata')
     .eq('customer_id', customerId)
     .eq('status', 'running');
 
@@ -80,7 +80,7 @@ export async function notifyCreditStatusForCustomer(customerId: string): Promise
 export async function notifyCreditStatusForAllCreditsInstances(): Promise<void> {
   const { data: instances } = await supabase
     .from('oriclaw_instances')
-    .select('id, customer_id, droplet_ip, metadata')
+    .select('id, customer_id, droplet_id, droplet_ip, metadata')
     .eq('status', 'running');
 
   const balanceCache = new Map<string, number>();

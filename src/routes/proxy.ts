@@ -7,16 +7,13 @@
  */
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
-import https from 'https';
 import path from 'path';
 import { supabase } from '../services/supabase';
 import { getInstanceById, updateInstance } from '../services/supabase';
 import { decrypt, encrypt } from '../services/crypto';
 import { getUserId } from '../middleware/requireAuth';
 import { getAdminSettings } from '../services/openrouter';
-
-// Accept self-signed TLS certs from VPS agents
-const vpsHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+import { agentHttpsAgent, resolveAgentBaseUrl } from '../services/agentNetwork';
 
 const router = Router();
 
@@ -34,9 +31,6 @@ async function resolveInstance(instanceId: string, userId: string, checkCredits 
       new Error('Instância suspensa ou cancelada. Acesse o dashboard para regularizar.'),
       { status: 403 }
     );
-  }
-  if (!instance.droplet_ip) {
-    throw Object.assign(new Error('Servidor ainda inicializando. Tente novamente em alguns minutos.'), { status: 503 });
   }
   const agentSecretEncrypted = (instance.metadata as Record<string, unknown>)?.agent_secret as string | undefined;
   if (!agentSecretEncrypted) {
@@ -68,7 +62,12 @@ async function resolveInstance(instanceId: string, userId: string, checkCredits 
     }
   }
 
-  return { instance, baseUrl: `https://${instance.droplet_ip}:8080`, agentSecret };
+  const baseUrl = await resolveAgentBaseUrl(instance);
+  if (!baseUrl) {
+    throw Object.assign(new Error('Servidor ainda inicializando. Tente novamente em alguns minutos.'), { status: 503 });
+  }
+
+  return { instance, baseUrl, agentSecret };
 }
 
 function agentHeaders(secret: string) {
@@ -77,7 +76,7 @@ function agentHeaders(secret: string) {
 
 /** Axios config for VPS agent calls (includes TLS agent for self-signed certs) */
 function agentAxiosConfig(secret: string, timeout = 15_000) {
-  return { headers: agentHeaders(secret), timeout, httpsAgent: vpsHttpsAgent };
+  return { headers: agentHeaders(secret), timeout, httpsAgent: agentHttpsAgent };
 }
 
 // ── Middleware: auth + resolve instance ─────────────────────────────────────
@@ -114,7 +113,7 @@ router.get('/:instance_id/health', async (req: Request, res: Response): Promise<
     const { data } = await axios.get(`${baseUrl}/health`, {
       headers: agentHeaders(agentSecret),
       timeout: 10_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -127,7 +126,7 @@ router.get('/:instance_id/health/detailed', async (req: Request, res: Response):
       const { data } = await axios.get(`${baseUrl}/health/detailed`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
-        httpsAgent: vpsHttpsAgent,
+        httpsAgent: agentHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -145,7 +144,7 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
       const { data } = await axios.get(`${baseUrl}/chat-url`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
-        httpsAgent: vpsHttpsAgent,
+        httpsAgent: agentHttpsAgent,
       });
 
       // Workaround: older VPS agents check `nc -z localhost 18789` which fails
@@ -156,7 +155,7 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
           const { data: healthData } = await axios.get(`${baseUrl}/health`, {
             headers: agentHeaders(agentSecret),
             timeout: 5_000,
-            httpsAgent: vpsHttpsAgent,
+            httpsAgent: agentHttpsAgent,
           });
           if (healthData && healthData.openclaw === 'running') {
             data.available = true;
@@ -180,7 +179,7 @@ router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void
       const { data } = await axios.get(`${baseUrl}/qr`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
-        httpsAgent: vpsHttpsAgent,
+        httpsAgent: agentHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -315,7 +314,7 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
     const { data } = await axios.post(`${baseUrl}/configure`, sanitizedBody, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
 
     // Persist ai_mode and status in Supabase instance record
@@ -384,7 +383,7 @@ router.post('/:instance_id/restart', async (req: Request, res: Response): Promis
     const { data } = await axios.post(`${baseUrl}/restart`, {}, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -396,7 +395,7 @@ router.get('/:instance_id/logs', async (req: Request, res: Response): Promise<vo
     const { data } = await axios.get(`${baseUrl}/logs`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -409,7 +408,7 @@ router.get('/:instance_id/channels', async (req: Request, res: Response): Promis
       const { data } = await axios.get(`${baseUrl}/channels`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
-        httpsAgent: vpsHttpsAgent,
+        httpsAgent: agentHttpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -426,7 +425,7 @@ router.post('/:instance_id/channels/telegram', async (req: Request, res: Respons
     const { data } = await axios.post(`${baseUrl}/channels/telegram`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -438,7 +437,7 @@ router.post('/:instance_id/channels/discord', async (req: Request, res: Response
     const { data } = await axios.post(`${baseUrl}/channels/discord`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -457,7 +456,7 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
     const { data } = await axios.delete(`${baseUrl}/channels/${channel}`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
-      httpsAgent: vpsHttpsAgent,
+      httpsAgent: agentHttpsAgent,
     });
     res.json(data);
   });
@@ -500,7 +499,7 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
         headers: { ...agentHeaders(agentSecret) },
         data: req.body,
         timeout: 60_000,
-        httpsAgent: vpsHttpsAgent,
+        httpsAgent: agentHttpsAgent,
       });
 
       res.json(data);

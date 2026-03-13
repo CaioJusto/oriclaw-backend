@@ -7,31 +7,51 @@ const supabase = createClient(
 );
 
 const TABLE = 'oriclaw_instances';
+const pendingProvisionCustomers = new Set<string>();
+
+function isUniqueViolation(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  return error.code === '23505' || /duplicate key|unique/i.test(error.message ?? '');
+}
 
 export async function createInstance(
   data: Omit<OriClawInstance, 'id' | 'created_at'>
 ): Promise<OriClawInstance> {
-  // Guard against duplicate provisioning from concurrent webhooks
-  const { data: existing } = await supabase
-    .from(TABLE)
-    .select('id')
-    .eq('customer_id', data.customer_id)
-    .neq('status', 'deleted')
-    .limit(1)
-    .maybeSingle();
-
-  if (existing) {
-    throw new Error(`Instance already exists for customer ${data.customer_id}`);
+  if (pendingProvisionCustomers.has(data.customer_id)) {
+    throw new Error(`Provisioning already in progress for customer ${data.customer_id}`);
   }
 
-  const { data: row, error } = await supabase
-    .from(TABLE)
-    .insert(data)
-    .select()
-    .single();
+  pendingProvisionCustomers.add(data.customer_id);
+  try {
+    const { data: existing } = await supabase
+      .from(TABLE)
+      .select('id')
+      .eq('customer_id', data.customer_id)
+      .neq('status', 'deleted')
+      .limit(1)
+      .maybeSingle();
 
-  if (error) throw new Error(`Supabase insert error: ${error.message}`);
-  return row as OriClawInstance;
+    if (existing) {
+      throw new Error(`Instance already exists for customer ${data.customer_id}`);
+    }
+
+    const { data: row, error } = await supabase
+      .from(TABLE)
+      .insert(data)
+      .select()
+      .single();
+
+    if (error) {
+      if (isUniqueViolation(error)) {
+        throw new Error(`Instance already exists for customer ${data.customer_id}`);
+      }
+      throw new Error(`Supabase insert error: ${error.message}`);
+    }
+
+    return row as OriClawInstance;
+  } finally {
+    pendingProvisionCustomers.delete(data.customer_id);
+  }
 }
 
 export async function getInstanceByCustomerId(

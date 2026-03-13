@@ -40,3 +40,9 @@ export function getDropletPublicIP(droplet: DODroplet): string | null {
   const publicNet = v4.find((n) => n.type === 'public');
   return publicNet?.ip_address ?? null;
 }
+
+export function getDropletPrivateIP(droplet: DODroplet): string | null {
+  const v4 = droplet.networks?.v4 ?? [];
+  const privateNet = v4.find((n) => n.type === 'private');
+  return privateNet?.ip_address ?? null;
+}
