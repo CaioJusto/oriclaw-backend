@@ -66,6 +66,29 @@ export async function getModelPricing(modelId: string): Promise<ModelPricing | n
   return model?.pricing ?? null;
 }
 
+export function normalizeOpenRouterModelId(modelId: string | null | undefined): string | null {
+  if (!modelId) return null;
+  return modelId.startsWith('openrouter/') ? modelId.slice('openrouter/'.length) : modelId;
+}
+
+export async function calculateOpenRouterCostUsd(
+  modelId: string,
+  promptTokens: number,
+  completionTokens: number
+): Promise<number | null> {
+  const normalizedModelId = normalizeOpenRouterModelId(modelId);
+  if (!normalizedModelId) return null;
+
+  const pricing = await getModelPricing(normalizedModelId);
+  if (!pricing) return null;
+
+  const promptUnitCost = Number.parseFloat(pricing.prompt);
+  const completionUnitCost = Number.parseFloat(pricing.completion);
+  if (!Number.isFinite(promptUnitCost) || !Number.isFinite(completionUnitCost)) return null;
+
+  return (promptTokens * promptUnitCost) + (completionTokens * completionUnitCost);
+}
+
 /**
  * Queries oriclaw_admin_settings and returns the first row, or null.
  */

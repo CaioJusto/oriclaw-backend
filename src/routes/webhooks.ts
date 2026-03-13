@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import Stripe from 'stripe';
 import { provisionInstance, deprovisionInstance, suspendInstance, reactivateInstance } from '../services/provisioning';
 import { addCredits } from './credits';
+import { notifyCreditStatusForCustomer } from '../services/creditStatus';
 import { supabase, getInstanceBySubscriptionId, getInstanceByCustomerId, updateInstance } from '../services/supabase';
 
 const router = Router();
@@ -221,6 +222,7 @@ router.post(
             const amountBrl = parseFloat(session.metadata?.amount_brl ?? '0');
             if (customerId && amountBrl > 0) {
               await addCredits(customerId, amountBrl);
+              await notifyCreditStatusForCustomer(customerId);
               console.log(`[webhook] Added R$${amountBrl} credits to ${customerId}`);
             }
           } else if (session.mode === 'subscription') {

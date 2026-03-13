@@ -43,6 +43,7 @@ apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--fo
 # Cria usuário dedicado para openclaw
 useradd -m -s /bin/bash openclaw || true
 mkdir -p /home/openclaw/.openclaw
+mkdir -p /home/openclaw/.openclaw/.openclaw
 
 # Garante que npm global bin está no PATH do user openclaw
 echo 'export PATH="/home/openclaw/.npm-global/bin:$PATH"' >> /home/openclaw/.bashrc
@@ -79,7 +80,7 @@ else
   exit 1
 fi
 
-cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
+cat > /home/openclaw/.openclaw/.openclaw/openclaw.json << CONFIGEOF
 {
   "model": "claude-sonnet-4-5",
   "channel": "whatsapp",
@@ -95,6 +96,7 @@ cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
   }
 }
 CONFIGEOF
+cp /home/openclaw/.openclaw/.openclaw/openclaw.json /home/openclaw/.openclaw/config.json
 
 touch /home/openclaw/.openclaw/.env
 chown -R openclaw:openclaw /home/openclaw
@@ -137,6 +139,11 @@ const TLS_KEY = process.env.TLS_KEY_PATH || '/etc/oriclaw-agent/tls/key.pem';
 const OPENCLAW_CONFIG_DIR = '/home/openclaw/.openclaw';
 const OPENCLAW_ENV_FILE = path.join(OPENCLAW_CONFIG_DIR, '.env');
 const OPENCLAW_CONFIG_FILE = path.join(OPENCLAW_CONFIG_DIR, 'config.json');
+const OPENCLAW_CONFIG_PATHS = [
+  path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'openclaw.json'),
+  path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
+  OPENCLAW_CONFIG_FILE,
+];
 
 // ── Concurrency locks ─────────────────────────────────────────────────────────
 let isConfiguring = false;
@@ -149,7 +156,21 @@ let restartingTimer = null;
 
 // ── Usage tracking ─────────────────────────────────────────────────────────
 const usageBuffer = [];
+const USAGE_BUFFER_LIMIT = 5000;
 let creditBlocked = false;
+
+function appendUsageEvent(event) {
+  usageBuffer.push({
+    id: crypto.randomUUID(),
+    ...event,
+  });
+
+  if (usageBuffer.length > USAGE_BUFFER_LIMIT) {
+    const dropped = usageBuffer.length - USAGE_BUFFER_LIMIT;
+    usageBuffer.splice(0, dropped);
+    console.warn(\`[usage-watcher] dropped \${dropped} old usage event(s) after buffer limit\`);
+  }
+}
 
 // ── Journald usage watcher ─────────────────────────────────────────────────
 function startUsageWatcher() {
@@ -171,7 +192,7 @@ function startUsageWatcher() {
         try {
           const parsed = JSON.parse(usageMatch[0]);
           if (parsed.usage && typeof parsed.usage.prompt_tokens === 'number') {
-            usageBuffer.push({
+            appendUsageEvent({
               prompt_tokens: parsed.usage.prompt_tokens,
               completion_tokens: parsed.usage.completion_tokens || 0,
               model: parsed.model || null,
@@ -336,20 +357,36 @@ function writeEnvFile(updates) {
 }
 
 /**
- * Read config.json.
+ * Resolve the active OpenClaw config file.
  */
-function readConfig() {
-  try { return JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_FILE, 'utf8')); } catch { return {}; }
+function getOpenClawConfigPath() {
+  return OPENCLAW_CONFIG_PATHS.find((cfgPath) => fs.existsSync(cfgPath)) || OPENCLAW_CONFIG_PATHS[0];
 }
 
 /**
- * Write config.json, merging with existing values.
+ * Read the active OpenClaw config.
+ */
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(getOpenClawConfigPath(), 'utf8')); } catch { return {}; }
+}
+
+/**
+ * Write the active OpenClaw config, merging with existing values.
  */
 function writeConfig(updates) {
+  const configPath = getOpenClawConfigPath();
   const config = { ...readConfig(), ...updates };
-  fs.mkdirSync(OPENCLAW_CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(OPENCLAW_CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
   try { runCmd(\`chown -R openclaw:openclaw \${OPENCLAW_CONFIG_DIR}\`); } catch { /* ignore */ }
+}
+
+function getWhatsAppAuthDirs() {
+  return [
+    path.join(OPENCLAW_CONFIG_DIR, 'credentials', 'whatsapp', 'default'),
+    path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'channels', 'whatsapp', 'default', 'auth'),
+    path.join(OPENCLAW_CONFIG_DIR, 'channels', 'whatsapp', 'default', 'auth'),
+  ];
 }
 
 /**
@@ -488,6 +525,32 @@ function openclawExec(args) {
   return \`sudo -u openclaw OPENCLAW_HOME=/home/openclaw/.openclaw HOME=/home/openclaw \${OPENCLAW_CMD} \${args}\`;
 }
 
+function shellQuote(value) {
+  return \`'\${String(value).replace(/'/g, \`'\\\\''\`)}'\`;
+}
+
+function getGatewayCliFlags() {
+  const config = readConfig();
+  const gateway = config?.gateway || {};
+  const auth = gateway.auth || {};
+  const port = Number(gateway.port || 18789);
+  const flags = [\`--url \${shellQuote(\`ws://127.0.0.1:\${port}\`)}\`];
+  if (auth.mode === 'token' && auth.token) {
+    flags.push(\`--token \${shellQuote(auth.token)}\`);
+  }
+  return flags.join(' ');
+}
+
+function openclawGatewayCall(method, extraArgs = '') {
+  const parts = ['gateway call', getGatewayCliFlags(), extraArgs, method].filter(Boolean);
+  return openclawExec(parts.join(' '));
+}
+
+function openclawDevicesExec(args) {
+  const parts = ['devices', args, getGatewayCliFlags()].filter(Boolean);
+  return openclawExec(parts.join(' '));
+}
+
 // ── WhatsApp connection check helper ─────────────────────────────────────────
 function isWhatsAppConnected(isRunning, logs) {
   if (!isRunning) return false;
@@ -503,7 +566,7 @@ function isWhatsAppConnected(isRunning, logs) {
 
 function isWhatsAppLinkedViaRPC() {
   try {
-    const out = runCmd(\`\${openclawExec('gateway call health --json')} 2>/dev/null\`);
+    const out = runCmd(\`\${openclawGatewayCall('health', '--json')} 2>/dev/null\`);
     const health = JSON.parse(out);
     const wa = health.channels && health.channels.whatsapp;
     return wa && (wa.connected === true || wa.linked === true);
@@ -517,6 +580,7 @@ let whatsappLoginProcess = null;
 let whatsappLoginStartedAt = 0;
 let whatsappRawQR = null;
 let whatsappQRTimestamp = 0;
+let whatsappLinkedAt = 0;
 
 let whatsappSetupDone = false;
 
@@ -574,8 +638,9 @@ async function startWhatsAppLogin() {
   const authDir = '/tmp/oriclaw-wa-auth';
   try {
     fs.mkdirSync(authDir, { recursive: true });
-    const openclawAuth = '/home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth';
-    execSync(\`cp -rn \${openclawAuth}/* \${authDir}/ 2>/dev/null || true\`, { timeout: 5000 });
+    for (const openclawAuth of getWhatsAppAuthDirs()) {
+      execSync(\`cp -rn '\${openclawAuth}'/* '\${authDir}/' 2>/dev/null || true\`, { timeout: 5000 });
+    }
   } catch { /* ignore */ }
 
   try {
@@ -626,11 +691,17 @@ async function startWhatsAppLogin() {
       if (connection === 'open') {
         console.log('[whatsapp-login] connected!');
         whatsappRawQR = null;
-        try {
-          const ocAuth = '/home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth';
-          execSync(\`mkdir -p \${ocAuth} && cp -r /tmp/oriclaw-wa-auth/* \${ocAuth}/ && chown -R openclaw:openclaw \${ocAuth}\`, { timeout: 10000 });
-          console.log('[whatsapp-login] auth synced to OpenClaw dir');
-        } catch (err) { console.error('[whatsapp-login] auth sync error:', err.message); }
+        whatsappLinkedAt = Date.now();
+        for (const ocAuth of getWhatsAppAuthDirs()) {
+          try {
+            execSync(\`mkdir -p '\${ocAuth}' && cp -r /tmp/oriclaw-wa-auth/* '\${ocAuth}/' 2>/dev/null || true && chown -R openclaw:openclaw '\${ocAuth}'\`, { timeout: 10000 });
+          } catch (err) {
+            console.error('[whatsapp-login] auth sync error:', err.message);
+          }
+        }
+        exec('sudo systemctl restart openclaw', { timeout: 30000 }, (restartErr) => {
+          if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
+        });
         cleanupWhatsAppSocket();
       }
       if (connection === 'close') {
@@ -667,7 +738,9 @@ app.get('/qr', auth, async (req, res) => {
   const isRunning = getOpenclawStatus() === 'running';
 
   const logs = getJournalLogsSinceLastStart(200);
-  if (isWhatsAppConnected(isRunning, logs)) {
+  const linkedViaRPC = isWhatsAppLinkedViaRPC();
+  const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30000);
+  if (linkedViaRPC || linkedRecently || isWhatsAppConnected(isRunning, logs)) {
     if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
       cleanupWhatsAppSocket();
     }
@@ -886,12 +959,7 @@ app.get('/chat-url', auth, (req, res) => {
 
     // Read gateway token from OpenClaw config (files owned by openclaw user, read via sudo)
     let gatewayToken = '';
-    const configPaths = [
-      path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'openclaw.json'),
-      path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
-      OPENCLAW_CONFIG_FILE,
-    ];
-    for (const cfgPath of configPaths) {
+    for (const cfgPath of OPENCLAW_CONFIG_PATHS) {
       try {
         const raw = runCmd(\`sudo -u openclaw /usr/bin/cat '\${cfgPath}' 2>/dev/null\`);
         const config = JSON.parse(raw);
@@ -926,15 +994,13 @@ app.get('/chat-url', auth, (req, res) => {
       }
     }
 
-    // OpenClaw Control UI reads gatewayUrl + token from URL hash fragment
+    // OpenClaw Control UI should be opened top-level from the gateway origin.
     const sslipDomain = publicIp.replace(/\\./g, '-') + '.sslip.io';
-    const baseUrl = \`https://\${sslipDomain}\`;
-    const wsUrl = \`wss://\${sslipDomain}\`;
-    const hash = gatewayToken
-      ? \`#gatewayUrl=\${encodeURIComponent(wsUrl)}&token=\${gatewayToken}\`
-      : \`#gatewayUrl=\${encodeURIComponent(wsUrl)}\`;
-    const url = baseUrl + hash;
-    res.json({ url, available, token: gatewayToken || undefined });
+    const baseUrl = \`https://\${sslipDomain}/\`;
+    const url = gatewayToken
+      ? \`\${baseUrl}#token=\${encodeURIComponent(gatewayToken)}\`
+      : baseUrl;
+    res.json({ url, available });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -946,7 +1012,7 @@ app.post('/chat-approve', auth, (req, res) => {
     // List pending devices and approve all
     let listOut = '';
     try {
-      listOut = runCmd(\`\${openclawExec('devices list --json')} 2>/dev/null\`);
+      listOut = runCmd(\`\${openclawDevicesExec('list --json')} 2>/dev/null\`);
     } catch { /* ignore */ }
 
     let approved = 0;
@@ -958,7 +1024,7 @@ app.post('/chat-approve', auth, (req, res) => {
           const reqId = p.requestId || p.id;
           if (reqId) {
             try {
-              runCmd(\`\${openclawExec(\`devices approve \${reqId}\`)} 2>/dev/null\`);
+              runCmd(\`\${openclawDevicesExec(\`approve \${shellQuote(reqId)}\`)} 2>/dev/null\`);
               approved++;
             } catch { /* ignore */ }
           }
@@ -970,7 +1036,7 @@ app.post('/chat-approve', auth, (req, res) => {
           const match = line.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
           if (match) {
             try {
-              runCmd(\`\${openclawExec(\`devices approve \${match[1]}\`)} 2>/dev/null\`);
+              runCmd(\`\${openclawDevicesExec(\`approve \${shellQuote(match[1])}\`)} 2>/dev/null\`);
               approved++;
             } catch { /* ignore */ }
           }
@@ -1135,7 +1201,7 @@ app.delete('/channels/:channel', auth, (req, res) => {
       // Respond immediately, then fire-and-forget the restart
       res.json({ success: true });
       exec(
-        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys && sudo systemctl restart openclaw',
+        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys /home/openclaw/.openclaw/credentials/whatsapp /home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth /home/openclaw/.openclaw/channels/whatsapp/default/auth && sudo systemctl restart openclaw',
         { timeout: 30000 },
         (err) => {
           if (err) console.error('[vps-agent] restart after whatsapp disconnect failed:', err.message);
@@ -1165,10 +1231,28 @@ app.delete('/channels/:channel', auth, (req, res) => {
   }
 });
 
-// GET /usage/pending → return buffered usage events and clear
+// GET /usage/pending → return buffered usage events without clearing
 app.get('/usage/pending', auth, (req, res) => {
-  const events = usageBuffer.splice(0, usageBuffer.length);
-  res.json({ events, credit_blocked: creditBlocked });
+  res.json({ events: usageBuffer.slice(), credit_blocked: creditBlocked });
+});
+
+// POST /usage/ack → remove usage events that were successfully processed
+app.post('/usage/ack', auth, (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter((id) => typeof id === 'string') : [];
+  if (ids.length === 0) {
+    return res.json({ removed: 0, pending: usageBuffer.length });
+  }
+
+  const ackedIds = new Set(ids);
+  let removed = 0;
+  for (let i = usageBuffer.length - 1; i >= 0; i -= 1) {
+    if (ackedIds.has(usageBuffer[i].id)) {
+      usageBuffer.splice(i, 1);
+      removed += 1;
+    }
+  }
+
+  res.json({ removed, pending: usageBuffer.length });
 });
 
 // POST /credit-status → receive credit status from backend, start/stop openclaw
@@ -1262,9 +1346,10 @@ WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
 Environment=OPENCLAW_HOME=/home/openclaw/.openclaw
 Environment=OPENCLAW_NO_RESPAWN=1
+Environment=NODE_OPTIONS=--max-old-space-size=1280
 Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway --allow-unconfigured --bind lan
+ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway run --allow-unconfigured --bind lan
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=90
@@ -1357,11 +1442,12 @@ sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /hom
 echo "[oriclaw] WhatsApp channel enabled"
 
 # ── Nginx reverse proxy (HTTPS for OpenClaw Gateway UI) ──────────────────────
-apt-get install -y -o Dpkg::Options::="--force-confdef" nginx libnginx-mod-http-headers-more-filter 2>/dev/null || true
+apt-get install -y -o Dpkg::Options::="--force-confdef" nginx 2>/dev/null || true
 
 # Get public IP and set up sslip.io domain for Let's Encrypt
 PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}')
 SSLIP_DOMAIN=$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set gateway.controlUi.allowedOrigins "[\"https://$SSLIP_DOMAIN\",\"http://$PUBLIC_IP:18789\"]" --strict-json 2>/dev/null || true
 
 # Get Let's Encrypt cert via certbot (non-interactive)
 apt-get install -y -o Dpkg::Options::="--force-confdef" certbot python3-certbot-nginx 2>/dev/null || true
@@ -1402,14 +1488,6 @@ server {
         proxy_set_header X-Forwarded-Proto \\\$scheme;
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
-
-        # Remove upstream restrictive headers
-        more_clear_headers 'X-Frame-Options';
-        more_clear_headers 'Content-Security-Policy';
-
-        # Add permissive headers for iframe embedding
-        add_header X-Frame-Options "ALLOW-FROM https://oriclaw.com" always;
-        add_header Content-Security-Policy "frame-ancestors 'self' https://oriclaw.com https://*.oriclaw.com https://*.vercel.app http://localhost:*" always;
     }
 }
 NGXEOF

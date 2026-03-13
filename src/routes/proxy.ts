@@ -330,6 +330,9 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       const existingAiMode = existingMeta.ai_mode as string | undefined;
 
       const metaUpdates: Record<string, unknown> = { ...existingMeta };
+      if (body.model && typeof body.model === 'string') {
+        metaUpdates.model = body.model;
+      }
 
       if (body.credits_mode) {
         metaUpdates.ai_mode = 'credits';
@@ -338,7 +341,6 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       } else if (body.model || body.anthropic_key || body.openai_key || body.google_key || body.openrouter_key) {
         // Explicitly reconfiguring BYOK keys/model — update ai_mode
         metaUpdates.ai_mode = 'byok';
-        if (body.model) metaUpdates.model = body.model as string;
       } else {
         // Only updating persona/language/timezone — preserve the existing ai_mode
         if (existingAiMode) metaUpdates.ai_mode = existingAiMode;
