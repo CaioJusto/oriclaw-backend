@@ -698,22 +698,28 @@ app.post('/configure', auth, (req, res) => {
     if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
     if (google_key) envUpdates.GOOGLE_API_KEY = google_key;
     if (openrouter_key) {
-      // Write OpenRouter key to systemd override and .env as fallback
+      // Configure OpenRouter API key in openclaw.json env section (native OpenClaw config)
       try {
-        const overrideDir = '/etc/systemd/system/openclaw.service.d';
-        runCmd(`sudo mkdir -p '${overrideDir}'`);
-        // Write override file via a temp file to avoid shell escaping issues
-        const tmpFile = '/tmp/openrouter-override.conf';
-        fs.writeFileSync(tmpFile, `[Service]\nEnvironment=OPENROUTER_API_KEY=${openrouter_key}\n`);
-        runCmd(`sudo cp '${tmpFile}' '${overrideDir}/openrouter.conf'`);
-        runCmd(`sudo chmod 600 '${overrideDir}/openrouter.conf'`);
-        fs.unlinkSync(tmpFile);
-        runCmd('sudo systemctl daemon-reload');
+        const sanitizedKey = sanitizeEnvValue(openrouter_key);
+        runCmd(openclawExec(`config set env.OPENROUTER_API_KEY ${sanitizedKey}`));
+        console.log('[configure] set OPENROUTER_API_KEY in openclaw.json env');
       } catch (err) {
-        console.error('[configure] systemd override failed, falling back to .env:', err.message);
+        console.error('[configure] openclaw config set env failed:', err.message);
       }
-      // Always write to .env as well so OpenClaw finds the key
+      // Also write to .env as fallback
       envUpdates.OPENROUTER_API_KEY = openrouter_key;
+    }
+
+    // Set model in OpenClaw via CLI — format: openrouter/<provider>/<model> for OpenRouter models
+    if (safeModel) {
+      try {
+        // OpenRouter models (format: provider/model-name) need "openrouter/" prefix for OpenClaw
+        const openclawModel = MODEL_REGEX.test(safeModel) ? `openrouter/${safeModel}` : safeModel;
+        runCmd(openclawExec(`models set ${openclawModel}`));
+        console.log(`[configure] set OpenClaw model to ${openclawModel}`);
+      } catch (err) {
+        console.error('[configure] openclaw models set failed:', err.message);
+      }
     }
     if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
     if (timezone) envUpdates.TZ = timezone;
