@@ -663,7 +663,11 @@ app.post('/configure', auth, (req, res) => {
 
   try {
     // Update config.json — validate model, channel, assistant_name inputs
-    const VALID_MODELS = ['claude-sonnet-4-5', 'claude-3-5-haiku-latest', 'claude-opus-4', 'gpt-4o', 'gpt-4o-mini'];
+    const VALID_MODELS = [
+      'claude-opus-4', 'claude-sonnet-4-5', 'claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001',
+      'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini',
+      'o3', 'o3-mini', 'o4-mini',
+    ];
     const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
     // Accept OpenRouter models (format: provider/model-name) in credits mode,
     // plus the hardcoded BYOK models
@@ -691,19 +695,22 @@ app.post('/configure', auth, (req, res) => {
     if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
     if (google_key) envUpdates.GOOGLE_API_KEY = google_key;
     if (openrouter_key) {
-      // Write to systemd override instead of .env for security
+      // Write OpenRouter key to systemd override and .env as fallback
       try {
         const overrideDir = '/etc/systemd/system/openclaw.service.d';
         runCmd(`sudo mkdir -p '${overrideDir}'`);
-        // Write via sudo tee to avoid permission issues
-        const overrideContent = `[Service]\\nEnvironment=OPENROUTER_API_KEY=${openrouter_key}\\n`;
-        runCmd(`echo '${overrideContent}' | sudo tee '${overrideDir}/openrouter.conf' > /dev/null`);
+        // Write override file via a temp file to avoid shell escaping issues
+        const tmpFile = '/tmp/openrouter-override.conf';
+        fs.writeFileSync(tmpFile, `[Service]\nEnvironment=OPENROUTER_API_KEY=${openrouter_key}\n`);
+        runCmd(`sudo cp '${tmpFile}' '${overrideDir}/openrouter.conf'`);
         runCmd(`sudo chmod 600 '${overrideDir}/openrouter.conf'`);
+        fs.unlinkSync(tmpFile);
         runCmd('sudo systemctl daemon-reload');
       } catch (err) {
         console.error('[configure] systemd override failed, falling back to .env:', err.message);
-        envUpdates.OPENROUTER_API_KEY = openrouter_key;
       }
+      // Always write to .env as well so OpenClaw finds the key
+      envUpdates.OPENROUTER_API_KEY = openrouter_key;
     }
     if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
     if (timezone) envUpdates.TZ = timezone;
