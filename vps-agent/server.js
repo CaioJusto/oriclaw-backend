@@ -664,9 +664,12 @@ app.post('/configure', auth, (req, res) => {
   try {
     // Update config.json — validate model, channel, assistant_name inputs
     const VALID_MODELS = [
-      'claude-opus-4', 'claude-sonnet-4-5', 'claude-sonnet-4-20250514', 'claude-haiku-4-5-20251001',
+      'claude-opus-4.6', 'claude-opus-4.5', 'claude-opus-4.1', 'claude-opus-4',
+      'claude-sonnet-4.6', 'claude-sonnet-4.5', 'claude-sonnet-4', 'claude-3.7-sonnet',
+      'claude-haiku-4.5', 'claude-3.5-haiku',
+      'gpt-5.4', 'gpt-5.4-pro', 'gpt-5.2', 'gpt-5.1', 'gpt-5', 'gpt-5-mini',
       'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini',
-      'o3', 'o3-mini', 'o4-mini',
+      'o4-mini', 'o3', 'o3-pro', 'o3-mini',
     ];
     const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
     // Accept OpenRouter models (format: provider/model-name) in credits mode,
