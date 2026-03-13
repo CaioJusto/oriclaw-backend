@@ -665,7 +665,12 @@ app.post('/configure', auth, (req, res) => {
     // Update config.json — validate model, channel, assistant_name inputs
     const VALID_MODELS = ['claude-sonnet-4-5', 'claude-3-5-haiku-latest', 'claude-opus-4', 'gpt-4o', 'gpt-4o-mini'];
     const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
-    const safeModel = model && VALID_MODELS.includes(model) ? model : null;
+    // Accept OpenRouter models (format: provider/model-name) in credits mode,
+    // plus the hardcoded BYOK models
+    const MODEL_REGEX = /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/;
+    const safeModel = model
+      ? (VALID_MODELS.includes(model) ? model : (MODEL_REGEX.test(model) ? model : null))
+      : null;
     const safeChannel = channel && VALID_CHANNELS.includes(channel) ? channel : null;
     const safeName = assistant_name ? String(assistant_name).slice(0, 64).replace(/[^\w\s\-]/g, '') : null;
     const configUpdates = {};

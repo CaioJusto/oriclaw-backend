@@ -210,15 +210,12 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       // Ensure an OpenRouter-compatible model is set for credits mode.
       // Without this, OpenClaw may try to use a previous provider (e.g. "anthropic")
       // which fails because only OPENROUTER_API_KEY is configured.
+      // The model format should be "provider/model" (e.g. "minimax/minimax-m2.5")
+      // which is the native OpenRouter format — OpenClaw uses OPENROUTER_API_KEY env var
+      // to route through OpenRouter automatically.
       if (!body.model) {
         const settings = await getAdminSettings();
         body.model = settings?.default_model ?? 'anthropic/claude-sonnet-4-5';
-      }
-      // Prefix model with "openrouter/" so OpenClaw routes through the OpenRouter
-      // provider instead of trying to use the native provider (which has no API key).
-      const modelStr = body.model as string;
-      if (!modelStr.startsWith('openrouter/')) {
-        body.model = `openrouter/${modelStr}`;
       }
     }
 
