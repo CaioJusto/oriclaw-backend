@@ -523,8 +523,7 @@ let whatsappSetupDone = false;
 function ensureWhatsAppSetup() {
   if (whatsappSetupDone) return;
   try {
-    exec(\`\${openclawExec('plugins enable whatsapp')} 2>/dev/null || true\`, { timeout: 30000 });
-    exec(\`\${openclawExec('channels add --channel whatsapp')} 2>/dev/null || true\`, { timeout: 30000 });
+    exec(\`\${openclawExec('config set channels.whatsapp.enabled true --strict-json')} 2>/dev/null || true\`, { timeout: 30000 });
     whatsappSetupDone = true;
     console.log('[whatsapp] ensureWhatsAppSetup fired (async)');
   } catch (err) {
@@ -745,11 +744,17 @@ app.post('/configure', auth, (req, res) => {
   try {
     // Update config.json — Bug fix #7: validate model, channel, assistant_name inputs
     const VALID_MODELS = [
+      // Anthropic
       'claude-opus-4.6', 'claude-opus-4.5', 'claude-opus-4.1', 'claude-opus-4',
       'claude-sonnet-4.6', 'claude-sonnet-4.5', 'claude-sonnet-4', 'claude-3.7-sonnet',
       'claude-haiku-4.5', 'claude-3.5-haiku',
-      'gpt-5.4', 'gpt-5.4-pro', 'gpt-5.2', 'gpt-5.1', 'gpt-5', 'gpt-5-mini',
+      // OpenAI GPT-5
+      'gpt-5.4-pro', 'gpt-5.4', 'gpt-5.3-codex', 'gpt-5.3-chat',
+      'gpt-5.2-pro', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.2-chat',
+      'gpt-5.1', 'gpt-5.1-codex-max', 'gpt-5', 'gpt-5-mini',
+      // OpenAI GPT-4
       'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4o-mini',
+      // OpenAI o-series
       'o4-mini', 'o3', 'o3-pro', 'o3-mini',
     ];
     const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
@@ -1025,10 +1030,11 @@ app.post('/channels/telegram', auth, async (req, res) => {
   }
 
   try {
-    // Enable Telegram plugin and add channel via OpenClaw CLI
+    // Configure Telegram channel via OpenClaw config set
     try {
-      runCmd(\`\${openclawExec('plugins enable telegram')} 2>/dev/null || true\`);
-      runCmd(\`\${openclawExec(\`channels add --channel telegram --token \${token}\`)} 2>/dev/null || true\`);
+      const safeToken = sanitizeEnvValue(token);
+      runCmd(\`\${openclawExec(\`config set channels.telegram.botToken '"\${safeToken}"' --strict-json\`)} 2>/dev/null || true\`);
+      runCmd(\`\${openclawExec('config set channels.telegram.enabled true --strict-json')} 2>/dev/null || true\`);
     } catch (err) {
       console.warn('[telegram] OpenClaw CLI config warning:', err.message);
     }
@@ -1074,10 +1080,11 @@ app.post('/channels/discord', auth, async (req, res) => {
   }
 
   try {
-    // Enable Discord plugin and add channel via OpenClaw CLI
+    // Configure Discord channel via OpenClaw config set
     try {
-      runCmd(\`\${openclawExec('plugins enable discord')} 2>/dev/null || true\`);
-      runCmd(\`\${openclawExec(\`channels add --channel discord --token \${token}\`)} 2>/dev/null || true\`);
+      const safeToken = sanitizeEnvValue(token);
+      runCmd(\`\${openclawExec(\`config set channels.discord.token '"\${safeToken}"' --strict-json\`)} 2>/dev/null || true\`);
+      runCmd(\`\${openclawExec('config set channels.discord.enabled true --strict-json')} 2>/dev/null || true\`);
     } catch (err) {
       console.warn('[discord] OpenClaw CLI config warning:', err.message);
     }
@@ -1122,9 +1129,9 @@ app.delete('/channels/:channel', auth, (req, res) => {
       );
       return;
     } else {
-      // Disable plugin via OpenClaw CLI
+      // Disable channel via OpenClaw config
       try {
-        runCmd(\`\${openclawExec(\`plugins disable \${channel}\`)} 2>/dev/null || true\`);
+        runCmd(\`\${openclawExec(\`config set channels.\${channel}.enabled false --strict-json\`)} 2>/dev/null || true\`);
       } catch { /* ignore */ }
 
       const env = readEnvFile();
@@ -1331,10 +1338,9 @@ StandardError=journal
 WantedBy=multi-user.target
 AGENTEOF
 
-# ── Pre-configure WhatsApp plugin ─────────────────────────────────────────────
-sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw plugins enable whatsapp 2>/dev/null || true
-sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw channels add --channel whatsapp 2>/dev/null || true
-echo "[oriclaw] WhatsApp plugin enabled and channel added"
+# ── Pre-configure WhatsApp channel ────────────────────────────────────────────
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set channels.whatsapp.enabled true --strict-json 2>/dev/null || true
+echo "[oriclaw] WhatsApp channel enabled"
 
 # ── Nginx reverse proxy (HTTPS for OpenClaw Gateway UI) ──────────────────────
 apt-get install -y -o Dpkg::Options::="--force-confdef" nginx libnginx-mod-http-headers-more-filter 2>/dev/null || true
