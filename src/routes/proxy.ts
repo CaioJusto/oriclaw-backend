@@ -193,6 +193,7 @@ router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void
 // ── POST /api/proxy/:instance_id/configure ──────────────────────────────────
 router.post('/:instance_id/configure', async (req: Request, res: Response): Promise<void> => {
   const MAX_SYSTEM_PROMPT_BYTES = 8_000;
+  const CREDITS_SETUP_FEE_BRL = 0.05;
   if (typeof req.body.system_prompt === 'string' &&
       Buffer.byteLength(req.body.system_prompt, 'utf8') > MAX_SYSTEM_PROMPT_BYTES) {
     res.status(413).json({ error: `system_prompt excede o limite de ${MAX_SYSTEM_PROMPT_BYTES} bytes (8KB).` });
@@ -201,6 +202,13 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
 
   await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
     const body = { ...req.body } as Record<string, unknown>;
+    const existingMeta = ((instance?.metadata ?? {}) as Record<string, unknown>);
+    const existingAiMode = existingMeta.ai_mode as string | undefined;
+    const setupFeeAlreadyPaid = typeof existingMeta.credits_setup_fee_paid_at === 'string';
+    const shouldChargeCreditsSetupFee =
+      !!body.credits_mode &&
+      !setupFeeAlreadyPaid &&
+      existingAiMode !== 'credits';
 
     // ── Bug fix #5: Credits mode — enforce balance check before configuring ──
     if (body.credits_mode) {
@@ -210,7 +218,9 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         .eq('customer_id', userId)
         .maybeSingle();
       const balance = (creditsRow as { balance_brl: number } | null)?.balance_brl ?? 0;
-      if (balance <= 0) {
+      const insufficientForCreditsMode =
+        balance <= 0 || (shouldChargeCreditsSetupFee && balance < CREDITS_SETUP_FEE_BRL);
+      if (insufficientForCreditsMode) {
         res.status(402).json({ error: 'Saldo insuficiente. Recarregue seus créditos.' });
         return;
       }
@@ -325,10 +335,10 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         .select('metadata')
         .eq('id', instance.id)
         .single();
-      const existingMeta = ((existingInstance?.metadata ?? instance.metadata ?? {}) as Record<string, unknown>);
-      const existingAiMode = existingMeta.ai_mode as string | undefined;
+      const freshMeta = ((existingInstance?.metadata ?? instance.metadata ?? {}) as Record<string, unknown>);
+      const freshAiMode = freshMeta.ai_mode as string | undefined;
 
-      const metaUpdates: Record<string, unknown> = { ...existingMeta };
+      const metaUpdates: Record<string, unknown> = { ...freshMeta };
       if (body.model && typeof body.model === 'string') {
         metaUpdates.model = body.model;
       }
@@ -342,9 +352,8 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         metaUpdates.ai_mode = 'byok';
       } else {
         // Only updating persona/language/timezone — preserve the existing ai_mode
-        if (existingAiMode) metaUpdates.ai_mode = existingAiMode;
+        if (freshAiMode) metaUpdates.ai_mode = freshAiMode;
       }
-      await updateInstance(instance.id, { status: 'running', metadata: metaUpdates });
 
       // Persist API key (encrypted) if a user-supplied key was provided
       const keyToStore = (body.anthropic_key ?? body.openai_key ?? body.google_key ?? body.openrouter_key) as string | undefined;
@@ -358,18 +367,22 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         }
       }
 
-      // Deduct setup fee when first configuring in credits mode.
-      // Per-message deduction is handled in the ai/* route handler.
-      if (body.credits_mode) {
+      // Deduct setup fee only once per instance when switching into credits mode.
+      // Per-message deduction is handled by the usage poller.
+      if (shouldChargeCreditsSetupFee) {
         const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
           p_customer_id: userId,
-          p_amount: 0.05,
+          p_amount: CREDITS_SETUP_FEE_BRL,
         });
         if (deductErr || !deducted) {
           console.warn('[proxy/configure] deduct_credits (setup fee) insufficient or error:', deductErr?.message);
-          // non-fatal — instance is configured; balance may have already been checked above
+        } else {
+          metaUpdates.credits_setup_fee_paid_at = new Date().toISOString();
+          metaUpdates.credits_setup_fee_brl = CREDITS_SETUP_FEE_BRL;
         }
       }
+
+      await updateInstance(instance.id, { status: 'running', metadata: metaUpdates });
     }
 
     res.json(data);

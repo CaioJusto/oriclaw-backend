@@ -228,6 +228,17 @@ type CreditUsageEvent = {
   timestamp?: string;
 };
 
+type NormalizedUsageCharge = {
+  id: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  costBrl: number;
+  createdAt: string;
+};
+
 type RunningInstance = {
   id: string;
   customer_id: string;
@@ -258,6 +269,62 @@ async function acknowledgeUsageEvents(baseUrl: string, agentSecret: string, even
       httpsAgent: agentHttpsAgent,
     }
   );
+}
+
+function normalizeUsageEvent(
+  event: CreditUsageEvent,
+  configuredModel: string | null,
+  defaultModelId: string | null,
+  inst: RunningInstance,
+  multiplier: number
+): Promise<NormalizedUsageCharge | null> {
+  return (async () => {
+    const eventId = typeof event.id === 'string' ? event.id : '';
+    if (!eventId) return null;
+
+    const promptTokens = Number(event.prompt_tokens ?? 0);
+    const completionTokens = Number(event.completion_tokens ?? 0);
+    const totalTokens = promptTokens + completionTokens;
+    if (totalTokens <= 0) {
+      return {
+        id: eventId,
+        model: configuredModel ?? defaultModelId ?? 'unknown',
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        costUsd: 0,
+        costBrl: 0,
+        createdAt: event.timestamp ?? new Date().toISOString(),
+      };
+    }
+
+    const preferredModel =
+      normalizeOpenRouterModelId(event.model ?? null) ??
+      configuredModel ??
+      defaultModelId;
+    if (!preferredModel) return null;
+
+    let costUsdRaw = await calculateOpenRouterCostUsd(preferredModel, promptTokens, completionTokens);
+    if (costUsdRaw === null && defaultModelId && preferredModel !== defaultModelId) {
+      costUsdRaw = await calculateOpenRouterCostUsd(defaultModelId, promptTokens, completionTokens);
+    }
+    if (costUsdRaw === null) {
+      console.warn(`[usage-poll] Missing pricing for model ${preferredModel} on instance ${inst.id}`);
+      return null;
+    }
+
+    const costUsd = costUsdRaw * multiplier;
+    return {
+      id: eventId,
+      model: preferredModel,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      costUsd,
+      costBrl: costUsd * USD_TO_BRL,
+      createdAt: event.timestamp ?? new Date().toISOString(),
+    };
+  })();
 }
 
 async function collectUsageFromAgents(): Promise<void> {
@@ -312,141 +379,62 @@ async function collectUsageFromAgents(): Promise<void> {
         const events = Array.isArray(usageData?.events) ? (usageData.events as CreditUsageEvent[]) : [];
         if (events.length === 0) continue;
 
-        const usageByModel = new Map<string, {
+        const acknowledgedEventIds: string[] = [];
+        const chargedUsageRows: Array<{
+          instance_id: string;
+          customer_id: string;
           model: string;
-          totalTokens: number;
-          costUsdRaw: number;
-          createdAt: string;
-        }>();
-        const processedEventIds: string[] = [];
+          prompt_tokens: number;
+          completion_tokens: number;
+          total_tokens: number;
+          cost_usd: number;
+          cost_brl: number;
+          created_at: string;
+        }> = [];
 
         for (const event of events) {
-          const promptTokens = Number(event.prompt_tokens ?? 0);
-          const completionTokens = Number(event.completion_tokens ?? 0);
-          const totalTokens = promptTokens + completionTokens;
-          if (totalTokens <= 0) continue;
+          const normalized = await normalizeUsageEvent(event, configuredModel, defaultModelId, inst, multiplier);
+          if (!normalized) continue;
 
-          const preferredModel =
-            normalizeOpenRouterModelId(event.model ?? null) ??
-            configuredModel ??
-            defaultModelId;
-          if (!preferredModel) continue;
-
-          let costUsdRaw = await calculateOpenRouterCostUsd(preferredModel, promptTokens, completionTokens);
-          if (costUsdRaw === null && defaultModelId && preferredModel !== defaultModelId) {
-            costUsdRaw = await calculateOpenRouterCostUsd(defaultModelId, promptTokens, completionTokens);
-          }
-          if (costUsdRaw === null) {
-            console.warn(`[usage-poll] Missing pricing for model ${preferredModel} on instance ${inst.id}`);
+          if (normalized.costBrl <= 0) {
+            acknowledgedEventIds.push(normalized.id);
             continue;
           }
 
-          if (typeof event.id === 'string' && event.id) {
-            processedEventIds.push(event.id);
+          const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
+            p_customer_id: inst.customer_id,
+            p_amount: normalized.costBrl,
+          });
+
+          if (deductErr) {
+            console.warn(`[usage-poll] deduct_credits error for ${inst.customer_id}:`, deductErr.message);
+            break;
           }
 
-          const bucketKey = preferredModel;
-          const existing = usageByModel.get(bucketKey);
-          if (existing) {
-            existing.totalTokens += totalTokens;
-            existing.costUsdRaw += costUsdRaw;
-            if (event.timestamp && event.timestamp > existing.createdAt) {
-              existing.createdAt = event.timestamp;
-            }
-          } else {
-            usageByModel.set(bucketKey, {
-              model: preferredModel,
-              totalTokens,
-              costUsdRaw,
-              createdAt: event.timestamp ?? new Date().toISOString(),
-            });
-          }
-        }
-
-        if (usageByModel.size === 0) continue;
-
-        const usageRows = Array.from(usageByModel.values()).map((entry) => {
-          const costUsd = entry.costUsdRaw * multiplier;
-          return {
-            instance_id: inst.id,
-            customer_id: inst.customer_id,
-            model: entry.model,
-            total_tokens: entry.totalTokens,
-            cost_usd: costUsd,
-            cost_brl: costUsd * USD_TO_BRL,
-            created_at: entry.createdAt,
-          };
-        });
-
-        const totalCostBrl = usageRows.reduce((sum, row) => sum + row.cost_brl, 0);
-        if (totalCostBrl <= 0) {
-          if (processedEventIds.length > 0) {
-            await acknowledgeUsageEvents(baseUrl, agentSecret, processedEventIds);
-          }
-          continue;
-        }
-
-        let chargedAmountBrl = 0;
-        let shouldAckProcessedEvents = false;
-
-        const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
-          p_customer_id: inst.customer_id,
-          p_amount: totalCostBrl,
-        });
-
-        if (deductErr) {
-          console.warn(`[usage-poll] deduct_credits error for ${inst.customer_id}:`, deductErr.message);
-          continue;
-        }
-
-        if (deducted) {
-          chargedAmountBrl = totalCostBrl;
-          shouldAckProcessedEvents = true;
-        } else {
-          const availableBalance = await getCustomerCreditBalance(inst.customer_id);
-          const partialAmountBrl = Math.min(Math.max(availableBalance, 0), totalCostBrl);
-
-          if (partialAmountBrl > 0) {
-            const { data: partialDeducted, error: partialDeductErr } = await supabase.rpc('deduct_credits', {
-              p_customer_id: inst.customer_id,
-              p_amount: partialAmountBrl,
-            });
-
-            if (partialDeductErr) {
-              console.warn(
-                `[usage-poll] partial deduct_credits error for ${inst.customer_id}:`,
-                partialDeductErr.message
-              );
-              continue;
-            }
-
-            if (!partialDeducted) {
-              console.warn(`[usage-poll] Partial deduction race for ${inst.customer_id}; retrying next cycle`);
-              continue;
-            }
-
-            chargedAmountBrl = partialAmountBrl;
-            shouldAckProcessedEvents = true;
+          if (!deducted) {
             console.warn(
-              `[usage-poll] Charged partial balance R$${partialAmountBrl.toFixed(4)} ` +
+              `[usage-poll] Balance exhausted before charging event ${normalized.id} ` +
               `for ${inst.customer_id} on instance ${inst.id}`
             );
-          } else {
-            shouldAckProcessedEvents = true;
-            console.warn(
-              `[usage-poll] Balance exhausted before charging ${inst.customer_id} for instance ${inst.id}`
-            );
+            break;
           }
+
+          chargedUsageRows.push({
+            instance_id: inst.id,
+            customer_id: inst.customer_id,
+            model: normalized.model,
+            prompt_tokens: normalized.promptTokens,
+            completion_tokens: normalized.completionTokens,
+            total_tokens: normalized.totalTokens,
+            cost_usd: normalized.costUsd,
+            cost_brl: normalized.costBrl,
+            created_at: normalized.createdAt,
+          });
+          acknowledgedEventIds.push(normalized.id);
         }
 
-        if (chargedAmountBrl > 0) {
-          const chargeRatio = Math.min(chargedAmountBrl / totalCostBrl, 1);
-          const chargedUsageRows = usageRows.map((row) => ({
-            ...row,
-            cost_usd: row.cost_usd * chargeRatio,
-            cost_brl: row.cost_brl * chargeRatio,
-          }));
-
+        if (chargedUsageRows.length > 0) {
+          const chargedAmountBrl = chargedUsageRows.reduce((sum, row) => sum + row.cost_brl, 0);
           const { error: insertErr } = await supabase.from('oriclaw_token_usage').insert(chargedUsageRows);
           if (insertErr) {
             console.warn(`[usage-poll] Failed to insert usage rows for ${inst.id}:`, insertErr.message);
@@ -457,9 +445,9 @@ async function collectUsageFromAgents(): Promise<void> {
           }
         }
 
-        if (shouldAckProcessedEvents && processedEventIds.length > 0) {
+        if (acknowledgedEventIds.length > 0) {
           try {
-            await acknowledgeUsageEvents(baseUrl, agentSecret, processedEventIds);
+            await acknowledgeUsageEvents(baseUrl, agentSecret, acknowledgedEventIds);
           } catch (ackErr) {
             console.warn(
               `[usage-poll] Failed to acknowledge usage events for ${inst.id}:`,
