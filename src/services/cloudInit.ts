@@ -905,12 +905,26 @@ app.get('/chat-url', auth, (req, res) => {
     // OpenClaw gateway listens on port 18789 by default
     const gatewayPort = 18789;
 
-    // Check if gateway port is responding
+    // Check if gateway port is responding (--bind lan may not listen on localhost)
     let available = false;
     try {
       runCmd(\`nc -z -w2 localhost \${gatewayPort} 2>/dev/null\`);
       available = true;
-    } catch { available = false; }
+    } catch {
+      try {
+        // Fallback: check on public IP (openclaw --bind lan listens there)
+        if (publicIp && publicIp !== 'localhost') {
+          runCmd(\`nc -z -w2 \${publicIp} \${gatewayPort} 2>/dev/null\`);
+          available = true;
+        }
+      } catch {
+        // Last resort: check if systemd says openclaw is active
+        try {
+          const status = runCmd('systemctl is-active openclaw').trim();
+          available = status === 'active';
+        } catch { available = false; }
+      }
+    }
 
     // OpenClaw Control UI reads gatewayUrl + token from URL hash fragment
     const sslipDomain = publicIp.replace(/\\./g, '-') + '.sslip.io';

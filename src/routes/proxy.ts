@@ -147,6 +147,23 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
         timeout: 10_000,
         httpsAgent: vpsHttpsAgent,
       });
+
+      // Workaround: older VPS agents check `nc -z localhost 18789` which fails
+      // when OpenClaw is started with `--bind lan` (listens on public IP, not localhost).
+      // If the agent reports available=false but the URL looks valid, verify via health.
+      if (data && data.available === false && data.url) {
+        try {
+          const { data: healthData } = await axios.get(`${baseUrl}/health`, {
+            headers: agentHeaders(agentSecret),
+            timeout: 5_000,
+            httpsAgent: vpsHttpsAgent,
+          });
+          if (healthData && healthData.openclaw === 'running') {
+            data.available = true;
+          }
+        } catch { /* ignore — keep original available=false */ }
+      }
+
       res.json(data);
     } catch (err: unknown) {
       const axErr = err as { response?: { status?: number; data?: unknown } };
