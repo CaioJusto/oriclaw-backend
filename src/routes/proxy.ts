@@ -13,6 +13,7 @@ import { supabase } from '../services/supabase';
 import { getInstanceById, updateInstance } from '../services/supabase';
 import { decrypt, encrypt } from '../services/crypto';
 import { getUserId } from '../middleware/requireAuth';
+import { getAdminSettings } from '../services/openrouter';
 
 // Accept self-signed TLS certs from VPS agents
 const vpsHttpsAgent = new https.Agent({ rejectUnauthorized: false });
@@ -205,6 +206,20 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
         return;
       }
       body.openrouter_key = orKey;
+
+      // Ensure an OpenRouter-compatible model is set for credits mode.
+      // Without this, OpenClaw may try to use a previous provider (e.g. "anthropic")
+      // which fails because only OPENROUTER_API_KEY is configured.
+      if (!body.model) {
+        const settings = await getAdminSettings();
+        body.model = settings?.default_model ?? 'anthropic/claude-sonnet-4-5';
+      }
+      // Prefix model with "openrouter/" so OpenClaw routes through the OpenRouter
+      // provider instead of trying to use the native provider (which has no API key).
+      const modelStr = body.model as string;
+      if (!modelStr.startsWith('openrouter/')) {
+        body.model = `openrouter/${modelStr}`;
+      }
     }
 
     // Inject stored Anthropic API key (decrypted) if not provided by client and instance has one
