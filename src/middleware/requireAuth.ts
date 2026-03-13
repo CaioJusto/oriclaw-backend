@@ -32,6 +32,38 @@ export async function getUserId(req: Request): Promise<string | null> {
   return data.user.id;
 }
 
+/**
+ * Superadmin middleware — only the admin_user_id from oriclaw_admin_settings
+ * is allowed through. Returns 403 for any other authenticated user.
+ */
+export async function requireSuperAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
+    return;
+  }
+  const token = authHeader.slice(7);
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    res.status(401).json({ error: 'Não autorizado. Faça login novamente.' });
+    return;
+  }
+
+  const { data: settings } = await supabase
+    .from('oriclaw_admin_settings')
+    .select('admin_user_id')
+    .limit(1)
+    .maybeSingle();
+
+  if (!settings || user.id !== settings.admin_user_id) {
+    res.status(403).json({ error: 'Acesso restrito ao superadmin.' });
+    return;
+  }
+
+  req.user = { id: user.id, email: user.email ?? undefined };
+  next();
+}
+
 // Bug fix #7: typed parameter instead of `any`
 export function sanitizeInstance(instance: OriClawInstance) {
   if (!instance) return instance;

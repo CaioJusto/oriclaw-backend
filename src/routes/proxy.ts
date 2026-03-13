@@ -19,7 +19,6 @@ const vpsHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 const router = Router();
 
-const COST_PER_MESSAGE_BRL = 0.02; // R$0.02 deducted per AI message in credits mode
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── Instance ownership check + VPS URL builder ──────────────────────────────
@@ -472,19 +471,6 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
         timeout: 60_000,
         httpsAgent: vpsHttpsAgent,
       });
-
-      // Deduct per-message credit cost for credits-mode users after successful response
-      const meta = (instance?.metadata ?? {}) as Record<string, unknown>;
-      if (meta.ai_mode === 'credits') {
-        const { data: deducted, error: deductErr } = await supabase.rpc('deduct_credits', {
-          p_customer_id: userId,
-          p_amount: COST_PER_MESSAGE_BRL,
-        });
-        if (deductErr || !deducted) {
-          console.warn('[proxy/ai] deduct_credits insufficient balance or error:', deductErr?.message);
-          // non-fatal: message already delivered, just log
-        }
-      }
 
       res.json(data);
     } catch (err: unknown) {

@@ -3,7 +3,7 @@
 const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
-const { execSync, exec } = require('child_process');
+const { execSync, exec, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
@@ -28,6 +28,53 @@ let isRestarting = false;
 const LOCK_TIMEOUT_MS = 60_000;
 let configuringTimer = null;
 let restartingTimer = null;
+
+// ── Usage tracking ─────────────────────────────────────────────────────────
+const usageBuffer = [];
+let creditBlocked = false;
+
+// ── Journald usage watcher ─────────────────────────────────────────────────
+function startUsageWatcher() {
+  const journal = spawn('journalctl', ['-u', 'openclaw', '-f', '-o', 'cat', '--no-pager'], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+
+  let partial = '';
+
+  journal.stdout.on('data', (chunk) => {
+    partial += chunk.toString();
+    const lines = partial.split('\n');
+    partial = lines.pop(); // keep incomplete line for next chunk
+
+    for (const line of lines) {
+      // Look for JSON containing usage data from OpenRouter
+      const usageMatch = line.match(/\{[^{}]*"usage"\s*:\s*\{[^}]*"prompt_tokens"\s*:\s*\d+[^}]*\}[^}]*\}/);
+      if (usageMatch) {
+        try {
+          const parsed = JSON.parse(usageMatch[0]);
+          if (parsed.usage && typeof parsed.usage.prompt_tokens === 'number') {
+            usageBuffer.push({
+              prompt_tokens: parsed.usage.prompt_tokens,
+              completion_tokens: parsed.usage.completion_tokens || 0,
+              model: parsed.model || null,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch { /* malformed JSON, skip */ }
+      }
+    }
+  });
+
+  journal.on('close', (code) => {
+    console.log('[usage-watcher] journalctl exited with code', code, '— restarting in 5s');
+    setTimeout(startUsageWatcher, 5000);
+  });
+
+  console.log('[usage-watcher] started');
+}
+
+// Delay watcher start to ensure openclaw service exists
+setTimeout(startUsageWatcher, 10_000);
 
 // ── Auth rate limiting ───────────────────────────────────────────────────────
 const authFailures = new Map(); // ip → { count, lastAttempt }
@@ -255,16 +302,21 @@ app.get('/health/detailed', auth, (req, res) => {
       ram_used_mb = Math.round((memTotal - memAvail) / 1024);
     } catch { /* ignore */ }
 
-    // Disk from df
+    // Disk from df (use df -k for compatibility, convert to GB)
     let disk_used_gb = 0, disk_total_gb = 0;
     try {
-      const dfOut = runCmd('df -BG / --output=size,used').trim();
-      const lines = dfOut.split('\n').filter(l => /^\d/.test(l.trim()));
-      const dataLine = lines.find(l => /\d/.test(l)) || lines[lines.length - 1];
-      if (dataLine) {
-        const parts = dataLine.trim().split(/\s+/);
-        disk_total_gb = parseFloat(parts[0]) || 0;
-        disk_used_gb = parseFloat(parts[1]) || 0;
+      const dfOut = runCmd('df -k /').trim();
+      // Format: Filesystem 1K-blocks Used Available Use% Mounted
+      const lines = dfOut.split('\n');
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].trim().split(/\s+/);
+        if (parts.length >= 4) {
+          const totalKb = parseInt(parts[1], 10) || 0;
+          const usedKb = parseInt(parts[2], 10) || 0;
+          disk_total_gb = Math.round((totalKb / 1048576) * 10) / 10;
+          disk_used_gb = Math.round((usedKb / 1048576) * 10) / 10;
+          break;
+        }
       }
     } catch { /* ignore */ }
 
@@ -348,53 +400,168 @@ function isWhatsAppLinkedViaRPC() {
 
 // ── WhatsApp login process management ────────────────────────────────────────
 let whatsappLoginProcess = null;
-let whatsappLoginOutput = '';
 let whatsappLoginStartedAt = 0;
+let whatsappRawQR = null;       // raw QR string from Baileys
+let whatsappQRTimestamp = 0;
+
+let whatsappSetupDone = false;
 
 function ensureWhatsAppSetup() {
+  if (whatsappSetupDone) return;
   try {
-    runCmd(`${openclawExec('plugins enable whatsapp')} 2>/dev/null || true`);
-    runCmd(`${openclawExec('channels add --channel whatsapp')} 2>/dev/null || true`);
-    console.log('[whatsapp] ensureWhatsAppSetup completed');
+    exec(`${openclawExec('plugins enable whatsapp')} 2>/dev/null || true`, { timeout: 30_000 });
+    exec(`${openclawExec('channels add --channel whatsapp')} 2>/dev/null || true`, { timeout: 30_000 });
+    whatsappSetupDone = true;
+    console.log('[whatsapp] ensureWhatsAppSetup fired (async)');
   } catch (err) {
     console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
   }
 }
 
-function startWhatsAppLogin() {
-  // Don't start if already running or started recently (< 10s ago)
-  if (whatsappLoginProcess && !whatsappLoginProcess.killed) return;
+/**
+ * Load Baileys from OpenClaw's node_modules (lazy, cached).
+ */
+let _baileys = null;
+function loadBaileys() {
+  if (_baileys) return _baileys;
+  const paths = [
+    '/home/openclaw/.npm-global/lib/node_modules/openclaw/node_modules/@whiskeysockets/baileys',
+    '/home/openclaw/.npm-global/lib/node_modules/@whiskeysockets/baileys',
+  ];
+  for (const p of paths) {
+    try {
+      _baileys = require(p);
+      console.log('[whatsapp] Baileys loaded from:', p);
+      return _baileys;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+let whatsappSocket = null;
+
+/**
+ * Start WhatsApp login using Baileys directly in-process.
+ * Captures raw QR data string for PNG generation.
+ */
+async function startWhatsAppLogin() {
+  if (whatsappSocket) return; // already running
   if (Date.now() - whatsappLoginStartedAt < 10_000) return;
 
   ensureWhatsAppSetup();
-  whatsappLoginOutput = '';
+  whatsappRawQR = null;
   whatsappLoginStartedAt = Date.now();
+  // Mark as "in progress" to prevent re-entry
+  whatsappLoginProcess = { killed: false };
 
-  console.log('[whatsapp] starting channels login process');
-  const child = exec(
-    openclawExec('channels login --channel whatsapp'),
-    { timeout: 120_000 }
-  );
-  whatsappLoginProcess = child;
-
-  child.stdout.on('data', (data) => {
-    whatsappLoginOutput += data.toString();
-    console.log('[whatsapp-login] stdout chunk received, total length:', whatsappLoginOutput.length);
-  });
-
-  child.stderr.on('data', (data) => {
-    whatsappLoginOutput += data.toString();
-  });
-
-  child.on('close', (code) => {
-    console.log('[whatsapp-login] exited with code:', code);
+  const baileys = loadBaileys();
+  if (!baileys) {
+    console.error('[whatsapp] Baileys not found in OpenClaw node_modules');
     whatsappLoginProcess = null;
-  });
+    return;
+  }
 
-  child.on('error', (err) => {
-    console.error('[whatsapp-login] error:', err.message);
-    whatsappLoginProcess = null;
-  });
+  const makeWASocket = baileys.default || baileys.makeWASocket;
+  const useMultiFileAuthState = baileys.useMultiFileAuthState;
+  const fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion;
+  const makeCacheableSignalKeyStore = baileys.makeCacheableSignalKeyStore;
+
+  // Use a temp auth dir writable by the agent, then sync to OpenClaw's dir
+  const authDir = '/tmp/oriclaw-wa-auth';
+  try {
+    fs.mkdirSync(authDir, { recursive: true });
+    // Copy existing OpenClaw auth if available (so we don't re-link)
+    const openclawAuth = '/home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth';
+    execSync(`cp -rn ${openclawAuth}/* ${authDir}/ 2>/dev/null || true`, { timeout: 5000 });
+  } catch { /* ignore */ }
+
+  try {
+    console.log('[whatsapp] creating Baileys socket...');
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    // Fetch latest WhatsApp protocol version (required, otherwise 405)
+    let version;
+    try {
+      const vInfo = await fetchLatestBaileysVersion();
+      version = vInfo.version;
+      console.log('[whatsapp] protocol version:', version);
+    } catch (err) {
+      console.warn('[whatsapp] fetchLatestBaileysVersion failed, using default:', err.message);
+    }
+
+    const baileysLogger = {
+      level: 'warn',
+      info: () => {},
+      debug: () => {},
+      warn: (...args) => console.log('[baileys-warn]', ...args),
+      error: (...args) => console.error('[baileys-error]', ...args),
+      trace: () => {},
+      fatal: (...args) => console.error('[baileys-fatal]', ...args),
+      child: () => baileysLogger,
+    };
+
+    const sock = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys, baileysLogger) : state.keys,
+      },
+      version,
+      printQRInTerminal: false,
+      browser: ['OpenClaw', 'Chrome', '20.0.04'],
+      logger: baileysLogger,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+    });
+    whatsappSocket = sock;
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) {
+        whatsappRawQR = qr;
+        whatsappQRTimestamp = Date.now();
+        console.log('[whatsapp-login] QR data captured, length:', qr.length);
+      }
+      if (connection === 'open') {
+        console.log('[whatsapp-login] connected!');
+        whatsappRawQR = null;
+        // Sync auth back to OpenClaw's directory
+        try {
+          const ocAuth = '/home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth';
+          execSync(`mkdir -p ${ocAuth} && cp -r /tmp/oriclaw-wa-auth/* ${ocAuth}/ && chown -R openclaw:openclaw ${ocAuth}`, { timeout: 10000 });
+          console.log('[whatsapp-login] auth synced to OpenClaw dir');
+        } catch (err) { console.error('[whatsapp-login] auth sync error:', err.message); }
+        cleanupWhatsAppSocket();
+      }
+      if (connection === 'close') {
+        const err = lastDisconnect?.error;
+        const code = err?.output?.statusCode;
+        console.log('[whatsapp-login] connection closed, code:', code, 'error:', err?.message || err);
+        cleanupWhatsAppSocket();
+      }
+    });
+
+    // Auto-cleanup after 90s
+    setTimeout(() => {
+      if (whatsappSocket === sock) {
+        console.log('[whatsapp-login] timeout, cleaning up');
+        cleanupWhatsAppSocket();
+      }
+    }, 90_000);
+
+  } catch (err) {
+    console.error('[whatsapp-login] error creating socket:', err.message);
+    cleanupWhatsAppSocket();
+  }
+}
+
+function cleanupWhatsAppSocket() {
+  if (whatsappSocket) {
+    try { whatsappSocket.ws?.close(); } catch {}
+    whatsappSocket = null;
+  }
+  whatsappLoginProcess = null;
 }
 
 function readOpenClawLogQR() {
@@ -411,42 +578,13 @@ function readOpenClawLogQR() {
   }
 }
 
-/**
- * Extract ASCII art QR code from the login process output.
- * Returns the QR block as a string (unicode block characters).
- */
-function extractQRAsciiArt(output) {
-  if (!output) return null;
-  const lines = output.split('\n');
-  const qrLines = [];
-  let inQR = false;
-  for (const line of lines) {
-    // QR art starts with a line of ▄ characters
-    if (!inQR && line.includes('▄▄▄▄▄▄▄▄▄▄')) {
-      inQR = true;
-    }
-    if (inQR) {
-      qrLines.push(line);
-      // QR art ends with a line of █ and ▄ characters (bottom border)
-      if (qrLines.length > 5 && (line.includes('█▄▄▄▄▄▄▄▄') || line.includes('▄███'))) {
-        // Check if this looks like the last line
-        if (!line.includes('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄')) {
-          break;
-        }
-      }
-    }
-  }
-  return qrLines.length > 10 ? qrLines.join('\n') : null;
-}
-
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
-  const logs = getJournalLogsSinceLastStart(200);
   const isRunning = getOpenclawStatus() === 'running';
 
-  // Check connection via both log heuristics and gateway RPC
-  if (isWhatsAppConnected(isRunning, logs) || (isRunning && isWhatsAppLinkedViaRPC())) {
-    // Kill login process if connected
+  // ── Fast path: check log heuristics first (instant) ─────────────────────────
+  const logs = getJournalLogsSinceLastStart(200);
+  if (isWhatsAppConnected(isRunning, logs)) {
     if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
       whatsappLoginProcess.kill();
       whatsappLoginProcess = null;
@@ -454,18 +592,25 @@ app.get('/qr', auth, async (req, res) => {
     return res.json({ connected: true, qr: null });
   }
 
-  // Try to extract QR data string from multiple sources
+  // ── Check if we have raw QR data from the Baileys helper ──────────────────
+  if (whatsappRawQR && (Date.now() - whatsappQRTimestamp < 120_000)) {
+    try {
+      const pngBase64 = await QRCode.toDataURL(whatsappRawQR, {
+        errorCorrectionLevel: 'L',
+        type: 'image/png',
+        width: 300,
+        margin: 2,
+      });
+      return res.json({ connected: false, qr: pngBase64, generated_at: whatsappQRTimestamp });
+    } catch (err) {
+      console.error('[qr] QRCode.toDataURL error:', err.message);
+    }
+  }
+
+  // ── Fallback: try to extract QR data from logs ──────────────────────────────
   let qrData = extractQRData(logs);
+  if (!qrData) qrData = readOpenClawLogQR();
 
-  if (!qrData && whatsappLoginOutput) {
-    qrData = extractQRData(whatsappLoginOutput);
-  }
-
-  if (!qrData) {
-    qrData = readOpenClawLogQR();
-  }
-
-  // If we have raw QR data, generate PNG
   if (qrData) {
     try {
       const pngBase64 = await QRCode.toDataURL(qrData, {
@@ -475,40 +620,11 @@ app.get('/qr', auth, async (req, res) => {
         margin: 2,
       });
       return res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
-    } catch (err) {
-      // Fall through to ASCII art
-    }
+    } catch (err) { /* fall through */ }
   }
 
-  // Try to extract ASCII art QR from login process output
-  let asciiQR = extractQRAsciiArt(whatsappLoginOutput);
-
-  // Also check OpenClaw log file for ASCII art
-  if (!asciiQR) {
-    try {
-      const today = new Date().toISOString().split('T')[0];
-      const logFile = `/tmp/openclaw/openclaw-${today}.log`;
-      if (fs.existsSync(logFile)) {
-        const content = fs.readFileSync(logFile, 'utf8');
-        const recent = content.slice(-15000);
-        // Log file stores QR in JSON format with "0" key containing the art
-        const qrMatches = [...recent.matchAll(/"0":"(▄[^"]+)"/g)];
-        if (qrMatches.length > 0) {
-          const lastMatch = qrMatches[qrMatches.length - 1][1];
-          // Unescape JSON string
-          const unescaped = lastMatch.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-          asciiQR = unescaped;
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  if (asciiQR) {
-    return res.json({ connected: false, qr: null, qr_ascii: asciiQR, generated_at: Date.now() });
-  }
-
-  // No QR data found — trigger login process
-  startWhatsAppLogin();
+  // No QR data found — trigger login process (fire and forget)
+  startWhatsAppLogin().catch(err => console.error('[qr] startWhatsAppLogin error:', err.message));
   return res.status(404).json({ error: 'QR not available yet', connected: false, login_started: true });
 });
 
@@ -569,7 +685,21 @@ app.post('/configure', auth, (req, res) => {
     if (anthropic_key) envUpdates.ANTHROPIC_API_KEY = anthropic_key;
     if (openai_key) envUpdates.OPENAI_API_KEY = openai_key;
     if (google_key) envUpdates.GOOGLE_API_KEY = google_key;
-    if (openrouter_key) envUpdates.OPENROUTER_API_KEY = openrouter_key;
+    if (openrouter_key) {
+      // Write to systemd override instead of .env for security
+      try {
+        const overrideDir = '/etc/systemd/system/openclaw.service.d';
+        runCmd(`sudo mkdir -p '${overrideDir}'`);
+        // Write via sudo tee to avoid permission issues
+        const overrideContent = `[Service]\\nEnvironment=OPENROUTER_API_KEY=${openrouter_key}\\n`;
+        runCmd(`echo '${overrideContent}' | sudo tee '${overrideDir}/openrouter.conf' > /dev/null`);
+        runCmd(`sudo chmod 600 '${overrideDir}/openrouter.conf'`);
+        runCmd('sudo systemctl daemon-reload');
+      } catch (err) {
+        console.error('[configure] systemd override failed, falling back to .env:', err.message);
+        envUpdates.OPENROUTER_API_KEY = openrouter_key;
+      }
+    }
     if (openai_token) envUpdates.OPENAI_ACCESS_TOKEN = openai_token;
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
@@ -637,7 +767,7 @@ app.post('/restart', auth, (req, res) => {
   });
 });
 
-// GET /chat-url → returns the OpenClaw web UI URL and availability
+// GET /chat-url → returns the OpenClaw Control UI URL and availability
 app.get('/chat-url', auth, (req, res) => {
   try {
     // Get the public IP of this machine
@@ -648,20 +778,87 @@ app.get('/chat-url', auth, (req, res) => {
       try { publicIp = runCmd("hostname -I | awk '{print $1}'").trim(); } catch { publicIp = 'localhost'; }
     }
 
-    // Check if port 3000 is responding
-    let available = false;
-    try {
-      runCmd('curl -s --max-time 2 http://localhost:3000/health > /dev/null 2>&1');
-      available = true;
-    } catch {
+    // Read gateway token from OpenClaw config (files owned by openclaw user, read via sudo)
+    let gatewayToken = '';
+    const configPaths = [
+      path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'openclaw.json'),
+      path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
+      OPENCLAW_CONFIG_FILE,
+    ];
+    for (const cfgPath of configPaths) {
       try {
-        runCmd('nc -z -w2 localhost 3000 2>/dev/null');
-        available = true;
-      } catch { available = false; }
+        const raw = runCmd(`sudo -u openclaw /usr/bin/cat '${cfgPath}' 2>/dev/null`);
+        const config = JSON.parse(raw);
+        if (config?.gateway?.auth?.token) {
+          gatewayToken = config.gateway.auth.token;
+          break;
+        }
+      } catch { /* try next */ }
     }
 
-    const url = `http://${publicIp}:3000`;
-    res.json({ url, available });
+    // OpenClaw gateway listens on port 18789 by default
+    const gatewayPort = 18789;
+
+    // Check if gateway port is responding
+    let available = false;
+    try {
+      runCmd(`nc -z -w2 localhost ${gatewayPort} 2>/dev/null`);
+      available = true;
+    } catch { available = false; }
+
+    // OpenClaw Control UI reads gatewayUrl + token from URL hash fragment
+    const sslipDomain = publicIp.replace(/\./g, '-') + '.sslip.io';
+    const baseUrl = `https://${sslipDomain}`;
+    const wsUrl = `wss://${sslipDomain}`;
+    const hash = gatewayToken
+      ? `#gatewayUrl=${encodeURIComponent(wsUrl)}&token=${gatewayToken}`
+      : `#gatewayUrl=${encodeURIComponent(wsUrl)}`;
+    const url = baseUrl + hash;
+    res.json({ url, available, token: gatewayToken || undefined });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /chat-approve → auto-approve pending device pairing requests
+app.post('/chat-approve', auth, (req, res) => {
+  try {
+    // List pending devices and approve all
+    let listOut = '';
+    try {
+      listOut = runCmd(`${openclawExec('devices list --json')} 2>/dev/null`);
+    } catch { /* ignore */ }
+
+    let approved = 0;
+    if (listOut) {
+      try {
+        const data = JSON.parse(listOut);
+        const pending = data?.pending || [];
+        for (const p of pending) {
+          const reqId = p.requestId || p.id;
+          if (reqId) {
+            try {
+              runCmd(`${openclawExec(`devices approve ${reqId}`)} 2>/dev/null`);
+              approved++;
+            } catch { /* ignore */ }
+          }
+        }
+      } catch {
+        // Fallback: parse text output for request IDs
+        const lines = listOut.split('\n');
+        for (const line of lines) {
+          const match = line.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
+          if (match) {
+            try {
+              runCmd(`${openclawExec(`devices approve ${match[1]}`)} 2>/dev/null`);
+              approved++;
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    }
+
+    res.json({ approved });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -713,25 +910,36 @@ app.post('/channels/telegram', auth, async (req, res) => {
   if (!token) return res.status(400).json({ error: 'Token é obrigatório.' });
 
   // Validar token com a API do Telegram
+  let botUsername = null;
   try {
     const tgRes = await fetch(`https://api.telegram.org/bot${token}/getMe`);
     const tgData = await tgRes.json();
     if (!tgData.ok) {
       return res.status(400).json({ error: 'Token do Telegram inválido. Verifique e tente novamente.' });
     }
-    console.log(`[channels] Telegram bot verified: @${tgData.result.username}`);
+    botUsername = tgData.result.username;
+    console.log(`[channels] Telegram bot verified: @${botUsername}`);
   } catch (err) {
     return res.status(500).json({ error: 'Não foi possível verificar o token. Tente novamente.' });
   }
 
   try {
+    // Enable Telegram plugin and add channel via OpenClaw CLI
+    try {
+      runCmd(`${openclawExec('plugins enable telegram')} 2>/dev/null || true`);
+      runCmd(`${openclawExec(`channels add --channel telegram --token ${token}`)} 2>/dev/null || true`);
+    } catch (err) {
+      console.warn('[telegram] OpenClaw CLI config warning:', err.message);
+    }
+
+    // Also write to .env as fallback
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
 
     exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
       if (err) console.error('[telegram] restart error:', err.message);
     });
 
-    res.json({ success: true });
+    res.json({ success: true, username: botUsername });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -765,6 +973,15 @@ app.post('/channels/discord', auth, async (req, res) => {
   }
 
   try {
+    // Enable Discord plugin and add channel via OpenClaw CLI
+    try {
+      runCmd(`${openclawExec('plugins enable discord')} 2>/dev/null || true`);
+      runCmd(`${openclawExec(`channels add --channel discord --token ${token}`)} 2>/dev/null || true`);
+    } catch (err) {
+      console.warn('[discord] OpenClaw CLI config warning:', err.message);
+    }
+
+    // Also write to .env and config as fallback
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
     if (guild_id) writeConfig({ discord_guild_id: guild_id });
 
@@ -804,6 +1021,11 @@ app.delete('/channels/:channel', auth, (req, res) => {
       );
       return;
     } else {
+      // Disable plugin via OpenClaw CLI
+      try {
+        runCmd(`${openclawExec(`plugins disable ${channel}`)} 2>/dev/null || true`);
+      } catch { /* ignore */ }
+
       const env = readEnvFile();
       delete env[envKeyMap[channel]];
       const content = Object.entries(env).map(([k, v]) => `${k}=${sanitizeEnvValue(v)}`).join('\n') + '\n';
@@ -816,6 +1038,65 @@ app.delete('/channels/:channel', auth, (req, res) => {
     }
 
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /usage/pending → return buffered usage events and clear
+app.get('/usage/pending', auth, (req, res) => {
+  const events = usageBuffer.splice(0, usageBuffer.length);
+  res.json({ events, credit_blocked: creditBlocked });
+});
+
+// POST /credit-status → receive credit status from backend, start/stop openclaw
+app.post('/credit-status', auth, (req, res) => {
+  const { blocked, balance_brl } = req.body || {};
+
+  if (blocked === true && !creditBlocked) {
+    creditBlocked = true;
+    exec('sudo systemctl stop openclaw', { timeout: 30_000 }, (err) => {
+      if (err) console.error('[credit-guard] failed to stop openclaw:', err.message);
+      else console.log('[credit-guard] openclaw stopped — credits exhausted');
+    });
+  } else if (blocked === false && creditBlocked) {
+    creditBlocked = false;
+    exec('sudo systemctl start openclaw', { timeout: 30_000 }, (err) => {
+      if (err) console.error('[credit-guard] failed to start openclaw:', err.message);
+      else console.log('[credit-guard] openclaw started — credits restored');
+    });
+  }
+
+  res.json({ credit_blocked: creditBlocked, balance_brl: balance_brl || 0 });
+});
+
+// POST /configure-codex-oauth → receive OAuth token, configure OpenClaw for Codex
+app.post('/configure-codex-oauth', auth, (req, res) => {
+  const { oauth_data } = req.body || {};
+  if (!oauth_data) {
+    return res.status(400).json({ error: 'oauth_data is required' });
+  }
+
+  try {
+    // Write OAuth credentials to OpenClaw credentials directory
+    const credDir = path.join(OPENCLAW_CONFIG_DIR, 'credentials');
+    runCmd(`sudo -u openclaw mkdir -p '${credDir}'`);
+
+    const oauthPath = path.join(credDir, 'oauth.json');
+    const safeContent = JSON.stringify(oauth_data).replace(/'/g, "'\\''");
+    runCmd(`echo '${safeContent}' | sudo -u openclaw tee '${oauthPath}' > /dev/null`);
+    runCmd(`sudo -u openclaw chmod 600 '${oauthPath}'`);
+
+    // Update config to use openai-codex model
+    writeConfig({ model: 'openai-codex/gpt-5.4', ai_mode: 'chatgpt' });
+
+    // Restart OpenClaw to pick up new auth
+    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+      if (err) {
+        return res.status(500).json({ error: 'Failed to restart openclaw: ' + err.message });
+      }
+      res.json({ success: true, model: 'openai-codex/gpt-5.4' });
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
