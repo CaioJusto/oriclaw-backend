@@ -28,7 +28,7 @@ function resolveAgentPrivateCidrs(): string[] {
 
 export const AGENT_PRIVATE_CIDRS = resolveAgentPrivateCidrs();
 export const AGENT_PRIVATE_CIDR = AGENT_PRIVATE_CIDRS[0];
-const AGENT_PROBE_TIMEOUT_MS = 5_000;
+const AGENT_PROBE_TIMEOUT_MS = 12_000;
 const RECENT_SUCCESS_TTL_MS = 5 * 60 * 1000;
 
 type AgentInstanceLike = Pick<OriClawInstance, 'id' | 'droplet_id' | 'droplet_ip' | 'metadata'>;

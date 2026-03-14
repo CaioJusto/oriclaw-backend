@@ -115,7 +115,7 @@ async function resolveUser(req: express.Request, _res: express.Response, next: e
 // ── Per-user rate limits for proxy routes ────────────────────────────────────
 const proxyRateLimit = rateLimit({
   windowMs: 60_000, // 1 minuto
-  max: 30,
+  max: 180,
   keyGenerator: (req: ExpressRequest & { user?: { id: string } }) => req.user?.id ?? req.ip ?? 'unknown',
   message: { error: 'Muitas requisições. Aguarde um momento.' },
   standardHeaders: true,

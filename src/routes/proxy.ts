@@ -155,7 +155,7 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
         try {
           const { data: healthData } = await axios.get(`${baseUrl}/health`, {
             headers: agentHeaders(agentSecret),
-            timeout: 5_000,
+            timeout: 10_000,
             httpsAgent,
           });
           if (healthData && healthData.openclaw === 'running') {
