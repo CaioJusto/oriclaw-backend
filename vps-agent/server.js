@@ -44,6 +44,43 @@ const usageBuffer = [];
 const USAGE_BUFFER_LIMIT = 5000;
 let creditBlocked = false;
 
+function extractErrorMessage(err) {
+  if (!err) return '';
+  if (typeof err === 'string') return err;
+  if (typeof err.message === 'string') return err.message;
+  return String(err);
+}
+
+function isTransientWhatsAppSocketError(err) {
+  const message = extractErrorMessage(err);
+  const statusCode = Number(err?.output?.statusCode || err?.data?.statusCode || err?.statusCode || 0);
+  return (
+    statusCode === 428 ||
+    statusCode === 515 ||
+    message.includes('Connection Closed') ||
+    message.includes('Connection Terminated')
+  );
+}
+
+function handleProcessLevelError(kind, err) {
+  if (isTransientWhatsAppSocketError(err)) {
+    console.warn(`[whatsapp] suppressed ${kind}:`, extractErrorMessage(err));
+    cleanupWhatsAppSocket();
+    return;
+  }
+
+  console.error(`[fatal] ${kind}:`, err);
+  process.exit(1);
+}
+
+process.on('unhandledRejection', (reason) => {
+  handleProcessLevelError('unhandledRejection', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  handleProcessLevelError('uncaughtException', err);
+});
+
 function appendUsageEvent(event) {
   usageBuffer.push({
     id: crypto.randomUUID(),
