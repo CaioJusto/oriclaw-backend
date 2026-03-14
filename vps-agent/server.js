@@ -1213,8 +1213,8 @@ function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = 
 
   try {
     for (const ocAuth of getWhatsAppAuthDirs()) {
-      fs.mkdirSync(ocAuth, { recursive: true });
-      fs.cpSync(authDir, ocAuth, { recursive: true, force: true });
+      runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', ocAuth], { allowFailure: true });
+      runProcess('sudo', ['-u', 'openclaw', 'cp', '-r', `${authDir}/.`, ocAuth], { allowFailure: true });
       runProcess('chown', ['-R', 'openclaw:openclaw', ocAuth], { allowFailure: true });
     }
     whatsappAuthSyncedAt = Date.now();
