@@ -247,6 +247,14 @@ Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
 oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/.openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/tee /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/tee /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/chmod 600 /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/chmod 600 /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mv /home/openclaw/.openclaw/* /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mv /home/openclaw/.openclaw/.openclaw/* /home/openclaw/.openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/credentials/whatsapp/default
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cp -r /tmp/oriclaw-wa-auth/. /home/openclaw/.openclaw/credentials/whatsapp/default
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth
@@ -297,13 +305,13 @@ allowed_origins = []
 if sslip_domain:
     allowed_origins.append(f"https://{sslip_domain}")
 
-paths = [
-    Path('/home/openclaw/.openclaw/.openclaw/openclaw.json'),
-    Path('/home/openclaw/.openclaw/openclaw.json'),
-    Path('/home/openclaw/.openclaw/config.json'),
+path_specs = [
+    (Path('/home/openclaw/.openclaw/.openclaw/openclaw.json'), True),
+    (Path('/home/openclaw/.openclaw/openclaw.json'), True),
+    (Path('/home/openclaw/.openclaw/config.json'), False),
 ]
 
-for config_path in paths:
+for config_path, native_only in path_specs:
     if not config_path.exists():
         continue
     try:
@@ -313,6 +321,7 @@ for config_path in paths:
         cfg = {}
 
     cfg.setdefault('gateway', {})
+    cfg['gateway']['mode'] = 'local'
     cfg['gateway']['bind'] = 'lan'
     cfg['gateway'].setdefault('auth', {})
     cfg['gateway']['auth']['mode'] = 'token'
@@ -320,6 +329,10 @@ for config_path in paths:
     if allowed_origins:
         cfg['gateway'].setdefault('controlUi', {})
         cfg['gateway']['controlUi']['allowedOrigins'] = allowed_origins
+
+    if native_only:
+        for legacy_key in ('model', 'channel', 'ai_mode', 'assistant_name', 'system_prompt', 'language', 'timezone', 'discord_guild_id'):
+            cfg.pop(legacy_key, None)
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(cfg, indent=2))

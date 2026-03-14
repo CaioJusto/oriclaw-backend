@@ -24,10 +24,21 @@ const OPENCLAW_CONFIG_PATHS = [
   path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
   OPENCLAW_CONFIG_FILE,
 ];
+const OPENCLAW_NATIVE_CONFIG_PATHS = OPENCLAW_CONFIG_PATHS.filter((configPath) => configPath !== OPENCLAW_CONFIG_FILE);
 const OPENCLAW_PAIRING_ROOT_DIRS = [
   path.join(OPENCLAW_CONFIG_DIR, '.openclaw'),
   OPENCLAW_CONFIG_DIR,
 ];
+const OPENCLAW_LEGACY_ONLY_KEYS = new Set([
+  'ai_mode',
+  'assistant_name',
+  'channel',
+  'discord_guild_id',
+  'language',
+  'model',
+  'system_prompt',
+  'timezone',
+]);
 
 // ── Concurrency locks ─────────────────────────────────────────────────────────
 let isConfiguring = false;
@@ -337,6 +348,47 @@ function getOpenClawConfigPath() {
   return OPENCLAW_CONFIG_PATHS.find((cfgPath) => fs.existsSync(cfgPath)) || OPENCLAW_CONFIG_PATHS[0];
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepMergeConfig(base, extra) {
+  if (!isPlainObject(base)) return isPlainObject(extra) ? deepMergeConfig({}, extra) : extra;
+  if (!isPlainObject(extra)) return extra === undefined ? base : extra;
+
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(extra)) {
+    if (isPlainObject(value) && isPlainObject(base[key])) {
+      merged[key] = deepMergeConfig(base[key], value);
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function getConfigReadOrder() {
+  return [
+    OPENCLAW_CONFIG_FILE,
+    path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
+    path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'openclaw.json'),
+  ];
+}
+
+function getConfigPathsForWrite() {
+  return [...new Set([
+    ...OPENCLAW_CONFIG_PATHS,
+    ...getConfigReadOrder(),
+  ])];
+}
+
+function getNativeConfigPathsForWrite() {
+  return [...new Set([
+    ...OPENCLAW_NATIVE_CONFIG_PATHS,
+    ...getConfigReadOrder().filter((configPath) => configPath !== OPENCLAW_CONFIG_FILE),
+  ])];
+}
+
 function readConfigPath(configPath) {
   try {
     return JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -350,26 +402,101 @@ function readConfigPath(configPath) {
   }
 }
 
+function normalizeOpenClawConfig(config) {
+  const normalized = deepMergeConfig({}, config || {});
+  const gatewayAuthToken = typeof normalized?.gateway?.auth?.token === 'string'
+    ? normalized.gateway.auth.token.trim()
+    : '';
+  const gatewayRemoteToken = typeof normalized?.gateway?.remote?.token === 'string'
+    ? normalized.gateway.remote.token.trim()
+    : '';
+  const gatewayToken = gatewayAuthToken || gatewayRemoteToken;
+
+  normalized.gateway = deepMergeConfig(normalized.gateway || {}, {
+    bind: normalized?.gateway?.bind || 'lan',
+    mode: normalized?.gateway?.mode || 'local',
+    auth: {
+      mode: 'token',
+      ...(gatewayToken ? { token: gatewayToken } : {}),
+    },
+    ...(gatewayToken ? { remote: { token: gatewayToken } } : {}),
+  });
+
+  const wantsWhatsApp = Boolean(
+    normalized?.channel === 'whatsapp' ||
+    normalized?.channels?.whatsapp?.enabled === true ||
+    hasWhatsAppAuthState()
+  );
+  if (wantsWhatsApp) {
+    normalized.channel = 'whatsapp';
+    normalized.channels = deepMergeConfig(normalized.channels || {}, {
+      whatsapp: {
+        enabled: true,
+        accounts: {
+          default: {
+            enabled: true,
+          },
+        },
+      },
+    });
+    normalized.plugins = deepMergeConfig(normalized.plugins || {}, {
+      entries: {
+        whatsapp: {
+          enabled: true,
+        },
+      },
+    });
+  }
+
+  if (normalized?.channels?.telegram?.botToken) {
+    normalized.channels = deepMergeConfig(normalized.channels || {}, {
+      telegram: { enabled: true },
+    });
+  }
+
+  if (normalized?.channels?.discord?.token) {
+    normalized.channels = deepMergeConfig(normalized.channels || {}, {
+      discord: { enabled: true },
+    });
+  }
+
+  return normalized;
+}
+
+function toNativeOpenClawConfig(config) {
+  const nativeConfig = deepMergeConfig({}, config || {});
+  for (const key of OPENCLAW_LEGACY_ONLY_KEYS) {
+    delete nativeConfig[key];
+  }
+  return nativeConfig;
+}
+
 /**
  * Read the active OpenClaw config.
  */
 function readConfig() {
-  for (const configPath of OPENCLAW_CONFIG_PATHS) {
+  let merged = {};
+  for (const configPath of getConfigReadOrder()) {
     const config = readConfigPath(configPath);
-    if (config) return config;
+    if (config) {
+      merged = deepMergeConfig(merged, config);
+    }
   }
-  return {};
+  return normalizeOpenClawConfig(merged);
 }
 
 /**
  * Write the active OpenClaw config, merging with existing values.
  */
 function writeConfig(updates) {
-  const configPath = getOpenClawConfigPath();
-  const config = { ...readConfig(), ...updates };
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+  const config = normalizeOpenClawConfig(deepMergeConfig(readConfig(), updates || {}));
+  const nativeConfig = toNativeOpenClawConfig(config);
+  writeOwnedJsonFile(OPENCLAW_CONFIG_FILE, config, { mode: '600' });
+  for (const configPath of getNativeConfigPathsForWrite()) {
+    writeOwnedJsonFile(configPath, nativeConfig, { mode: '600' });
+  }
   try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
+  return config;
 }
 
 function safeJsonParse(raw) {
@@ -417,15 +544,17 @@ function safeReadJsonFile(filePath, fallback) {
   }
 }
 
-function writeOwnedJsonFile(filePath, value) {
+function writeOwnedJsonFile(filePath, value, options = {}) {
   const dir = path.dirname(filePath);
   const tempPath = path.join(dir, `${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
   const content = `${JSON.stringify(value, null, 2)}\n`;
+  const mode = typeof options.mode === 'string' && options.mode.trim() ? options.mode.trim() : '600';
 
   runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', dir]);
   runProcess('sudo', ['-u', 'openclaw', 'tee', tempPath], { input: content, allowFailure: true });
-  runProcess('sudo', ['-u', 'openclaw', 'chmod', '600', tempPath], { allowFailure: true });
+  runProcess('sudo', ['-u', 'openclaw', 'chmod', mode, tempPath], { allowFailure: true });
   runProcess('sudo', ['-u', 'openclaw', 'mv', tempPath, filePath]);
+  runProcess('sudo', ['-u', 'openclaw', 'chmod', mode, filePath], { allowFailure: true });
 }
 
 function normalizeStringList(...values) {
@@ -772,13 +901,7 @@ async function runWatchdogCycle(trigger = 'interval') {
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(120);
     const openclawStatus = getOpenclawStatus();
-    if (openclawStatus === 'running') {
-      refreshGatewayHealthCache({ force: true });
-    }
-    const gatewayHealth = openclawStatus === 'running'
-      ? readGatewayHealth({ refresh: false })
-      : null;
-    const channels = buildChannelSnapshot(config, env, logs, gatewayHealth);
+    const channels = buildChannelSnapshot(config, env, logs, null);
     const degradedChannels = getDegradedChannels(channels);
     watchdogState.channels = channels;
     watchdogState.degraded_channels = degradedChannels;
@@ -953,13 +1076,7 @@ app.get('/health/detailed', auth, (req, res) => {
       const config = readConfig();
       const env = readEnvFile();
       const logs = getJournalLogsSinceLastStart(120);
-      if (openclaw === 'running') {
-        refreshGatewayHealthCache({ force: true });
-      }
-      const gatewayHealth = openclaw === 'running'
-        ? readGatewayHealth({ refresh: false })
-        : null;
-      liveChannels = buildChannelSnapshot(config, env, logs, gatewayHealth);
+      liveChannels = buildChannelSnapshot(config, env, logs, null);
       liveDegradedChannels = getDegradedChannels(liveChannels);
     } catch (snapshotErr) {
       console.warn('[health/detailed] live channel snapshot failed:', snapshotErr.message);
@@ -1274,15 +1391,7 @@ function buildDiagnosticsPayload() {
   const env = readEnvFile();
   const openclaw = getOpenclawStatus();
   const logsSinceLastStart = getJournalLogsSinceLastStart(120);
-
-  if (openclaw === 'running') {
-    refreshGatewayHealthCache({ force: true });
-  }
-
-  const gatewayHealth = openclaw === 'running'
-    ? readGatewayHealth({ refresh: false })
-    : null;
-  const channels = buildChannelSnapshot(config, env, logsSinceLastStart, gatewayHealth);
+  const channels = buildChannelSnapshot(config, env, logsSinceLastStart, null);
   const degradedChannels = getDegradedChannels(channels);
   const freeMemMb = Math.round(os.freemem() / 1024 / 1024);
   const totalMemMb = Math.round(os.totalmem() / 1024 / 1024);
@@ -1335,12 +1444,30 @@ function buildDiagnosticsPayload() {
   };
 }
 
+function setConfigPathValue(pathExpression, value) {
+  const segments = String(pathExpression)
+    .split('.')
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  if (segments.length === 0) return;
+
+  const updates = {};
+  let cursor = updates;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    cursor[segments[i]] = {};
+    cursor = cursor[segments[i]];
+  }
+  cursor[segments[segments.length - 1]] = value;
+  writeConfig(updates);
+}
+
 function setOpenclawJsonString(path, value) {
-  return runOpenclaw(['config', 'set', path, JSON.stringify(value), '--strict-json'], { allowFailure: true });
+  return setConfigPathValue(path, sanitizeEnvValue(value));
 }
 
 function setOpenclawJsonValue(path, value) {
-  return runOpenclaw(['config', 'set', path, String(value), '--strict-json'], { allowFailure: true });
+  return setConfigPathValue(path, value);
 }
 
 function removeWhatsAppAuthState() {
@@ -1383,7 +1510,7 @@ function isWhatsAppConnected(isRunning, logs) {
  * Uses 'health' endpoint which is more reliable than 'status'.
  */
 function isWhatsAppLinkedViaRPC() {
-  return getWhatsAppLinkedFromGatewayHealth(readGatewayHealth({ allowStale: false }));
+  return false;
 }
 
 // ── WhatsApp login process management ────────────────────────────────────────
@@ -1403,23 +1530,41 @@ const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 let whatsappSetupDone = false;
 let whatsappSetupInFlight = false;
 
+function persistWhatsAppChannelConfig() {
+  writeConfig({
+    channel: 'whatsapp',
+    channels: {
+      whatsapp: {
+        enabled: true,
+        dmPolicy: 'pairing',
+        groupPolicy: 'allowlist',
+        debounceMs: 0,
+        accounts: {
+          default: {
+            enabled: true,
+            dmPolicy: 'pairing',
+            groupPolicy: 'allowlist',
+            debounceMs: 0,
+          },
+        },
+      },
+    },
+  });
+}
+
 function ensureWhatsAppSetup() {
   if (whatsappSetupDone || whatsappSetupInFlight) return;
   whatsappSetupInFlight = true;
 
-  runOpenclawAsync(['config', 'set', 'channels.whatsapp.enabled', 'true', '--strict-json'], (err) => {
-    whatsappSetupInFlight = false;
-    if (err) {
-      console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
-      return;
-    }
-
+  try {
+    persistWhatsAppChannelConfig();
     whatsappSetupDone = true;
     console.log('[whatsapp] ensureWhatsAppSetup applied');
-  }, {
-    allowFailure: true,
-    timeout: 20_000,
-  });
+  } catch (err) {
+    console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
+  } finally {
+    whatsappSetupInFlight = false;
+  }
 }
 
 function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = {}) {
@@ -1430,7 +1575,6 @@ function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = 
     for (const ocAuth of getWhatsAppAuthDirs()) {
       runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', ocAuth], { allowFailure: true });
       runProcess('sudo', ['-u', 'openclaw', 'cp', '-r', `${authDir}/.`, ocAuth], { allowFailure: true });
-      runProcess('chown', ['-R', 'openclaw:openclaw', ocAuth], { allowFailure: true });
     }
     whatsappAuthSyncedAt = Date.now();
     return true;
@@ -1444,6 +1588,12 @@ function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = 
 
 function restartOpenclawAfterPairing(authDir = WHATSAPP_TEMP_AUTH_DIR, reason = 'pairing_restart_required') {
   setTimeout(() => {
+    try {
+      persistWhatsAppChannelConfig();
+    } catch (err) {
+      console.error('[whatsapp-login] failed to persist channel config before restart:', err.message);
+    }
+
     const synced = syncWhatsAppAuthToOpenclaw(authDir, { force: true });
     if (!synced) {
       console.warn('[whatsapp-login] skipped restart because auth sync did not complete:', reason);
@@ -1456,7 +1606,7 @@ function restartOpenclawAfterPairing(authDir = WHATSAPP_TEMP_AUTH_DIR, reason = 
     runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
       if (restartErr) console.error('[whatsapp-login] restart after pairing failed:', restartErr.message);
     });
-  }, 300);
+  }, 1500);
 }
 
 function scheduleWhatsAppAuthSync(authDir = WHATSAPP_TEMP_AUTH_DIR, delayMs = 400) {
@@ -1578,7 +1728,7 @@ async function startWhatsAppLogin() {
       scheduleWhatsAppAuthSync(authDir);
     });
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       if (qr) {
         whatsappRawQR = qr;
@@ -1591,11 +1741,12 @@ async function startWhatsAppLogin() {
         whatsappForceFreshLogin = false;
         whatsappLinkedAt = Date.now();
         watchdogState.consecutive_channel_failures = 0;
-        syncWhatsAppAuthToOpenclaw(authDir);
-        whatsappPairingRestartAt = Date.now();
-        runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
-          if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
-        });
+        try {
+          await Promise.resolve(saveCreds());
+        } catch (saveErr) {
+          console.error('[whatsapp-login] saveCreds on open failed:', saveErr.message);
+        }
+        restartOpenclawAfterPairing(authDir, 'pairing_open');
         invalidateGatewayHealthCache();
         cleanupWhatsAppSocket();
       }
@@ -1722,16 +1873,6 @@ app.get('/qr', auth, async (req, res) => {
     return res.json({ connected: true, qr: null });
   }
 
-  if (isRunning) {
-    const linkedViaRPC = isWhatsAppLinkedViaRPC();
-    if (linkedViaRPC) {
-      if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
-        cleanupWhatsAppSocket();
-      }
-      return res.json({ connected: true, qr: null });
-    }
-  }
-
   // ── Fallback: try to extract QR data from logs ──────────────────────────────
   if (!hadStaleRawQR) {
     let qrData = extractQRData(logs);
@@ -1833,7 +1974,11 @@ app.post('/configure', auth, (req, res) => {
     if (openrouter_key) {
       // Configure OpenRouter API key in openclaw.json env section (native OpenClaw config)
       try {
-        runOpenclaw(['config', 'set', 'env.OPENROUTER_API_KEY', sanitizeEnvValue(openrouter_key)]);
+        writeConfig({
+          env: {
+            OPENROUTER_API_KEY: sanitizeEnvValue(openrouter_key),
+          },
+        });
         console.log('[configure] set OPENROUTER_API_KEY in openclaw.json env');
       } catch (err) {
         console.error('[configure] openclaw config set env failed:', err.message);
@@ -2018,10 +2163,7 @@ app.get('/channels', auth, (req, res) => {
     const config = readConfig();
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(100);
-    const gatewayHealth = getOpenclawStatus() === 'running'
-      ? readGatewayHealth()
-      : null;
-    const snapshot = buildChannelSnapshot(config, env, logs, gatewayHealth);
+    const snapshot = buildChannelSnapshot(config, env, logs, null);
 
     res.json({
       whatsapp: {

@@ -117,18 +117,54 @@ fi
 
 cat > /home/openclaw/.openclaw/.openclaw/openclaw.json << CONFIGEOF
 {
-  "model": "claude-sonnet-4-5",
-  "channel": "whatsapp",
   "gateway": {
+    "mode": "local",
     "bind": "lan",
     "auth": {
       "mode": "token",
       "token": "__GATEWAY_TOKEN__"
     }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true
+    }
+  },
+  "plugins": {
+    "entries": {
+      "whatsapp": {
+        "enabled": true
+      }
+    }
   }
 }
 CONFIGEOF
-cp /home/openclaw/.openclaw/.openclaw/openclaw.json /home/openclaw/.openclaw/config.json
+cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
+{
+  "model": "claude-sonnet-4-5",
+  "channel": "whatsapp",
+  "gateway": {
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "__GATEWAY_TOKEN__"
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true
+    }
+  },
+  "plugins": {
+    "entries": {
+      "whatsapp": {
+        "enabled": true
+      }
+    }
+  }
+}
+CONFIGEOF
 
 touch /home/openclaw/.openclaw/.env
 chown -R openclaw:openclaw /home/openclaw
@@ -1685,6 +1721,14 @@ Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
 oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/.openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/tee /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/tee /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/chmod 600 /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/chmod 600 /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mv /home/openclaw/.openclaw/* /home/openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mv /home/openclaw/.openclaw/.openclaw/* /home/openclaw/.openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/credentials/whatsapp/default
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cp -r /tmp/oriclaw-wa-auth/. /home/openclaw/.openclaw/credentials/whatsapp/default
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth
