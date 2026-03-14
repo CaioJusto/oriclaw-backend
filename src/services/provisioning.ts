@@ -158,6 +158,19 @@ fi
 apt-get update -y
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git ufw nginx python3 python3-pip build-essential || true
 
+if ! swapon --show | grep -q '/swapfile'; then
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+cat > /etc/sysctl.d/99-oriclaw-memory.conf << 'SYSCTLEOF'
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+SYSCTLEOF
+sysctl --system >/dev/null 2>&1 || true
+
 useradd -m -s /bin/bash openclaw 2>/dev/null || true
 mkdir -p /home/openclaw/.openclaw /home/openclaw/.openclaw/.openclaw
 mkdir -p /var/tmp/openclaw-compile-cache

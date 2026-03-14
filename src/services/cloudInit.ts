@@ -37,6 +37,20 @@ apt-get update -y
 # Skip apt-get upgrade — base image is already up-to-date, saves ~3 min
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git || true
 
+# ── Swap ─────────────────────────────────────────────────────────────────────
+if ! swapon --show | grep -q '/swapfile'; then
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+cat > /etc/sysctl.d/99-oriclaw-memory.conf << 'SYSCTLEOF'
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+SYSCTLEOF
+sysctl --system >/dev/null 2>&1 || true
+
 # ── Node.js 22 ───────────────────────────────────────────────────────────────
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nodejs
