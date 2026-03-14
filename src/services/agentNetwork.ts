@@ -12,7 +12,7 @@ import {
 
 export const AGENT_PORT = 8080;
 export const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
-const AGENT_PROBE_TIMEOUT_MS = 2_500;
+const AGENT_PROBE_TIMEOUT_MS = 5_000;
 const RECENT_SUCCESS_TTL_MS = 5 * 60 * 1000;
 
 type AgentInstanceLike = Pick<OriClawInstance, 'id' | 'droplet_id' | 'droplet_ip' | 'metadata'>;
