@@ -13,7 +13,7 @@ import {
 import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest, DODroplet, DODropletResponse } from '../types';
 import { encrypt, decrypt } from './crypto';
-import { AGENT_PRIVATE_CIDR } from './agentNetwork';
+import { AGENT_PRIVATE_CIDRS } from './agentNetwork';
 import {
   buildPinnedAgentHttpsAgent,
   createProvisionedAgentTlsMaterial,
@@ -138,7 +138,7 @@ function buildSnapshotCloudInit(
 set -e
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-export AGENT_PRIVATE_CIDR='${AGENT_PRIVATE_CIDR}'
+export AGENT_PRIVATE_CIDRS='${AGENT_PRIVATE_CIDRS.join(',')}'
 export GATEWAY_TOKEN='${gatewayToken}'
 
 # Stop services before overwriting secrets
@@ -315,7 +315,12 @@ ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
-ufw allow from "$AGENT_PRIVATE_CIDR" to any port 8080 proto tcp
+IFS=',' read -r -a AGENT_CIDR_LIST <<< "$AGENT_PRIVATE_CIDRS"
+for cidr in "\${AGENT_CIDR_LIST[@]}"; do
+  cidr="$(echo "$cidr" | xargs)"
+  [ -n "$cidr" ] || continue
+  ufw allow from "$cidr" to any port 8080 proto tcp
+done
 ufw allow 443/tcp
 ufw --force enable
 

@@ -11,7 +11,23 @@ import {
 } from './agentTls';
 
 export const AGENT_PORT = 8080;
-export const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
+const DEFAULT_AGENT_PRIVATE_CIDRS = ['10.116.0.0/20', '10.10.0.0/16'];
+
+function resolveAgentPrivateCidrs(): string[] {
+  const configured = [
+    process.env.ORICLAW_AGENT_ALLOWED_CIDRS,
+    process.env.ORICLAW_AGENT_PRIVATE_CIDR,
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .flatMap((value) => value.split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([...DEFAULT_AGENT_PRIVATE_CIDRS, ...configured]));
+}
+
+export const AGENT_PRIVATE_CIDRS = resolveAgentPrivateCidrs();
+export const AGENT_PRIVATE_CIDR = AGENT_PRIVATE_CIDRS[0];
 const AGENT_PROBE_TIMEOUT_MS = 5_000;
 const RECENT_SUCCESS_TTL_MS = 5 * 60 * 1000;
 

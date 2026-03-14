@@ -1,6 +1,24 @@
 import { VPS_AGENT_PACKAGE_JSON, VPS_AGENT_SERVER_JS } from './vpsAgentAssets';
 
-const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
+const DEFAULT_AGENT_PRIVATE_CIDRS = ['10.116.0.0/20', '10.10.0.0/16'];
+
+function resolveAgentPrivateCidrs(): string[] {
+  const configured = [
+    process.env.ORICLAW_AGENT_ALLOWED_CIDRS,
+    process.env.ORICLAW_AGENT_PRIVATE_CIDR,
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .flatMap((value) => value.split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([...DEFAULT_AGENT_PRIVATE_CIDRS, ...configured]));
+}
+
+const AGENT_PRIVATE_CIDRS = resolveAgentPrivateCidrs();
+const AGENT_FIREWALL_RULES = AGENT_PRIVATE_CIDRS
+  .map((cidr) => `ufw allow from ${cidr} to any port 8080 proto tcp`)
+  .join('\n');
 
 /**
  * Cloud-init script for OriClaw droplets.
@@ -30,7 +48,7 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    # SSH
 # Port 8080 (VPS Agent) — private-only via DigitalOcean VPC
-ufw allow from ${AGENT_PRIVATE_CIDR} to any port 8080 proto tcp
+${AGENT_FIREWALL_RULES}
 # Port 443 (OpenClaw Gateway UI via nginx HTTPS proxy) — protected by gateway token auth
 ufw allow 443/tcp
 ufw --force enable
