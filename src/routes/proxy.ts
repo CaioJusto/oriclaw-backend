@@ -537,6 +537,43 @@ router.post('/:instance_id/channels/telegram', async (req: Request, res: Respons
   });
 });
 
+// ── GET /api/proxy/:instance_id/channels/telegram/pairing ───────────────────
+router.get('/:instance_id/channels/telegram/pairing', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
+    try {
+      const { data } = await axios.get(`${baseUrl}/channels/telegram/pairing`, {
+        headers: agentHeaders(agentSecret),
+        params: req.query,
+        timeout: 15_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Telegram pairing fetch failed' });
+    }
+  });
+});
+
+// ── POST /api/proxy/:instance_id/channels/telegram/pairing/approve ──────────
+router.post('/:instance_id/channels/telegram/pairing/approve', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
+    try {
+      const { data } = await axios.post(`${baseUrl}/channels/telegram/pairing/approve`, req.body, {
+        headers: agentHeaders(agentSecret),
+        timeout: 15_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Telegram pairing approval failed' });
+    }
+  });
+});
+
 // ── POST /api/proxy/:instance_id/channels/discord ────────────────────────────
 router.post('/:instance_id/channels/discord', async (req: Request, res: Response): Promise<void> => {
   await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {

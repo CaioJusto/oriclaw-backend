@@ -29,6 +29,11 @@ const OPENCLAW_PAIRING_ROOT_DIRS = [
   path.join(OPENCLAW_CONFIG_DIR, '.openclaw'),
   OPENCLAW_CONFIG_DIR,
 ];
+const OPENCLAW_CHANNEL_CREDENTIALS_DIRS = [
+  path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'credentials'),
+  path.join(OPENCLAW_CONFIG_DIR, 'credentials'),
+];
+const PAIRING_PENDING_TTL_MS = 60 * 60 * 1000;
 const OPENCLAW_LEGACY_ONLY_KEYS = new Set([
   'ai_mode',
   'assistant_name',
@@ -452,11 +457,25 @@ function normalizeOpenClawConfig(config) {
     normalized.channels = deepMergeConfig(normalized.channels || {}, {
       telegram: { enabled: true },
     });
+    normalized.plugins = deepMergeConfig(normalized.plugins || {}, {
+      entries: {
+        telegram: {
+          enabled: true,
+        },
+      },
+    });
   }
 
   if (normalized?.channels?.discord?.token) {
     normalized.channels = deepMergeConfig(normalized.channels || {}, {
       discord: { enabled: true },
+    });
+    normalized.plugins = deepMergeConfig(normalized.plugins || {}, {
+      entries: {
+        discord: {
+          enabled: true,
+        },
+      },
     });
   }
 
@@ -526,6 +545,13 @@ function clearChannelConfig(channel) {
     delete nextTelegram.botToken;
     nextTelegram.enabled = false;
     config.channels.telegram = nextTelegram;
+    config.plugins = deepMergeConfig(config.plugins || {}, {
+      entries: {
+        telegram: {
+          enabled: false,
+        },
+      },
+    });
     delete config.telegram_username;
   } else if (channel === 'discord') {
     const nextDiscord = isPlainObject(config.channels.discord)
@@ -534,6 +560,13 @@ function clearChannelConfig(channel) {
     delete nextDiscord.token;
     nextDiscord.enabled = false;
     config.channels.discord = nextDiscord;
+    config.plugins = deepMergeConfig(config.plugins || {}, {
+      entries: {
+        discord: {
+          enabled: false,
+        },
+      },
+    });
     delete config.discord_guild_id;
     delete config.discord_guild_name;
   }
@@ -579,7 +612,7 @@ function getDevicePairingFiles(rootDir) {
 
 function safeReadJsonFile(filePath, fallback) {
   try {
-    const raw = runProcess('sudo', ['-u', 'openclaw', '/usr/bin/cat', filePath], { allowFailure: true }).trim();
+    const raw = runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/cat', filePath], { allowFailure: true }).trim();
     return raw ? JSON.parse(raw) : fallback;
   } catch {
     return fallback;
@@ -592,11 +625,177 @@ function writeOwnedJsonFile(filePath, value, options = {}) {
   const content = `${JSON.stringify(value, null, 2)}\n`;
   const mode = typeof options.mode === 'string' && options.mode.trim() ? options.mode.trim() : '600';
 
-  runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', dir]);
-  runProcess('sudo', ['-u', 'openclaw', 'tee', tempPath], { input: content, allowFailure: true });
-  runProcess('sudo', ['-u', 'openclaw', 'chmod', mode, tempPath], { allowFailure: true });
-  runProcess('sudo', ['-u', 'openclaw', 'mv', tempPath, filePath]);
-  runProcess('sudo', ['-u', 'openclaw', 'chmod', mode, filePath], { allowFailure: true });
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/mkdir', '-p', dir]);
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/tee', tempPath], { input: content, allowFailure: true });
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/chmod', mode, tempPath], { allowFailure: true });
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/mv', tempPath, filePath]);
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/chmod', mode, filePath], { allowFailure: true });
+}
+
+function resolveChannelCredentialsDir() {
+  return OPENCLAW_CHANNEL_CREDENTIALS_DIRS[0];
+}
+
+function ensureChannelCredentialsDirAccess() {
+  const dir = resolveChannelCredentialsDir();
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/mkdir', '-p', dir], { allowFailure: true });
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/chmod', '700', dir], { allowFailure: true });
+  return dir;
+}
+
+function writeChannelCredentialsJsonFile(filePath, value) {
+  ensureChannelCredentialsDirAccess();
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/tee', filePath], { input: content, allowFailure: true });
+  runProcess('sudo', ['-n', '-u', 'openclaw', '/usr/bin/chmod', '600', filePath], { allowFailure: true });
+}
+
+function safeChannelKey(channel) {
+  const raw = String(channel || '').trim().toLowerCase();
+  if (!raw) throw new Error('Canal de pairing inválido.');
+  const safe = raw.replace(/[\\/:*?"<>|]/g, '_').replace(/\.\./g, '_');
+  if (!safe || safe === '_') throw new Error('Canal de pairing inválido.');
+  return safe;
+}
+
+function normalizePairingAccountId(accountId) {
+  return typeof accountId === 'string' ? accountId.trim().toLowerCase() : '';
+}
+
+function resolveChannelPairingPath(channel) {
+  return path.join(ensureChannelCredentialsDirAccess(), `${safeChannelKey(channel)}-pairing.json`);
+}
+
+function resolveChannelAllowFromPath(channel, accountId) {
+  const base = safeChannelKey(channel);
+  const normalizedAccountId = normalizePairingAccountId(accountId);
+  return path.join(
+    ensureChannelCredentialsDirAccess(),
+    normalizedAccountId ? `${base}-${normalizedAccountId}-allowFrom.json` : `${base}-allowFrom.json`,
+  );
+}
+
+function normalizePairingRequestEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  const code = typeof entry.code === 'string' ? entry.code.trim().toUpperCase() : '';
+  const createdAt = typeof entry.createdAt === 'string' ? entry.createdAt.trim() : '';
+  const lastSeenAt = typeof entry.lastSeenAt === 'string' ? entry.lastSeenAt.trim() : '';
+  if (!id || !code || !createdAt) return null;
+  const metaSource = entry.meta && typeof entry.meta === 'object' && !Array.isArray(entry.meta)
+    ? entry.meta
+    : null;
+  const meta = metaSource
+    ? Object.fromEntries(
+      Object.entries(metaSource)
+        .map(([key, value]) => [String(key), String(value ?? '').trim()])
+        .filter(([, value]) => Boolean(value)),
+    )
+    : undefined;
+  return {
+    id,
+    code,
+    createdAt,
+    lastSeenAt: lastSeenAt || null,
+    ...(meta ? { meta } : {}),
+  };
+}
+
+function isPairingRequestExpired(entry, nowMs = Date.now()) {
+  const createdAt = Date.parse(entry?.createdAt || '');
+  if (!Number.isFinite(createdAt)) return true;
+  return (nowMs - createdAt) > PAIRING_PENDING_TTL_MS;
+}
+
+function readChannelPairingRequests(channel, accountId) {
+  const filePath = resolveChannelPairingPath(channel);
+  const payload = safeReadJsonFile(filePath, { version: 1, requests: [] });
+  const rawRequests = Array.isArray(payload?.requests) ? payload.requests : [];
+  const normalizedAccountId = normalizePairingAccountId(accountId);
+  const nowMs = Date.now();
+  const validRequests = [];
+  let removed = false;
+
+  for (const rawEntry of rawRequests) {
+    const entry = normalizePairingRequestEntry(rawEntry);
+    if (!entry || isPairingRequestExpired(entry, nowMs)) {
+      removed = true;
+      continue;
+    }
+    validRequests.push(entry);
+  }
+
+  if (removed) {
+    writeChannelCredentialsJsonFile(filePath, {
+      version: 1,
+      requests: validRequests,
+    });
+  }
+
+  return validRequests
+    .filter((entry) => {
+      if (!normalizedAccountId) return true;
+      return normalizePairingAccountId(entry.meta?.accountId) === normalizedAccountId;
+    })
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
+function approveChannelPairingCode(channel, code, accountId) {
+  const normalizedCode = String(code || '').trim().toUpperCase();
+  if (!normalizedCode) return null;
+
+  const filePath = resolveChannelPairingPath(channel);
+  const payload = safeReadJsonFile(filePath, { version: 1, requests: [] });
+  const rawRequests = Array.isArray(payload?.requests) ? payload.requests : [];
+  const normalizedAccountId = normalizePairingAccountId(accountId);
+  const nowMs = Date.now();
+  const validRequests = [];
+  let approvedEntry = null;
+
+  for (const rawEntry of rawRequests) {
+    const entry = normalizePairingRequestEntry(rawEntry);
+    if (!entry || isPairingRequestExpired(entry, nowMs)) {
+      continue;
+    }
+
+    const entryAccountId = normalizePairingAccountId(entry.meta?.accountId);
+    const accountMatches = !normalizedAccountId || entryAccountId === normalizedAccountId;
+    if (!approvedEntry && accountMatches && entry.code === normalizedCode) {
+      approvedEntry = entry;
+      continue;
+    }
+
+    validRequests.push(entry);
+  }
+
+  writeChannelCredentialsJsonFile(filePath, {
+    version: 1,
+    requests: validRequests,
+  });
+
+  if (!approvedEntry) return null;
+
+  const allowFromPath = resolveChannelAllowFromPath(channel, normalizedAccountId || approvedEntry.meta?.accountId || '');
+  const allowPayload = safeReadJsonFile(allowFromPath, { version: 1, allowFrom: [] });
+  const allowFrom = Array.isArray(allowPayload?.allowFrom)
+    ? allowPayload.allowFrom.map((value) => String(value).trim()).filter(Boolean)
+    : [];
+  if (!allowFrom.includes(approvedEntry.id)) {
+    allowFrom.push(approvedEntry.id);
+  }
+
+  writeChannelCredentialsJsonFile(allowFromPath, {
+    version: 1,
+    allowFrom,
+  });
+
+  return {
+    id: approvedEntry.id,
+    code: approvedEntry.code,
+    account_id: normalizePairingAccountId(normalizedAccountId || approvedEntry.meta?.accountId || '') || 'default',
+    meta: approvedEntry.meta || null,
+    remaining: validRequests.length,
+  };
 }
 
 function normalizeStringList(...values) {
@@ -2329,6 +2528,42 @@ app.post('/channels/whatsapp/relink', auth, async (req, res) => {
   }
 });
 
+// GET /channels/telegram/pairing → pending Telegram pairing requests
+app.get('/channels/telegram/pairing', auth, (req, res) => {
+  try {
+    const accountId = typeof req.query.account_id === 'string'
+      ? req.query.account_id
+      : typeof req.query.accountId === 'string'
+        ? req.query.accountId
+        : '';
+    const requests = readChannelPairingRequests('telegram', accountId);
+    res.json({ requests, pending: requests.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /channels/telegram/pairing/approve → body: { code, account_id? }
+app.post('/channels/telegram/pairing/approve', auth, (req, res) => {
+  try {
+    const code = String(req.body?.code || '').trim();
+    const accountId = String(req.body?.account_id || req.body?.accountId || '').trim();
+    if (!code) {
+      return res.status(400).json({ error: 'Código de pairing é obrigatório.' });
+    }
+
+    const approved = approveChannelPairingCode('telegram', code, accountId);
+    if (!approved) {
+      return res.status(404).json({ error: 'Nenhum pedido pendente encontrado para esse código.' });
+    }
+
+    const requests = readChannelPairingRequests('telegram', accountId);
+    res.json({ success: true, approved, requests, pending: requests.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /channels/telegram → body: { token }
 app.post('/channels/telegram', auth, async (req, res) => {
   const { token } = req.body || {};
@@ -2353,6 +2588,7 @@ app.post('/channels/telegram', auth, async (req, res) => {
     try {
       setOpenclawJsonString('channels.telegram.botToken', sanitizeEnvValue(token));
       setOpenclawJsonValue('channels.telegram.enabled', true);
+      setOpenclawJsonValue('plugins.entries.telegram.enabled', true);
     } catch (err) {
       console.warn('[telegram] OpenClaw CLI config warning:', err.message);
     }
@@ -2402,6 +2638,7 @@ app.post('/channels/discord', auth, async (req, res) => {
     try {
       setOpenclawJsonString('channels.discord.token', sanitizeEnvValue(token));
       setOpenclawJsonValue('channels.discord.enabled', true);
+      setOpenclawJsonValue('plugins.entries.discord.enabled', true);
     } catch (err) {
       console.warn('[discord] OpenClaw CLI config warning:', err.message);
     }
