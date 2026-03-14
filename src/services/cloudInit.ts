@@ -1,4 +1,25 @@
+import fs from 'fs';
+import path from 'path';
+
 const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
+const VPS_AGENT_DIR_CANDIDATES = [
+  path.resolve(process.cwd(), 'vps-agent'),
+  path.resolve(__dirname, '../../vps-agent'),
+];
+
+function readVpsAgentAsset(filename: string): string {
+  for (const dir of VPS_AGENT_DIR_CANDIDATES) {
+    const fullPath = path.join(dir, filename);
+    if (fs.existsSync(fullPath)) {
+      return fs.readFileSync(fullPath, 'utf8').trim();
+    }
+  }
+
+  throw new Error(`Missing VPS agent asset: ${filename}`);
+}
+
+const VPS_AGENT_PACKAGE_JSON = readVpsAgentAsset('package.json');
+const VPS_AGENT_SERVER_JS = readVpsAgentAsset('server.js');
 
 /**
  * Cloud-init script for OriClaw droplets.
@@ -1326,6 +1347,14 @@ try {
 }
 
 SERVEREOF
+
+cat > /opt/oriclaw-agent/package.json << 'PKGOVERRIDE'
+${VPS_AGENT_PACKAGE_JSON}
+PKGOVERRIDE
+
+cat > /opt/oriclaw-agent/server.js << 'SERVEROVERRIDE'
+${VPS_AGENT_SERVER_JS}
+SERVEROVERRIDE
 
 cd /opt/oriclaw-agent && for attempt in 1 2 3; do
   npm install --omit=dev && break

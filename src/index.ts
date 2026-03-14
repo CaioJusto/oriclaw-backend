@@ -12,7 +12,7 @@ import authRoutes from './routes/auth';
 import checkoutRoutes from './routes/checkout';
 import billingRoutes from './routes/billing';
 import adminRoutes from './routes/admin';
-import { supabase } from './services/supabase';
+import { supabase, updateInstance } from './services/supabase';
 import { retryPendingDeletions } from './services/provisioning';
 import { calculateOpenRouterCostUsd, getAdminSettings, normalizeOpenRouterModelId } from './services/openrouter';
 import { decrypt } from './services/crypto';
@@ -247,6 +247,163 @@ type RunningInstance = {
   metadata: Record<string, unknown> | null;
 };
 
+type AgentWatchdogState = {
+  last_run_at?: string | null;
+  last_result?: string | null;
+  last_reason?: string | null;
+  last_error?: string | null;
+  degraded_channels?: unknown;
+  channels?: Record<string, unknown> | null;
+};
+
+type AgentDetailedHealth = {
+  openclaw?: string;
+  watchdog?: AgentWatchdogState | null;
+};
+
+let isUsagePollRunning = false;
+let isHealthPollRunning = false;
+
+function getActionableChannelFailures(watchdog: AgentWatchdogState | null | undefined): string[] {
+  const channels = watchdog?.channels as Record<string, unknown> | null | undefined;
+  const failed = new Set<string>();
+
+  const whatsapp = (channels?.whatsapp ?? {}) as Record<string, unknown>;
+  if (whatsapp.desired === true && whatsapp.connected !== true) {
+    failed.add('whatsapp');
+  }
+
+  const telegram = (channels?.telegram ?? {}) as Record<string, unknown>;
+  if (telegram.desired === true && telegram.connected !== true) {
+    failed.add('telegram');
+  }
+
+  const discord = (channels?.discord ?? {}) as Record<string, unknown>;
+  if (discord.desired === true && discord.connected !== true) {
+    failed.add('discord');
+  }
+
+  const degraded = Array.isArray(watchdog?.degraded_channels)
+    ? watchdog!.degraded_channels.filter((value): value is string => typeof value === 'string' && value.length > 0)
+    : [];
+  for (const channel of degraded) failed.add(channel);
+
+  return Array.from(failed);
+}
+
+async function triggerAgentSelfHeal(baseUrl: string, agentSecret: string): Promise<AgentWatchdogState | null> {
+  const { data } = await axios.post(
+    `${baseUrl}/self-heal`,
+    {},
+    {
+      headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
+      timeout: 15_000,
+      httpsAgent: agentHttpsAgent,
+    }
+  );
+
+  return (data ?? null) as AgentWatchdogState | null;
+}
+
+async function monitorManagedInstances(): Promise<void> {
+  if (isHealthPollRunning) return;
+  isHealthPollRunning = true;
+
+  try {
+    const { data: instances, error: fetchErr } = await supabase
+      .from('oriclaw_instances')
+      .select('id, customer_id, droplet_id, droplet_ip, metadata')
+      .eq('status', 'running');
+
+    if (fetchErr || !instances) {
+      console.warn('[health-poll] Failed to fetch running instances:', fetchErr?.message);
+      return;
+    }
+
+    for (const inst of instances as RunningInstance[]) {
+      const meta = (inst.metadata ?? {}) as Record<string, unknown>;
+      const agentSecretEncrypted = meta.agent_secret as string | undefined;
+      if (!agentSecretEncrypted) continue;
+
+      let agentSecret: string;
+      try {
+        agentSecret = decrypt(agentSecretEncrypted);
+      } catch {
+        continue;
+      }
+
+      const baseUrl = await resolveAgentBaseUrl(inst);
+      if (!baseUrl) continue;
+
+      const nowIso = new Date().toISOString();
+
+      try {
+        const { data } = await axios.get(`${baseUrl}/health/detailed`, {
+          headers: { 'x-agent-secret': agentSecret },
+          timeout: 10_000,
+          httpsAgent: agentHttpsAgent,
+        });
+
+        const health = (data ?? {}) as AgentDetailedHealth;
+        const watchdog = health.watchdog ?? null;
+        const actionableChannels = getActionableChannelFailures(watchdog);
+        const watchdogLastRunAt = typeof watchdog?.last_run_at === 'string' ? watchdog.last_run_at : null;
+        const watchdogLastRunMs = watchdogLastRunAt ? new Date(watchdogLastRunAt).getTime() : 0;
+        const watchdogStale = !watchdogLastRunMs || (Date.now() - watchdogLastRunMs) > 3 * 60_000;
+        const serviceDegraded = health.openclaw !== 'running';
+        const watchdogErrored = watchdog?.last_result === 'error';
+        const shouldHeal = serviceDegraded || watchdogErrored || watchdogStale || actionableChannels.length > 0;
+
+        let selfHealResult: AgentWatchdogState | null = null;
+        if (shouldHeal) {
+          try {
+            selfHealResult = await triggerAgentSelfHeal(baseUrl, agentSecret);
+            console.warn(
+              `[health-poll] Self-heal triggered for ${inst.id}: ` +
+              `${selfHealResult?.last_result ?? 'unknown'} (${selfHealResult?.last_reason ?? 'no-reason'})`
+            );
+          } catch (healErr) {
+            console.warn(
+              `[health-poll] Self-heal failed for ${inst.id}:`,
+              healErr instanceof Error ? healErr.message : String(healErr)
+            );
+          }
+        }
+
+        await updateInstance(inst.id, {
+          metadata: {
+            health_last_seen_at: nowIso,
+            health_state: shouldHeal ? 'degraded' : 'healthy',
+            health_openclaw: health.openclaw ?? 'unknown',
+            health_watchdog_last_run_at: watchdogLastRunAt,
+            health_watchdog_last_result: watchdog?.last_result ?? null,
+            health_watchdog_last_reason: watchdog?.last_reason ?? null,
+            health_watchdog_last_error: watchdog?.last_error ?? null,
+            health_degraded_channels: actionableChannels,
+            health_last_self_heal_at: shouldHeal ? nowIso : (meta.health_last_self_heal_at ?? null),
+            health_last_self_heal_result: selfHealResult?.last_result ?? null,
+            health_last_self_heal_reason: selfHealResult?.last_reason ?? null,
+          },
+        });
+      } catch (instErr) {
+        const message = instErr instanceof Error ? instErr.message : String(instErr);
+        console.warn(`[health-poll] Agent unreachable for ${inst.id}:`, message);
+        await updateInstance(inst.id, {
+          metadata: {
+            health_last_seen_at: nowIso,
+            health_state: 'agent_unreachable',
+            health_last_error: message,
+          },
+        });
+      }
+    }
+  } catch (err) {
+    console.error('[health-poll] Unexpected error:', err instanceof Error ? err.message : String(err));
+  } finally {
+    isHealthPollRunning = false;
+  }
+}
+
 async function getCustomerCreditBalance(customerId: string): Promise<number> {
   const { data } = await supabase
     .from('oriclaw_credits')
@@ -328,6 +485,9 @@ function normalizeUsageEvent(
 }
 
 async function collectUsageFromAgents(): Promise<void> {
+  if (isUsagePollRunning) return;
+  isUsagePollRunning = true;
+
   try {
     const adminSettings = await getAdminSettings();
     const multiplier = adminSettings?.cost_multiplier ?? 1;
@@ -464,12 +624,16 @@ async function collectUsageFromAgents(): Promise<void> {
     await notifyCreditStatusForAllCreditsInstances();
   } catch (err) {
     console.error('[usage-poll] Unexpected error:', err instanceof Error ? err.message : String(err));
+  } finally {
+    isUsagePollRunning = false;
   }
 }
 
 // Run once after 30s delay, then every 60s
 setTimeout(collectUsageFromAgents, 30_000);
 setInterval(collectUsageFromAgents, 60_000);
+setTimeout(monitorManagedInstances, 45_000);
+setInterval(monitorManagedInstances, 90_000);
 
 app.listen(PORT, () => {
   console.log(`🌀 OriClaw backend running on port ${PORT}`);

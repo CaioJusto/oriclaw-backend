@@ -261,12 +261,32 @@ function writeConfig(updates) {
   try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
 }
 
+function safeJsonParse(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function getWhatsAppAuthDirs() {
   return [
     path.join(OPENCLAW_CONFIG_DIR, 'credentials', 'whatsapp', 'default'),
     path.join(OPENCLAW_CONFIG_DIR, '.openclaw', 'channels', 'whatsapp', 'default', 'auth'),
     path.join(OPENCLAW_CONFIG_DIR, 'channels', 'whatsapp', 'default', 'auth'),
   ];
+}
+
+function hasFiles(dir) {
+  try {
+    return fs.existsSync(dir) && fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasWhatsAppAuthState() {
+  return getWhatsAppAuthDirs().some(hasFiles);
 }
 
 /**
@@ -292,6 +312,254 @@ function extractQRData(logs) {
 
   return null;
 }
+
+function readGatewayHealth() {
+  try {
+    const out = runCmd(`${openclawGatewayCall('health', '--json')} 2>/dev/null`);
+    return safeJsonParse(out);
+  } catch {
+    return null;
+  }
+}
+
+function getWhatsAppLinkedFromGatewayHealth(gatewayHealth) {
+  const wa = gatewayHealth?.channels?.whatsapp;
+  return !!wa && (wa.connected === true || wa.linked === true || wa.ready === true);
+}
+
+function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs = getJournalLogsSinceLastStart(100), gatewayHealth = null) {
+  const isRunning = getOpenclawStatus() === 'running';
+  const whatsappAuthPresent = hasWhatsAppAuthState();
+  const whatsappDesired = Boolean(
+    config?.channel === 'whatsapp' ||
+    config?.channels?.whatsapp?.enabled ||
+    whatsappAuthPresent
+  );
+  const whatsappConnected =
+    getWhatsAppLinkedFromGatewayHealth(gatewayHealth) ||
+    isWhatsAppConnected(isRunning, logs);
+
+  const telegramDesired = Boolean(env.TELEGRAM_BOT_TOKEN || config?.channels?.telegram?.enabled);
+  const telegramGateway = gatewayHealth?.channels?.telegram;
+  const telegramConnected = !!telegramGateway && (
+    telegramGateway.connected === true ||
+    telegramGateway.ready === true
+  );
+
+  const discordDesired = Boolean(env.DISCORD_BOT_TOKEN || config?.channels?.discord?.enabled);
+  const discordGateway = gatewayHealth?.channels?.discord;
+  const discordConnected = !!discordGateway && (
+    discordGateway.connected === true ||
+    discordGateway.ready === true
+  );
+
+  return {
+    whatsapp: {
+      desired: whatsappDesired,
+      connected: whatsappConnected,
+      auth_present: whatsappAuthPresent,
+      login_in_progress: !!whatsappLoginProcess || !!whatsappSocket,
+      needs_relink: whatsappDesired && !whatsappConnected && !whatsappAuthPresent,
+    },
+    telegram: {
+      desired: telegramDesired,
+      token_present: !!env.TELEGRAM_BOT_TOKEN,
+      connected: telegramConnected,
+    },
+    discord: {
+      desired: discordDesired,
+      token_present: !!env.DISCORD_BOT_TOKEN,
+      guild_id_present: !!config?.discord_guild_id,
+      connected: discordConnected,
+    },
+  };
+}
+
+function getDegradedChannels(channels) {
+  const degraded = [];
+
+  if (channels.whatsapp.desired && channels.whatsapp.auth_present && !channels.whatsapp.connected) {
+    degraded.push('whatsapp');
+  }
+  if (channels.telegram.desired && !channels.telegram.connected) {
+    degraded.push('telegram');
+  }
+  if (channels.discord.desired && !channels.discord.connected) {
+    degraded.push('discord');
+  }
+
+  return degraded;
+}
+
+const WATCHDOG_INTERVAL_MS = 60_000;
+const WATCHDOG_RESTART_COOLDOWN_MS = 120_000;
+const WATCHDOG_QR_COOLDOWN_MS = 5 * 60_000;
+
+let isWatchdogRunning = false;
+const watchdogState = {
+  enabled: true,
+  last_run_at: null,
+  last_result: 'idle',
+  last_reason: null,
+  last_error: null,
+  last_restart_at: null,
+  last_qr_bootstrap_at: null,
+  consecutive_service_failures: 0,
+  consecutive_channel_failures: 0,
+  total_self_heals: 0,
+  degraded_channels: [],
+  channels: null,
+};
+
+function canRunAfter(lastIso, cooldownMs) {
+  if (!lastIso) return true;
+  return (Date.now() - new Date(lastIso).getTime()) >= cooldownMs;
+}
+
+function restartOpenclawForWatchdog(reason) {
+  runCmd('sudo systemctl reset-failed openclaw 2>/dev/null || true');
+  runCmd('sudo systemctl restart openclaw');
+  watchdogState.last_restart_at = new Date().toISOString();
+  watchdogState.last_reason = reason;
+  watchdogState.total_self_heals += 1;
+}
+
+function reconcileChannelConfig(config, env) {
+  const repaired = [];
+
+  if (env.TELEGRAM_BOT_TOKEN) {
+    const telegramEnabled = config?.channels?.telegram?.enabled === true;
+    const telegramToken = config?.channels?.telegram?.botToken;
+    if (!telegramEnabled || telegramToken !== env.TELEGRAM_BOT_TOKEN) {
+      const safeToken = sanitizeEnvValue(env.TELEGRAM_BOT_TOKEN);
+      runCmd(`${openclawExec(`config set channels.telegram.botToken '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
+      runCmd(`${openclawExec('config set channels.telegram.enabled true --strict-json')} 2>/dev/null || true`);
+      repaired.push('telegram');
+    }
+  }
+
+  if (env.DISCORD_BOT_TOKEN) {
+    const discordEnabled = config?.channels?.discord?.enabled === true;
+    const discordToken = config?.channels?.discord?.token;
+    if (!discordEnabled || discordToken !== env.DISCORD_BOT_TOKEN) {
+      const safeToken = sanitizeEnvValue(env.DISCORD_BOT_TOKEN);
+      runCmd(`${openclawExec(`config set channels.discord.token '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
+      runCmd(`${openclawExec('config set channels.discord.enabled true --strict-json')} 2>/dev/null || true`);
+      repaired.push('discord');
+    }
+  }
+
+  if ((config?.channel === 'whatsapp' || hasWhatsAppAuthState()) && config?.channels?.whatsapp?.enabled !== true) {
+    runCmd(`${openclawExec('config set channels.whatsapp.enabled true --strict-json')} 2>/dev/null || true`);
+    repaired.push('whatsapp');
+  }
+
+  return repaired;
+}
+
+async function runWatchdogCycle(trigger = 'interval') {
+  if (isWatchdogRunning) {
+    return watchdogState;
+  }
+
+  isWatchdogRunning = true;
+  watchdogState.last_run_at = new Date().toISOString();
+  watchdogState.last_error = null;
+
+  try {
+    if (creditBlocked) {
+      watchdogState.last_result = 'skipped_credit_blocked';
+      return watchdogState;
+    }
+    if (isConfiguring || isRestarting) {
+      watchdogState.last_result = 'skipped_busy';
+      return watchdogState;
+    }
+
+    const config = readConfig();
+    const env = readEnvFile();
+    const logs = getJournalLogsSinceLastStart(120);
+    const openclawStatus = getOpenclawStatus();
+    const gatewayHealth = openclawStatus === 'running' ? readGatewayHealth() : null;
+    const channels = buildChannelSnapshot(config, env, logs, gatewayHealth);
+    const degradedChannels = getDegradedChannels(channels);
+    watchdogState.channels = channels;
+    watchdogState.degraded_channels = degradedChannels;
+
+    let restartReason = null;
+    let restarted = false;
+    let repaired = [];
+
+    if (openclawStatus !== 'running' || !gatewayHealth) {
+      watchdogState.consecutive_service_failures += 1;
+    } else {
+      watchdogState.consecutive_service_failures = 0;
+    }
+
+    if (degradedChannels.length > 0) {
+      watchdogState.consecutive_channel_failures += 1;
+    } else {
+      watchdogState.consecutive_channel_failures = 0;
+    }
+
+    repaired = reconcileChannelConfig(config, env);
+    if (repaired.length > 0) {
+      restartReason = `channel_config_reconciled:${repaired.join(',')}`;
+    }
+
+    if (!restartReason && watchdogState.consecutive_service_failures >= 2) {
+      restartReason = gatewayHealth ? 'openclaw_not_running' : 'gateway_unhealthy';
+    }
+
+    if (!restartReason && watchdogState.consecutive_channel_failures >= 2 && degradedChannels.length > 0) {
+      restartReason = `channels_degraded:${degradedChannels.join(',')}`;
+    }
+
+    if (restartReason && canRunAfter(watchdogState.last_restart_at, WATCHDOG_RESTART_COOLDOWN_MS)) {
+      restartOpenclawForWatchdog(restartReason);
+      restarted = true;
+    }
+
+    if (
+      !restarted &&
+      channels.whatsapp.desired &&
+      !channels.whatsapp.connected &&
+      !channels.whatsapp.auth_present &&
+      !channels.whatsapp.login_in_progress &&
+      canRunAfter(watchdogState.last_qr_bootstrap_at, WATCHDOG_QR_COOLDOWN_MS)
+    ) {
+      await startWhatsAppLogin();
+      watchdogState.last_qr_bootstrap_at = new Date().toISOString();
+      watchdogState.last_reason = 'whatsapp_qr_bootstrap';
+      watchdogState.total_self_heals += 1;
+      watchdogState.last_result = 'started_qr_recovery';
+      return watchdogState;
+    }
+
+    watchdogState.last_reason = restartReason;
+    watchdogState.last_result = restarted
+      ? 'restarted_openclaw'
+      : (repaired.length > 0 ? 'reconciled_config' : 'ok');
+    return watchdogState;
+  } catch (err) {
+    watchdogState.last_result = 'error';
+    watchdogState.last_error = err.message;
+    return watchdogState;
+  } finally {
+    isWatchdogRunning = false;
+  }
+}
+
+setTimeout(() => {
+  runWatchdogCycle('startup').catch((err) => {
+    console.error('[watchdog] startup cycle failed:', err.message);
+  });
+  setInterval(() => {
+    runWatchdogCycle('interval').catch((err) => {
+      console.error('[watchdog] periodic cycle failed:', err.message);
+    });
+  }, WATCHDOG_INTERVAL_MS);
+}, 20_000);
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -392,6 +660,7 @@ app.get('/health/detailed', auth, (req, res) => {
       disk_total_gb,
       last_message_at,
       restart_count,
+      watchdog: watchdogState,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -449,14 +718,7 @@ function isWhatsAppConnected(isRunning, logs) {
  * Uses 'health' endpoint which is more reliable than 'status'.
  */
 function isWhatsAppLinkedViaRPC() {
-  try {
-    const out = runCmd(`${openclawGatewayCall('health', '--json')} 2>/dev/null`);
-    const health = JSON.parse(out);
-    const wa = health.channels && health.channels.whatsapp;
-    return wa && (wa.connected === true || wa.linked === true);
-  } catch {
-    return false;
-  }
+  return getWhatsAppLinkedFromGatewayHealth(readGatewayHealth());
 }
 
 // ── WhatsApp login process management ────────────────────────────────────────
@@ -985,23 +1247,46 @@ app.get('/channels', auth, (req, res) => {
     const config = readConfig();
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(100);
-    const isRunning = getOpenclawStatus() === 'running';
-    const waConnected = isWhatsAppConnected(isRunning, logs) || (isRunning && isWhatsAppLinkedViaRPC());
+    const gatewayHealth = readGatewayHealth();
+    const snapshot = buildChannelSnapshot(config, env, logs, gatewayHealth);
 
     res.json({
       whatsapp: {
-        status: waConnected ? 'connected' : (isRunning ? 'disconnected' : 'disconnected'),
+        status: snapshot.whatsapp.connected
+          ? 'connected'
+          : (snapshot.whatsapp.desired
+            ? (snapshot.whatsapp.needs_relink ? 'needs_relink' : 'disconnected')
+            : 'not_configured'),
         phone: config.whatsapp_phone || null,
+        auth_present: snapshot.whatsapp.auth_present,
+        login_in_progress: snapshot.whatsapp.login_in_progress,
       },
       telegram: {
-        status: env.TELEGRAM_BOT_TOKEN ? 'configured' : 'not_configured',
+        status: !snapshot.telegram.desired
+          ? 'not_configured'
+          : (snapshot.telegram.connected ? 'connected' : 'configured'),
         username: config.telegram_username || null,
       },
       discord: {
-        status: (env.DISCORD_BOT_TOKEN && config.discord_guild_id) ? 'configured' : 'not_configured',
+        status: !snapshot.discord.desired
+          ? 'not_configured'
+          : (snapshot.discord.connected ? 'connected' : 'configured'),
         guild: config.discord_guild_name || config.discord_guild_id || null,
       },
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/watchdog', auth, (req, res) => {
+  res.json(watchdogState);
+});
+
+app.post('/self-heal', auth, async (req, res) => {
+  try {
+    const result = await runWatchdogCycle('manual');
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

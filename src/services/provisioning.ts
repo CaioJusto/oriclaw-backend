@@ -93,7 +93,12 @@ const PLAN_SIZES: Record<string, string> = {
 const DEFAULT_DROPLET_REGION = process.env.ORICLAW_DROPLET_REGION || 'nyc1';
 const DEFAULT_VPC_ID = process.env.ORICLAW_VPC_ID || '';
 const SNAPSHOT_BOOTSTRAP_REPO = process.env.ORICLAW_BACKEND_REPO || 'CaioJusto/oriclaw-backend';
-const SNAPSHOT_BOOTSTRAP_REF = process.env.ORICLAW_BOOTSTRAP_REF || 'main';
+const SNAPSHOT_BOOTSTRAP_REF =
+  process.env.ORICLAW_BOOTSTRAP_REF ||
+  process.env.SOURCE_COMMIT ||
+  process.env.GITHUB_SHA ||
+  process.env.COMMIT_SHA ||
+  'main';
 const SNAPSHOT_AGENT_BASE_URL =
   `https://raw.githubusercontent.com/${SNAPSHOT_BOOTSTRAP_REPO}/${SNAPSHOT_BOOTSTRAP_REF}/vps-agent`;
 
