@@ -229,7 +229,7 @@ touch /etc/systemd/system/openclaw.service.d/openrouter.conf
 chmod 600 /etc/systemd/system/openclaw.service.d/openrouter.conf
 
 cat > /etc/sudoers.d/oriclaw-agent << 'SUDOEOF'
-oriclaw-agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart openclaw, /usr/bin/systemctl start openclaw, /usr/bin/systemctl stop openclaw, /usr/bin/systemctl is-active openclaw, /usr/bin/systemctl status openclaw
+oriclaw-agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart openclaw, /usr/bin/systemctl start openclaw, /usr/bin/systemctl stop openclaw, /usr/bin/systemctl reset-failed openclaw, /usr/bin/systemctl is-active openclaw, /usr/bin/systemctl status openclaw
 Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
 oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
