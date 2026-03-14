@@ -1179,6 +1179,10 @@ let whatsappRawQR = null;       // raw QR string from Baileys
 let whatsappQRTimestamp = 0;
 let whatsappLinkedAt = 0;
 let whatsappForceFreshLogin = false;
+let whatsappAuthSyncTimer = null;
+let whatsappAuthSyncInFlight = false;
+let whatsappAuthSyncedAt = 0;
+const WHATSAPP_TEMP_AUTH_DIR = '/tmp/oriclaw-wa-auth';
 const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 
 let whatsappSetupDone = false;
@@ -1201,6 +1205,36 @@ function ensureWhatsAppSetup() {
     allowFailure: true,
     timeout: 20_000,
   });
+}
+
+function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR) {
+  if (whatsappAuthSyncInFlight || !fs.existsSync(authDir)) return false;
+  whatsappAuthSyncInFlight = true;
+
+  try {
+    for (const ocAuth of getWhatsAppAuthDirs()) {
+      fs.mkdirSync(ocAuth, { recursive: true });
+      fs.cpSync(authDir, ocAuth, { recursive: true, force: true });
+      runProcess('chown', ['-R', 'openclaw:openclaw', ocAuth], { allowFailure: true });
+    }
+    whatsappAuthSyncedAt = Date.now();
+    return true;
+  } catch (err) {
+    console.error('[whatsapp-login] auth sync error:', err.message);
+    return false;
+  } finally {
+    whatsappAuthSyncInFlight = false;
+  }
+}
+
+function scheduleWhatsAppAuthSync(authDir = WHATSAPP_TEMP_AUTH_DIR, delayMs = 400) {
+  if (whatsappAuthSyncTimer) {
+    clearTimeout(whatsappAuthSyncTimer);
+  }
+  whatsappAuthSyncTimer = setTimeout(() => {
+    whatsappAuthSyncTimer = null;
+    syncWhatsAppAuthToOpenclaw(authDir);
+  }, delayMs);
 }
 
 /**
@@ -1252,7 +1286,7 @@ async function startWhatsAppLogin() {
   const makeCacheableSignalKeyStore = baileys.makeCacheableSignalKeyStore;
 
   // Use a temp auth dir writable by the agent, then sync to OpenClaw's dir
-  const authDir = '/tmp/oriclaw-wa-auth';
+  const authDir = WHATSAPP_TEMP_AUTH_DIR;
   try {
     fs.mkdirSync(authDir, { recursive: true });
     execSync(`find '${authDir}' -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true`, { timeout: 5000 });
@@ -1305,7 +1339,12 @@ async function startWhatsAppLogin() {
     });
     whatsappSocket = sock;
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', () => {
+      Promise.resolve(saveCreds()).catch((err) => {
+        console.error('[whatsapp-login] saveCreds error:', err.message);
+      });
+      scheduleWhatsAppAuthSync(authDir);
+    });
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -1319,15 +1358,7 @@ async function startWhatsAppLogin() {
         whatsappRawQR = null;
         whatsappForceFreshLogin = false;
         whatsappLinkedAt = Date.now();
-        for (const ocAuth of getWhatsAppAuthDirs()) {
-          try {
-            runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', ocAuth]);
-            runProcess('sudo', ['-u', 'openclaw', 'cp', '-r', '/tmp/oriclaw-wa-auth/.', `${ocAuth}/`], { allowFailure: true });
-            runProcess('chown', ['-R', 'openclaw:openclaw', ocAuth], { allowFailure: true });
-          } catch (err) {
-            console.error('[whatsapp-login] auth sync error:', err.message);
-          }
-        }
+        syncWhatsAppAuthToOpenclaw(authDir);
         runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
           if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
         });
@@ -1340,6 +1371,13 @@ async function startWhatsAppLogin() {
         console.log('[whatsapp-login] connection closed, code:', code, 'error:', err?.message || err);
         if (code === 401) {
           whatsappForceFreshLogin = true;
+        }
+        if ((code === 515 || code === 428) && syncWhatsAppAuthToOpenclaw(authDir)) {
+          whatsappLinkedAt = Date.now();
+          invalidateGatewayHealthCache();
+          runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
+            if (restartErr) console.error('[whatsapp-login] restart after restart-required close failed:', restartErr.message);
+          });
         }
         cleanupWhatsAppSocket();
       }
