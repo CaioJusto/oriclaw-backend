@@ -599,6 +599,7 @@ let whatsappLoginStartedAt = 0;
 let whatsappRawQR = null;
 let whatsappQRTimestamp = 0;
 let whatsappLinkedAt = 0;
+const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 
 let whatsappSetupDone = false;
 
@@ -754,19 +755,11 @@ function cleanupWhatsAppSocket() {
 // GET /qr  → base64 PNG of the current QR code (or { connected: true })
 app.get('/qr', auth, async (req, res) => {
   const isRunning = getOpenclawStatus() === 'running';
+  const rawQRAge = whatsappQRTimestamp ? Date.now() - whatsappQRTimestamp : Infinity;
+  const hasFreshRawQR = Boolean(whatsappRawQR && rawQRAge < WHATSAPP_QR_MAX_AGE_MS);
+  const hadStaleRawQR = Boolean(whatsappRawQR && rawQRAge >= WHATSAPP_QR_MAX_AGE_MS);
 
-  const logs = getJournalLogsSinceLastStart(200);
-  const linkedViaRPC = isWhatsAppLinkedViaRPC();
-  const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30000);
-  if (linkedViaRPC || linkedRecently || isWhatsAppConnected(isRunning, logs)) {
-    if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
-      cleanupWhatsAppSocket();
-    }
-    return res.json({ connected: true, qr: null });
-  }
-
-  // Check if we have raw QR data from the Baileys helper
-  if (whatsappRawQR && (Date.now() - whatsappQRTimestamp < 120000)) {
+  if (hasFreshRawQR) {
     try {
       const pngBase64 = await QRCode.toDataURL(whatsappRawQR, {
         errorCorrectionLevel: 'L',
@@ -780,20 +773,48 @@ app.get('/qr', auth, async (req, res) => {
     }
   }
 
-  // Fallback: try to extract QR data from logs
-  let qrData = extractQRData(logs);
-  if (!qrData) qrData = readOpenClawLogQR();
+  if (hadStaleRawQR) {
+    console.log('[qr] stale QR expired after', rawQRAge, 'ms; restarting login flow');
+    whatsappRawQR = null;
+    whatsappQRTimestamp = 0;
+    cleanupWhatsAppSocket();
+  }
 
-  if (qrData) {
-    try {
-      const pngBase64 = await QRCode.toDataURL(qrData, {
-        errorCorrectionLevel: 'M',
-        type: 'image/png',
-        width: 300,
-        margin: 2,
-      });
-      return res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
-    } catch (err) { /* fall through */ }
+  const logs = getJournalLogsSinceLastStart(200);
+  const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30000);
+  if (linkedRecently || isWhatsAppConnected(isRunning, logs)) {
+    if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
+      cleanupWhatsAppSocket();
+    }
+    return res.json({ connected: true, qr: null });
+  }
+
+  if (isRunning) {
+    const linkedViaRPC = isWhatsAppLinkedViaRPC();
+    if (linkedViaRPC) {
+      if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
+        cleanupWhatsAppSocket();
+      }
+      return res.json({ connected: true, qr: null });
+    }
+  }
+
+  // Fallback: try to extract QR data from logs
+  if (!hadStaleRawQR) {
+    let qrData = extractQRData(logs);
+    if (!qrData) qrData = readOpenClawLogQR();
+
+    if (qrData) {
+      try {
+        const pngBase64 = await QRCode.toDataURL(qrData, {
+          errorCorrectionLevel: 'M',
+          type: 'image/png',
+          width: 300,
+          margin: 2,
+        });
+        return res.json({ connected: false, qr: pngBase64, generated_at: Date.now() });
+      } catch (err) { /* fall through */ }
+    }
   }
 
   // No QR data found — trigger login process
