@@ -11,6 +11,8 @@ import {
 
 export const AGENT_PORT = 8080;
 export const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
+const AGENT_PROBE_TIMEOUT_MS = 2_500;
+const RECENT_SUCCESS_TTL_MS = 5 * 60 * 1000;
 
 type AgentInstanceLike = Pick<OriClawInstance, 'id' | 'droplet_id' | 'droplet_ip' | 'metadata'>;
 
@@ -30,6 +32,8 @@ export type AgentTransport = {
   baseUrl: string;
   httpsAgent: https.Agent;
 };
+
+const lastSuccessfulHostByInstance = new Map<string, { host: string; verifiedAt: number }>();
 
 function asIp(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
@@ -113,26 +117,29 @@ export async function resolveAgentHost(instance: AgentInstanceLike): Promise<str
 }
 
 export async function resolveAgentBaseUrl(instance: AgentInstanceLike): Promise<string | null> {
-  const host = await resolveAgentHost(instance);
+  const host = (await resolveAgentHosts(instance))[0] ?? null;
   return host ? `https://${host}:${AGENT_PORT}` : null;
 }
 
 export async function resolveAgentHosts(instance: AgentInstanceLike): Promise<string[]> {
+  const hosts = new Set<string>();
   const cachedPrivateIp = getCachedPrivateIp(instance);
   const cachedPublicIp = getCachedPublicIp(instance);
-  const hosts = new Set<string>();
 
   if (cachedPrivateIp) hosts.add(cachedPrivateIp);
   if (cachedPublicIp) hosts.add(cachedPublicIp);
 
-  if (hosts.size > 0) {
-    return Array.from(hosts);
+  if (instance.droplet_id) {
+    try {
+      const { privateIp, publicIp } = await refreshAgentIps(instance);
+      if (privateIp) hosts.add(privateIp);
+      if (publicIp) hosts.add(publicIp);
+    } catch {
+      /* ignore refresh failures and fall back to cached IPs */
+    }
   }
 
-  const baseUrl = await resolveAgentBaseUrl(instance);
-  if (!baseUrl) return [];
-
-  return [baseUrl.replace(/^https:\/\//, '').replace(/:\d+$/, '')];
+  return Array.from(hosts);
 }
 
 function pemFromRawCert(raw: Buffer): string {
@@ -203,16 +210,78 @@ async function bootstrapPinnedTls(instance: AgentInstanceLike, agentSecret: stri
   throw lastError ?? new Error('Unable to bootstrap pinned TLS for agent');
 }
 
+function createAgentTransport(host: string, tls: AgentPinnedTls): AgentTransport {
+  return {
+    baseUrl: `https://${host}:${AGENT_PORT}`,
+    httpsAgent: buildPinnedAgentHttpsAgent(tls.certPem, tls.fingerprint256),
+  };
+}
+
+function orderHosts(instanceId: string, hosts: string[]): string[] {
+  const cached = lastSuccessfulHostByInstance.get(instanceId);
+  if (!cached) return hosts;
+
+  if ((Date.now() - cached.verifiedAt) > RECENT_SUCCESS_TTL_MS) {
+    lastSuccessfulHostByInstance.delete(instanceId);
+    return hosts;
+  }
+
+  return hosts.slice().sort((a, b) => {
+    if (a === cached.host) return -1;
+    if (b === cached.host) return 1;
+    return 0;
+  });
+}
+
+async function verifyAgentTransport(transport: AgentTransport, agentSecret: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const req = https.request(
+      {
+        host: new URL(transport.baseUrl).hostname,
+        port: AGENT_PORT,
+        path: '/health',
+        method: 'GET',
+        headers: { 'x-agent-secret': agentSecret },
+        agent: transport.httpsAgent,
+        timeout: AGENT_PROBE_TIMEOUT_MS,
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`Agent transport probe returned status ${res.statusCode}`));
+          return;
+        }
+
+        res.resume();
+        res.on('end', () => resolve());
+      }
+    );
+
+    req.on('timeout', () => req.destroy(new Error('Agent transport probe timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 export async function resolveAgentTransport(
   instance: AgentInstanceLike,
   agentSecret: string
 ): Promise<AgentTransport | null> {
-  const baseUrl = await resolveAgentBaseUrl(instance);
-  if (!baseUrl) return null;
-
+  const hosts = orderHosts(instance.id, await resolveAgentHosts(instance));
+  if (hosts.length === 0) return null;
   const tls = getPinnedTls(instance) ?? await bootstrapPinnedTls(instance, agentSecret);
-  return {
-    baseUrl,
-    httpsAgent: buildPinnedAgentHttpsAgent(tls.certPem, tls.fingerprint256),
-  };
+  let lastError: Error | null = null;
+
+  for (const host of hosts) {
+    const transport = createAgentTransport(host, tls);
+    try {
+      await verifyAgentTransport(transport, agentSecret);
+      lastSuccessfulHostByInstance.set(instance.id, { host, verifiedAt: Date.now() });
+      return transport;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw lastError ?? new Error('Unable to reach agent on any known host');
 }
