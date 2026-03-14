@@ -549,7 +549,7 @@ function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs =
     discordGateway.ready === true
   );
 
-  return {
+  const channels = {
     whatsapp: {
       desired: whatsappDesired,
       connected: whatsappConnected,
@@ -571,12 +571,20 @@ function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs =
       connected: discordConnected,
     },
   };
+
+  channels.whatsapp.stabilizing = isWhatsAppConnectionStabilizing(channels);
+  return channels;
 }
 
 function getDegradedChannels(channels) {
   const degraded = [];
 
-  if (channels.whatsapp.desired && channels.whatsapp.auth_present && !channels.whatsapp.connected) {
+  if (
+    channels.whatsapp.desired &&
+    channels.whatsapp.auth_present &&
+    !channels.whatsapp.connected &&
+    !channels.whatsapp.stabilizing
+  ) {
     degraded.push('whatsapp');
   }
   if (channels.telegram.desired && channels.telegram.connection_known && !channels.telegram.connected) {
@@ -592,6 +600,7 @@ function getDegradedChannels(channels) {
 const WATCHDOG_INTERVAL_MS = 60_000;
 const WATCHDOG_RESTART_COOLDOWN_MS = 120_000;
 const WATCHDOG_QR_COOLDOWN_MS = 5 * 60_000;
+const WATCHDOG_WHATSAPP_CONNECT_GRACE_MS = 4 * 60_000;
 
 let isWatchdogRunning = false;
 const watchdogState = {
@@ -612,6 +621,30 @@ const watchdogState = {
 function canRunAfter(lastIso, cooldownMs) {
   if (!lastIso) return true;
   return (Date.now() - new Date(lastIso).getTime()) >= cooldownMs;
+}
+
+function isRecentTimestamp(lastMs, windowMs) {
+  return Boolean(lastMs) && (Date.now() - lastMs) < windowMs;
+}
+
+function isRecentIsoTimestamp(lastIso, windowMs) {
+  return Boolean(lastIso) && !canRunAfter(lastIso, windowMs);
+}
+
+function isWhatsAppConnectionStabilizing(channels) {
+  const whatsapp = channels?.whatsapp;
+  if (!whatsapp || !whatsapp.desired || whatsapp.connected) {
+    return false;
+  }
+
+  return (
+    whatsapp.login_in_progress ||
+    isRecentTimestamp(whatsappLoginStartedAt, WATCHDOG_WHATSAPP_CONNECT_GRACE_MS) ||
+    isRecentTimestamp(whatsappAuthSyncedAt, WATCHDOG_WHATSAPP_CONNECT_GRACE_MS) ||
+    isRecentTimestamp(whatsappLinkedAt, WATCHDOG_WHATSAPP_CONNECT_GRACE_MS) ||
+    isRecentTimestamp(whatsappPairingRestartAt, WATCHDOG_WHATSAPP_CONNECT_GRACE_MS) ||
+    isRecentIsoTimestamp(watchdogState.last_qr_bootstrap_at, WATCHDOG_WHATSAPP_CONNECT_GRACE_MS)
+  );
 }
 
 function restartOpenclawForWatchdog(reason) {
@@ -1203,6 +1236,7 @@ let whatsappForceFreshLogin = false;
 let whatsappAuthSyncTimer = null;
 let whatsappAuthSyncInFlight = false;
 let whatsappAuthSyncedAt = 0;
+let whatsappPairingRestartAt = 0;
 const WHATSAPP_TEMP_AUTH_DIR = '/tmp/oriclaw-wa-auth';
 const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 
@@ -1258,6 +1292,7 @@ function restartOpenclawAfterPairing(authDir = WHATSAPP_TEMP_AUTH_DIR, reason = 
 
     console.log('[whatsapp-login] restarting openclaw after pairing:', reason);
     invalidateGatewayHealthCache();
+    whatsappPairingRestartAt = Date.now();
     runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
       if (restartErr) console.error('[whatsapp-login] restart after pairing failed:', restartErr.message);
     });
@@ -1395,7 +1430,9 @@ async function startWhatsAppLogin() {
         whatsappRawQR = null;
         whatsappForceFreshLogin = false;
         whatsappLinkedAt = Date.now();
+        watchdogState.consecutive_channel_failures = 0;
         syncWhatsAppAuthToOpenclaw(authDir);
+        whatsappPairingRestartAt = Date.now();
         runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
           if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
         });
