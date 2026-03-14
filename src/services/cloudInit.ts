@@ -468,6 +468,46 @@ function writeConfig(updates) {
   try { runCmd(\`chown -R openclaw:openclaw \${OPENCLAW_CONFIG_DIR}\`); } catch { /* ignore */ }
 }
 
+function replaceConfig(config) {
+  const configPath = getOpenClawConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(config || {}, null, 2), 'utf8');
+  try { runCmd(\`chown -R openclaw:openclaw \${OPENCLAW_CONFIG_DIR}\`); } catch { /* ignore */ }
+}
+
+function clearChannelConfig(channel) {
+  const config = JSON.parse(JSON.stringify(readConfig() || {}));
+
+  if (config?.channel === channel) {
+    delete config.channel;
+  }
+
+  if (!config.channels || typeof config.channels !== 'object' || Array.isArray(config.channels)) {
+    config.channels = {};
+  }
+
+  if (channel === 'telegram') {
+    const nextTelegram = config.channels.telegram && typeof config.channels.telegram === 'object'
+      ? { ...config.channels.telegram }
+      : {};
+    delete nextTelegram.botToken;
+    nextTelegram.enabled = false;
+    config.channels.telegram = nextTelegram;
+    delete config.telegram_username;
+  } else if (channel === 'discord') {
+    const nextDiscord = config.channels.discord && typeof config.channels.discord === 'object'
+      ? { ...config.channels.discord }
+      : {};
+    delete nextDiscord.token;
+    nextDiscord.enabled = false;
+    config.channels.discord = nextDiscord;
+    delete config.discord_guild_id;
+    delete config.discord_guild_name;
+  }
+
+  replaceConfig(config);
+}
+
 function getWhatsAppAuthDirs() {
   return [
     path.join(OPENCLAW_CONFIG_DIR, 'credentials', 'whatsapp', 'default'),
@@ -1535,9 +1575,10 @@ app.delete('/channels/:channel', auth, (req, res) => {
       );
       return;
     } else {
-      // Disable channel via OpenClaw config
+      // Remove persisted channel credentials so the dashboard no longer treats
+      // the channel as configured after restart.
       try {
-        runCmd(\`\${openclawExec(\`config set channels.\${channel}.enabled false --strict-json\`)} 2>/dev/null || true\`);
+        clearChannelConfig(channel);
       } catch { /* ignore */ }
 
       const env = readEnvFile();

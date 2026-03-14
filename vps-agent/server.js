@@ -498,6 +498,49 @@ function writeConfig(updates) {
   return config;
 }
 
+function persistConfigSnapshot(config) {
+  const normalized = normalizeOpenClawConfig(config || {});
+  const nativeConfig = toNativeOpenClawConfig(normalized);
+  writeOwnedJsonFile(OPENCLAW_CONFIG_FILE, normalized, { mode: '600' });
+  for (const configPath of getNativeConfigPathsForWrite()) {
+    writeOwnedJsonFile(configPath, nativeConfig, { mode: '600' });
+  }
+  return normalized;
+}
+
+function clearChannelConfig(channel) {
+  const config = deepMergeConfig({}, readConfig() || {});
+
+  if (config?.channel === channel) {
+    delete config.channel;
+  }
+
+  if (!isPlainObject(config.channels)) {
+    config.channels = {};
+  }
+
+  if (channel === 'telegram') {
+    const nextTelegram = isPlainObject(config.channels.telegram)
+      ? { ...config.channels.telegram }
+      : {};
+    delete nextTelegram.botToken;
+    nextTelegram.enabled = false;
+    config.channels.telegram = nextTelegram;
+    delete config.telegram_username;
+  } else if (channel === 'discord') {
+    const nextDiscord = isPlainObject(config.channels.discord)
+      ? { ...config.channels.discord }
+      : {};
+    delete nextDiscord.token;
+    nextDiscord.enabled = false;
+    config.channels.discord = nextDiscord;
+    delete config.discord_guild_id;
+    delete config.discord_guild_name;
+  }
+
+  return persistConfigSnapshot(config);
+}
+
 function safeJsonParse(raw) {
   try {
     return JSON.parse(raw);
@@ -2400,9 +2443,10 @@ app.delete('/channels/:channel', auth, (req, res) => {
       });
       return;
     } else {
-      // Disable channel via OpenClaw config
+      // Remove persisted channel credentials so the dashboard no longer treats
+      // the channel as configured after restart.
       try {
-        setOpenclawJsonValue(`channels.${channel}.enabled`, false);
+        clearChannelConfig(channel);
       } catch { /* ignore */ }
 
       const env = readEnvFile();
