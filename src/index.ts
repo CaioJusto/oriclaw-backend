@@ -274,12 +274,12 @@ function getActionableChannelFailures(watchdog: AgentWatchdogState | null | unde
   }
 
   const telegram = (channels?.telegram ?? {}) as Record<string, unknown>;
-  if (telegram.desired === true && telegram.connected !== true) {
+  if (telegram.desired === true && telegram.connection_known === true && telegram.connected !== true) {
     failed.add('telegram');
   }
 
   const discord = (channels?.discord ?? {}) as Record<string, unknown>;
-  if (discord.desired === true && discord.connected !== true) {
+  if (discord.desired === true && discord.connection_known === true && discord.connected !== true) {
     failed.add('discord');
   }
 

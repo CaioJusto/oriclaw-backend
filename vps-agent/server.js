@@ -365,12 +365,14 @@ function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs =
     telegram: {
       desired: telegramDesired,
       token_present: !!env.TELEGRAM_BOT_TOKEN,
+      connection_known: !!gatewayHealth,
       connected: telegramConnected,
     },
     discord: {
       desired: discordDesired,
       token_present: !!env.DISCORD_BOT_TOKEN,
       guild_id_present: !!config?.discord_guild_id,
+      connection_known: !!gatewayHealth,
       connected: discordConnected,
     },
   };
@@ -382,10 +384,10 @@ function getDegradedChannels(channels) {
   if (channels.whatsapp.desired && channels.whatsapp.auth_present && !channels.whatsapp.connected) {
     degraded.push('whatsapp');
   }
-  if (channels.telegram.desired && !channels.telegram.connected) {
+  if (channels.telegram.desired && channels.telegram.connection_known && !channels.telegram.connected) {
     degraded.push('telegram');
   }
-  if (channels.discord.desired && !channels.discord.connected) {
+  if (channels.discord.desired && channels.discord.connection_known && !channels.discord.connected) {
     degraded.push('discord');
   }
 
@@ -491,7 +493,7 @@ async function runWatchdogCycle(trigger = 'interval') {
     let restarted = false;
     let repaired = [];
 
-    if (openclawStatus !== 'running' || !gatewayHealth) {
+    if (openclawStatus !== 'running') {
       watchdogState.consecutive_service_failures += 1;
     } else {
       watchdogState.consecutive_service_failures = 0;
@@ -509,7 +511,7 @@ async function runWatchdogCycle(trigger = 'interval') {
     }
 
     if (!restartReason && watchdogState.consecutive_service_failures >= 2) {
-      restartReason = gatewayHealth ? 'openclaw_not_running' : 'gateway_unhealthy';
+      restartReason = 'openclaw_not_running';
     }
 
     if (!restartReason && watchdogState.consecutive_channel_failures >= 2 && degradedChannels.length > 0) {
