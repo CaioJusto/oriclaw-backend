@@ -501,15 +501,6 @@ function extractQRData(logs) {
   return null;
 }
 
-function readGatewayHealth() {
-  try {
-    const out = runOpenclawGatewayCall('health', ['--json'], { allowFailure: true });
-    return safeJsonParse(out);
-  } catch {
-    return null;
-  }
-}
-
 function getWhatsAppLinkedFromGatewayHealth(gatewayHealth) {
   const wa = gatewayHealth?.channels?.whatsapp;
   return !!wa && (wa.connected === true || wa.linked === true || wa.ready === true);
@@ -607,6 +598,7 @@ function canRunAfter(lastIso, cooldownMs) {
 }
 
 function restartOpenclawForWatchdog(reason) {
+  invalidateGatewayHealthCache();
   runSystemctl(['reset-failed', 'openclaw'], { allowFailure: true });
   runSystemctl(['restart', 'openclaw']);
   watchdogState.last_restart_at = new Date().toISOString();
@@ -668,7 +660,12 @@ async function runWatchdogCycle(trigger = 'interval') {
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(120);
     const openclawStatus = getOpenclawStatus();
-    const gatewayHealth = openclawStatus === 'running' ? readGatewayHealth() : null;
+    if (openclawStatus === 'running') {
+      refreshGatewayHealthCache({ force: true });
+    }
+    const gatewayHealth = openclawStatus === 'running'
+      ? readGatewayHealth({ refresh: false })
+      : null;
     const channels = buildChannelSnapshot(config, env, logs, gatewayHealth);
     const degradedChannels = getDegradedChannels(channels);
     watchdogState.channels = channels;
@@ -946,6 +943,18 @@ let lastSuccessfulGatewayUrl = '';
 let lastSuccessfulGatewayUrlAt = 0;
 const GATEWAY_URL_CACHE_TTL_MS = 10 * 60_000;
 const GATEWAY_DEVICES_TIMEOUT_MS = 4_000;
+const GATEWAY_HEALTH_CACHE_TTL_MS = 60_000;
+const GATEWAY_HEALTH_REFRESH_TIMEOUT_MS = 5_000;
+const gatewayHealthCache = {
+  data: null,
+  fetchedAt: 0,
+  refreshing: false,
+};
+
+function invalidateGatewayHealthCache() {
+  gatewayHealthCache.data = null;
+  gatewayHealthCache.fetchedAt = 0;
+}
 
 function getGatewayUrlCandidates() {
   const { port, token, allowedOrigins } = readGatewayConnectionConfig();
@@ -1015,6 +1024,14 @@ function runOpenclawGatewayCall(method, extraArgs = [], options = {}) {
   return runOpenclaw(['gateway', 'call', ...getGatewayUrlCandidates().fallbackArgs, ...extraArgs, method], options);
 }
 
+function runOpenclawGatewayCallAsync(method, extraArgs = [], callback, options = {}) {
+  return runOpenclawAsync(
+    ['gateway', 'call', ...getGatewayUrlCandidates().fallbackArgs, ...extraArgs, method],
+    callback,
+    options,
+  );
+}
+
 function runOpenclawDevices(args, options = {}) {
   const { urls, fallbackArgs } = getGatewayUrlCandidates();
   let lastError = null;
@@ -1046,6 +1063,54 @@ function runOpenclawDevices(args, options = {}) {
   }
 
   throw lastError || new Error('Unable to reach OpenClaw gateway for devices command');
+}
+
+function refreshGatewayHealthCache(options = {}) {
+  const force = options.force === true;
+  const now = Date.now();
+  const cacheAge = now - gatewayHealthCache.fetchedAt;
+  if (!force && gatewayHealthCache.refreshing) return false;
+  if (!force && gatewayHealthCache.data && cacheAge < GATEWAY_HEALTH_CACHE_TTL_MS) return false;
+
+  gatewayHealthCache.refreshing = true;
+  runOpenclawGatewayCallAsync('health', ['--json'], (err, stdout) => {
+    gatewayHealthCache.refreshing = false;
+    if (err) {
+      return;
+    }
+
+    const parsed = safeJsonParse(typeof stdout === 'string' ? stdout : '');
+    if (!parsed) {
+      return;
+    }
+
+    gatewayHealthCache.data = parsed;
+    gatewayHealthCache.fetchedAt = Date.now();
+  }, {
+    timeout: GATEWAY_HEALTH_REFRESH_TIMEOUT_MS,
+  });
+
+  return true;
+}
+
+function readGatewayHealth(options = {}) {
+  const allowStale = options.allowStale !== false;
+  const refresh = options.refresh !== false;
+
+  if (refresh) {
+    refreshGatewayHealthCache();
+  }
+
+  const hasFreshData = Boolean(
+    gatewayHealthCache.data &&
+    (Date.now() - gatewayHealthCache.fetchedAt) < GATEWAY_HEALTH_CACHE_TTL_MS,
+  );
+
+  if (hasFreshData) {
+    return gatewayHealthCache.data;
+  }
+
+  return allowStale ? gatewayHealthCache.data : null;
 }
 
 function runSystemctl(args, options = {}) {
@@ -1104,7 +1169,7 @@ function isWhatsAppConnected(isRunning, logs) {
  * Uses 'health' endpoint which is more reliable than 'status'.
  */
 function isWhatsAppLinkedViaRPC() {
-  return getWhatsAppLinkedFromGatewayHealth(readGatewayHealth());
+  return getWhatsAppLinkedFromGatewayHealth(readGatewayHealth({ allowStale: false }));
 }
 
 // ── WhatsApp login process management ────────────────────────────────────────
@@ -1250,6 +1315,7 @@ async function startWhatsAppLogin() {
         runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
           if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
         });
+        invalidateGatewayHealthCache();
         cleanupWhatsAppSocket();
       }
       if (connection === 'close') {
@@ -1502,6 +1568,7 @@ app.post('/restart', auth, (req, res) => {
     return res.status(429).json({ error: 'Reinicialização já em andamento. Aguarde.' });
   }
   isRestarting = true;
+  invalidateGatewayHealthCache();
   restartingTimer = setTimeout(() => {
     console.error('[vps-agent] restart lock timed out — force-releasing');
     isRestarting = false;
@@ -1628,7 +1695,9 @@ app.get('/channels', auth, (req, res) => {
     const config = readConfig();
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(100);
-    const gatewayHealth = readGatewayHealth();
+    const gatewayHealth = getOpenclawStatus() === 'running'
+      ? readGatewayHealth()
+      : null;
     const snapshot = buildChannelSnapshot(config, env, logs, gatewayHealth);
 
     res.json({
