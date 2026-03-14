@@ -175,7 +175,7 @@ async function fetchPinnedTlsFromHost(host: string, agentSecret: string): Promis
         method: 'GET',
         headers: { 'x-agent-secret': agentSecret },
         rejectUnauthorized: false,
-        timeout: 5_000,
+        timeout: AGENT_PROBE_TIMEOUT_MS,
       },
       (res) => {
         if (res.statusCode !== 200) {
