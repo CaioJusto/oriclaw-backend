@@ -1,5 +1,6 @@
 import https from 'https';
 import { TLSSocket } from 'tls';
+import axios from 'axios';
 import { OriClawInstance } from '../types';
 import { getDroplet, getDropletPrivateIP, getDropletPublicIP } from './digitalocean';
 import { updateInstance } from './supabase';
@@ -234,33 +235,16 @@ function orderHosts(instanceId: string, hosts: string[]): string[] {
 }
 
 async function verifyAgentTransport(transport: AgentTransport, agentSecret: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const req = https.request(
-      {
-        host: new URL(transport.baseUrl).hostname,
-        port: AGENT_PORT,
-        path: '/health',
-        method: 'GET',
-        headers: { 'x-agent-secret': agentSecret },
-        agent: transport.httpsAgent,
-        timeout: AGENT_PROBE_TIMEOUT_MS,
-      },
-      (res) => {
-        if (res.statusCode !== 200) {
-          res.resume();
-          reject(new Error(`Agent transport probe returned status ${res.statusCode}`));
-          return;
-        }
-
-        res.resume();
-        res.on('end', () => resolve());
-      }
-    );
-
-    req.on('timeout', () => req.destroy(new Error('Agent transport probe timed out')));
-    req.on('error', reject);
-    req.end();
+  const { status } = await axios.get(`${transport.baseUrl}/health`, {
+    headers: { 'x-agent-secret': agentSecret },
+    timeout: AGENT_PROBE_TIMEOUT_MS,
+    httpsAgent: transport.httpsAgent,
+    validateStatus: () => true,
   });
+
+  if (status !== 200) {
+    throw new Error(`Agent transport probe returned status ${status}`);
+  }
 }
 
 export async function resolveAgentTransport(
