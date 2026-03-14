@@ -531,7 +531,9 @@ function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs =
     config?.channels?.whatsapp?.enabled ||
     whatsappAuthPresent
   );
+  const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30_000);
   const whatsappConnected =
+    linkedRecently ||
     getWhatsAppLinkedFromGatewayHealth(gatewayHealth) ||
     isWhatsAppConnected(isRunning, logs);
 
