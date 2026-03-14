@@ -38,7 +38,7 @@ router.post('/portal', requireAuth, async (req: Request, res: Response) => {
     const subscription = await stripe.subscriptions.retrieve(instance.stripe_subscription_id!);
     const customerId = subscription.customer as string;
 
-    const returnUrl = `${process.env.APP_URL ?? 'https://oriclaw.com.br'}/dashboard`;
+    const returnUrl = `${process.env.APP_URL ?? 'https://conectaclaw.com'}/dashboard`;
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,

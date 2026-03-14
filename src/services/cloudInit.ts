@@ -21,13 +21,13 @@ const AGENT_FIREWALL_RULES = AGENT_PRIVATE_CIDRS
   .join('\n');
 
 /**
- * Cloud-init script for OriClaw droplets.
- * Installs OpenClaw + the OriClaw VPS agent side-by-side.
+ * Cloud-init script for ConectaClaw droplets.
+ * Installs OpenClaw + the ConectaClaw VPS agent side-by-side.
  *
  * __AGENT_SECRET__ is replaced at provision time with a random secret.
  */
 export const CLOUD_INIT_SCRIPT = `#!/bin/bash
-# OriClaw auto-provisioning script
+# ConectaClaw auto-provisioning script
 set -e
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
@@ -108,8 +108,31 @@ if [ -z "$OPENCLAW_BIN" ]; then
 fi
 
 if [ -f "$OPENCLAW_BIN" ]; then
-  ln -sf "$OPENCLAW_BIN" /usr/local/bin/openclaw
-  echo "[oriclaw] openclaw symlink created: $OPENCLAW_BIN"
+  cat > /usr/local/bin/openclaw << 'OPENCLAWEOF'
+#!/bin/bash
+set -e
+
+OPENCLAW_BIN=""
+for candidate in /home/openclaw/.npm-global/bin/openclaw /home/openclaw/.local/bin/openclaw; do
+  if [ -x "$candidate" ]; then
+    OPENCLAW_BIN="$candidate"
+    break
+  fi
+done
+
+if [ -z "$OPENCLAW_BIN" ]; then
+  echo "openclaw binary not found under /home/openclaw" >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  exec sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw "$OPENCLAW_BIN" "$@"
+fi
+
+exec env HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw "$OPENCLAW_BIN" "$@"
+OPENCLAWEOF
+  chmod 755 /usr/local/bin/openclaw
+  echo "[oriclaw] openclaw wrapper installed at /usr/local/bin/openclaw"
 else
   echo "[oriclaw] ERROR: openclaw binary not found after install" >&2
   exit 1
@@ -126,23 +149,19 @@ cat > /home/openclaw/.openclaw/.openclaw/openclaw.json << CONFIGEOF
     }
   },
   "channels": {
-    "whatsapp": {
-      "enabled": true
-    }
-  },
-  "plugins": {
-    "entries": {
-      "whatsapp": {
-        "enabled": true
-      }
+    "telegram": {
+      "enabled": false
+    },
+    "discord": {
+      "enabled": false
     }
   }
 }
 CONFIGEOF
 cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
 {
-  "model": "claude-sonnet-4-5",
-  "channel": "whatsapp",
+  "model": "claude-sonnet-4.6",
+  "channel": "telegram",
   "gateway": {
     "mode": "local",
     "bind": "lan",
@@ -152,15 +171,11 @@ cat > /home/openclaw/.openclaw/config.json << CONFIGEOF
     }
   },
   "channels": {
-    "whatsapp": {
-      "enabled": true
-    }
-  },
-  "plugins": {
-    "entries": {
-      "whatsapp": {
-        "enabled": true
-      }
+    "telegram": {
+      "enabled": false
+    },
+    "discord": {
+      "enabled": false
     }
   }
 }
@@ -745,7 +760,7 @@ app.get('/health/detailed', auth, (req, res) => {
 });
 
 // ── OpenClaw command helpers ─────────────────────────────────────────────────
-const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
+const OPENCLAW_CMD = '/usr/local/bin/openclaw';
 
 function openclawExec(args) {
   return \`sudo -u openclaw OPENCLAW_HOME=/home/openclaw/.openclaw HOME=/home/openclaw \${OPENCLAW_CMD} \${args}\`;
@@ -1172,7 +1187,7 @@ app.post('/configure', auth, (req, res) => {
       // OpenAI o-series
       'o4-mini', 'o3', 'o3-pro', 'o3-mini',
     ];
-    const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
+    const VALID_CHANNELS = ['telegram', 'discord'];
     // Accept OpenRouter models (format: provider/model-name) in credits mode,
     // plus the hardcoded BYOK models
     const MODEL_REGEX = /^[a-zA-Z0-9_-]+\\/[a-zA-Z0-9._-]+$/;
@@ -1626,12 +1641,12 @@ try {
     cert: fs.readFileSync(TLS_CERT),
   };
   https.createServer(tlsOptions, app).listen(PORT, () => {
-    console.log(\`🌀 OriClaw VPS Agent running on HTTPS port \${PORT}\`);
+    console.log(\`🌀 ConectaClaw VPS Agent running on HTTPS port \${PORT}\`);
   });
 } catch (tlsErr) {
   console.warn('[vps-agent] TLS cert not found, falling back to HTTP:', tlsErr.message);
   app.listen(PORT, () => {
-    console.log(\`🌀 OriClaw VPS Agent running on HTTP port \${PORT} (no TLS)\`);
+    console.log(\`🌀 ConectaClaw VPS Agent running on HTTP port \${PORT} (no TLS)\`);
   });
 }
 
@@ -1668,7 +1683,7 @@ Environment=OPENCLAW_NO_RESPAWN=1
 Environment=NODE_OPTIONS=--max-old-space-size=1280
 Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway run --allow-unconfigured --bind lan
+ExecStart=/usr/local/bin/openclaw gateway run --allow-unconfigured --bind lan
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=90
@@ -1718,7 +1733,7 @@ chmod g+s /home/openclaw/.openclaw
 cat > /etc/sudoers.d/oriclaw-agent << 'SUDOEOF'
 oriclaw-agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart openclaw, /usr/bin/systemctl start openclaw, /usr/bin/systemctl stop openclaw, /usr/bin/systemctl reset-failed openclaw, /usr/bin/systemctl is-active openclaw, /usr/bin/systemctl status openclaw
 Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
-oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /usr/local/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw
@@ -1755,7 +1770,7 @@ chown -R oriclaw-agent:oriclaw-agent /etc/oriclaw-agent 2>/dev/null || true
 # ── VPS Agent systemd service ─────────────────────────────────────────────────
 cat > /etc/systemd/system/oriclaw-agent.service << 'AGENTEOF'
 [Unit]
-Description=OriClaw VPS Agent
+Description=ConectaClaw VPS Agent
 After=network.target
 
 [Service]
@@ -1773,17 +1788,13 @@ StandardError=journal
 WantedBy=multi-user.target
 AGENTEOF
 
-# ── Pre-configure WhatsApp channel ────────────────────────────────────────────
-sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set channels.whatsapp.enabled true --strict-json 2>/dev/null || true
-echo "[oriclaw] WhatsApp channel enabled"
-
 # ── Nginx reverse proxy (HTTPS for OpenClaw Gateway UI) ──────────────────────
 apt-get install -y -o Dpkg::Options::="--force-confdef" nginx 2>/dev/null || true
 
 # Get public IP and set up sslip.io domain for Let's Encrypt
 PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}')
 SSLIP_DOMAIN=$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io
-sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set gateway.controlUi.allowedOrigins "[\"https://$SSLIP_DOMAIN\"]" --strict-json 2>/dev/null || true
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /usr/local/bin/openclaw config set gateway.controlUi.allowedOrigins "[\"https://$SSLIP_DOMAIN\"]" --strict-json 2>/dev/null || true
 
 # Get Let's Encrypt cert via certbot (non-interactive)
 apt-get install -y -o Dpkg::Options::="--force-confdef" certbot python3-certbot-nginx 2>/dev/null || true

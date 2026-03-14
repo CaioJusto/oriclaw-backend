@@ -1,5 +1,5 @@
 /**
- * Proxy routes — bridge between the OriClaw dashboard and VPS agents.
+ * Proxy routes — bridge between the ConectaClaw dashboard and VPS agents.
  *
  * Auth: expects `Authorization: Bearer <supabase_access_token>`.
  * We validate the token via Supabase admin client and verify that the
@@ -247,7 +247,7 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
       // Inject ORICLAW_OPENROUTER_KEY server-side when credits mode is requested
       const orKey = process.env.ORICLAW_OPENROUTER_KEY;
       if (!orKey) {
-        res.status(500).json({ error: 'OriClaw OpenRouter key not configured on server' });
+        res.status(500).json({ error: 'ConectaClaw OpenRouter key not configured on server' });
         return;
       }
       body.openrouter_key = orKey;

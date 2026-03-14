@@ -1,7 +1,7 @@
 {
-  "name": "oriclaw-backend",
+  "name": "conectaclaw-backend",
   "version": "1.0.0",
-  "description": "OriClaw backend provisioning API — auto-creates DigitalOcean Droplets for OpenClaw customers",
+  "description": "ConectaClaw backend provisioning API — auto-creates DigitalOcean Droplets for OpenClaw customers",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

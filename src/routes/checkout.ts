@@ -68,7 +68,7 @@ router.post('/session', async (req: Request, res: Response): Promise<void> => {
       line_items: [{
         price_data: {
           currency: 'brl',
-          product_data: { name: `OriClaw ${plan.charAt(0).toUpperCase() + plan.slice(1)}`, metadata: { plan } },
+          product_data: { name: `ConectaClaw ${plan.charAt(0).toUpperCase() + plan.slice(1)}`, metadata: { plan } },
           unit_amount: PLAN_PRICES[plan],
           recurring: { interval: 'month' },
         },

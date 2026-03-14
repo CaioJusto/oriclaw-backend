@@ -94,7 +94,7 @@ app.use(rateLimit({
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'oriclaw-backend', ts: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'conectaclaw-backend', ts: new Date().toISOString() });
 });
 
 // ── Auth resolver: runs before rate limiters to enable per-user keying ───────
@@ -268,11 +268,6 @@ function getActionableChannelFailures(watchdog: AgentWatchdogState | null | unde
   const channels = watchdog?.channels as Record<string, unknown> | null | undefined;
   const failed = new Set<string>();
 
-  const whatsapp = (channels?.whatsapp ?? {}) as Record<string, unknown>;
-  if (whatsapp.desired === true && whatsapp.connected !== true) {
-    failed.add('whatsapp');
-  }
-
   const telegram = (channels?.telegram ?? {}) as Record<string, unknown>;
   if (telegram.desired === true && telegram.connection_known === true && telegram.connected !== true) {
     failed.add('telegram');
@@ -286,7 +281,10 @@ function getActionableChannelFailures(watchdog: AgentWatchdogState | null | unde
   const degraded = Array.isArray(watchdog?.degraded_channels)
     ? watchdog!.degraded_channels.filter((value): value is string => typeof value === 'string' && value.length > 0)
     : [];
-  for (const channel of degraded) failed.add(channel);
+  for (const channel of degraded) {
+    if (channel === 'whatsapp') continue;
+    failed.add(channel);
+  }
 
   return Array.from(failed);
 }
@@ -645,7 +643,7 @@ setTimeout(monitorManagedInstances, 45_000);
 setInterval(monitorManagedInstances, 90_000);
 
 app.listen(PORT, () => {
-  console.log(`🌀 OriClaw backend running on port ${PORT}`);
+  console.log(`🌀 ConectaClaw backend running on port ${PORT}`);
 });
 
 export default app;

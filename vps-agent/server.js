@@ -711,7 +711,46 @@ function getWhatsAppLinkedFromGatewayHealth(gatewayHealth) {
   return !!wa && (wa.connected === true || wa.linked === true || wa.ready === true);
 }
 
-function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs = getJournalLogsSinceLastStart(100), gatewayHealth = null) {
+const OPENCLAW_WHATSAPP_LINK_CACHE_TTL_MS = 15_000;
+const openclawWhatsAppLinkCache = {
+  checkedAt: 0,
+  linked: false,
+};
+
+function invalidateWhatsAppLinkCache() {
+  openclawWhatsAppLinkCache.checkedAt = 0;
+  openclawWhatsAppLinkCache.linked = false;
+}
+
+function isWhatsAppLinkedViaRPC() {
+  const now = Date.now();
+  if ((now - openclawWhatsAppLinkCache.checkedAt) < OPENCLAW_WHATSAPP_LINK_CACHE_TTL_MS) {
+    return openclawWhatsAppLinkCache.linked;
+  }
+
+  let linked = false;
+  try {
+    const output = runProcessCombined('sudo', ['-u', 'openclaw', 'openclaw', 'doctor'], {
+      timeout: 6_000,
+      allowFailure: true,
+    });
+    linked = /- WhatsApp default: [^\n]*\blinked\b/i.test(output);
+  } catch (err) {
+    console.warn('[whatsapp] local link probe failed:', err.message);
+  }
+
+  openclawWhatsAppLinkCache.checkedAt = now;
+  openclawWhatsAppLinkCache.linked = linked;
+  return linked;
+}
+
+function buildChannelSnapshot(
+  config = readConfig(),
+  env = readEnvFile(),
+  logs = getJournalLogsSinceLastStart(100),
+  gatewayHealth = null,
+  options = {},
+) {
   const isRunning = getOpenclawStatus() === 'running';
   const whatsappAuthPresent = hasWhatsAppAuthState();
   const whatsappDesired = Boolean(
@@ -720,9 +759,11 @@ function buildChannelSnapshot(config = readConfig(), env = readEnvFile(), logs =
     whatsappAuthPresent
   );
   const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30_000);
+  const linkedViaOpenclaw = options.linkedFallback === true ? isWhatsAppLinkedViaRPC() : false;
   const whatsappConnected =
     linkedRecently ||
     getWhatsAppLinkedFromGatewayHealth(gatewayHealth) ||
+    linkedViaOpenclaw ||
     isWhatsAppConnected(isRunning, logs);
 
   const telegramDesired = Boolean(env.TELEGRAM_BOT_TOKEN || config?.channels?.telegram?.enabled);
@@ -1075,7 +1116,7 @@ app.get('/health/detailed', auth, (req, res) => {
       const config = readConfig();
       const env = readEnvFile();
       const logs = getJournalLogsSinceLastStart(120);
-      liveChannels = buildChannelSnapshot(config, env, logs, null);
+      liveChannels = buildChannelSnapshot(config, env, logs, null, { linkedFallback: true });
       liveDegradedChannels = getDegradedChannels(liveChannels);
     } catch (snapshotErr) {
       console.warn('[health/detailed] live channel snapshot failed:', snapshotErr.message);
@@ -1103,7 +1144,7 @@ app.get('/health/detailed', auth, (req, res) => {
 });
 
 // ── OpenClaw command helpers ─────────────────────────────────────────────────
-const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
+const OPENCLAW_CMD = '/usr/local/bin/openclaw';
 const OPENCLAW_SUDO_ARGS = [
   '-u', 'openclaw',
   'OPENCLAW_HOME=/home/openclaw/.openclaw',
@@ -1518,6 +1559,7 @@ let whatsappLoginStartedAt = 0;
 let whatsappRawQR = null;       // raw QR string from Baileys
 let whatsappQRTimestamp = 0;
 let whatsappLinkedAt = 0;
+let whatsappPairingAcceptedAt = 0;
 let whatsappForceFreshLogin = false;
 let whatsappAuthSyncTimer = null;
 let whatsappAuthSyncInFlight = false;
@@ -1525,6 +1567,7 @@ let whatsappAuthSyncedAt = 0;
 let whatsappPairingRestartAt = 0;
 const WHATSAPP_TEMP_AUTH_DIR = '/tmp/oriclaw-wa-auth';
 const WHATSAPP_QR_MAX_AGE_MS = 30_000;
+const WHATSAPP_PAIRING_SUCCESS_GRACE_MS = 10 * 60_000;
 
 let whatsappSetupDone = false;
 let whatsappSetupInFlight = false;
@@ -1576,6 +1619,7 @@ function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = 
       runProcess('sudo', ['-u', 'openclaw', 'cp', '-r', `${authDir}/.`, ocAuth], { allowFailure: true });
     }
     whatsappAuthSyncedAt = Date.now();
+    invalidateWhatsAppLinkCache();
     return true;
   } catch (err) {
     console.error('[whatsapp-login] auth sync error:', err.message);
@@ -1599,8 +1643,10 @@ function restartOpenclawAfterPairing(authDir = WHATSAPP_TEMP_AUTH_DIR, reason = 
       return;
     }
 
+    whatsappPairingAcceptedAt = Date.now();
     console.log('[whatsapp-login] restarting openclaw after pairing:', reason);
     invalidateGatewayHealthCache();
+    invalidateWhatsAppLinkCache();
     whatsappPairingRestartAt = Date.now();
     runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
       if (restartErr) console.error('[whatsapp-login] restart after pairing failed:', restartErr.message);
@@ -1739,6 +1785,7 @@ async function startWhatsAppLogin() {
         whatsappRawQR = null;
         whatsappForceFreshLogin = false;
         whatsappLinkedAt = Date.now();
+        whatsappPairingAcceptedAt = whatsappLinkedAt;
         watchdogState.consecutive_channel_failures = 0;
         try {
           await Promise.resolve(saveCreds());
@@ -1755,10 +1802,18 @@ async function startWhatsAppLogin() {
         console.log('[whatsapp-login] connection closed, code:', code, 'error:', err?.message || err);
         if (code === 401) {
           whatsappForceFreshLogin = true;
+          whatsappPairingAcceptedAt = 0;
+          invalidateWhatsAppLinkCache();
         }
         if (code === 515) {
+          if (whatsappAuthSyncedAt && (Date.now() - whatsappAuthSyncedAt) < 15_000) {
+            whatsappLinkedAt = Date.now();
+            whatsappPairingAcceptedAt = whatsappLinkedAt;
+          }
           restartOpenclawAfterPairing(authDir, 'stream_error_515');
         } else if (code === 428 && whatsappAuthSyncedAt && (Date.now() - whatsappAuthSyncedAt) < 15_000) {
+          whatsappLinkedAt = Date.now();
+          whatsappPairingAcceptedAt = whatsappLinkedAt;
           restartOpenclawAfterPairing(authDir, 'connection_terminated_after_auth_sync');
         }
         cleanupWhatsAppSocket();
@@ -1797,10 +1852,12 @@ function resetWhatsAppRelinkState() {
   whatsappRawQR = null;
   whatsappQRTimestamp = 0;
   whatsappLinkedAt = 0;
+  whatsappPairingAcceptedAt = 0;
   whatsappForceFreshLogin = true;
   whatsappAuthSyncInFlight = false;
   whatsappAuthSyncedAt = 0;
   whatsappPairingRestartAt = 0;
+  invalidateWhatsAppLinkCache();
   try {
     fs.rmSync(WHATSAPP_TEMP_AUTH_DIR, { recursive: true, force: true });
   } catch { /* ignore */ }
@@ -1841,6 +1898,7 @@ app.get('/qr', auth, async (req, res) => {
   const rawQRAge = whatsappQRTimestamp ? Date.now() - whatsappQRTimestamp : Infinity;
   const hasFreshRawQR = Boolean(whatsappRawQR && rawQRAge < WHATSAPP_QR_MAX_AGE_MS);
   const hadStaleRawQR = Boolean(whatsappRawQR && rawQRAge >= WHATSAPP_QR_MAX_AGE_MS);
+  const pairingAcceptedRecently = isRecentTimestamp(whatsappPairingAcceptedAt, WHATSAPP_PAIRING_SUCCESS_GRACE_MS);
 
   if (hasFreshRawQR) {
     try {
@@ -1865,7 +1923,7 @@ app.get('/qr', auth, async (req, res) => {
 
   const logs = getJournalLogsSinceLastStart(200);
   const linkedRecently = whatsappLinkedAt && (Date.now() - whatsappLinkedAt < 30_000);
-  if (linkedRecently || isWhatsAppConnected(isRunning, logs)) {
+  if (pairingAcceptedRecently || linkedRecently || isWhatsAppConnected(isRunning, logs) || isWhatsAppLinkedViaRPC()) {
     if (whatsappLoginProcess && !whatsappLoginProcess.killed) {
       cleanupWhatsAppSocket();
     }
@@ -1944,7 +2002,7 @@ app.post('/configure', auth, (req, res) => {
       // OpenAI o-series
       'o4-mini', 'o3', 'o3-pro', 'o3-mini',
     ];
-    const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
+    const VALID_CHANNELS = ['telegram', 'discord'];
     // Accept OpenRouter models (format: provider/model-name) in credits mode,
     // plus the hardcoded BYOK models
     const MODEL_REGEX = /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/;
@@ -2162,7 +2220,7 @@ app.get('/channels', auth, (req, res) => {
     const config = readConfig();
     const env = readEnvFile();
     const logs = getJournalLogsSinceLastStart(100);
-    const snapshot = buildChannelSnapshot(config, env, logs, null);
+    const snapshot = buildChannelSnapshot(config, env, logs, null, { linkedFallback: true });
 
     res.json({
       whatsapp: {
@@ -2447,11 +2505,11 @@ try {
     cert: require('fs').readFileSync(TLS_CERT),
   };
   https.createServer(tls, app).listen(PORT, () => {
-    console.log(`🔒 OriClaw VPS Agent running on HTTPS port ${PORT}`);
+    console.log(`🔒 ConectaClaw VPS Agent running on HTTPS port ${PORT}`);
   });
 } catch (err) {
   console.warn('⚠️  TLS certs not found, falling back to HTTP:', err.message);
   app.listen(PORT, () => {
-    console.log(`🌀 OriClaw VPS Agent running on HTTP port ${PORT} (no TLS)`);
+    console.log(`🌀 ConectaClaw VPS Agent running on HTTP port ${PORT} (no TLS)`);
   });
 }

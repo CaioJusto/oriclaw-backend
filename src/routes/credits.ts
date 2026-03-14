@@ -1,5 +1,5 @@
 /**
- * Credits routes — manage OriClaw credit balances for pay-as-you-go customers.
+ * Credits routes — manage ConectaClaw credit balances for pay-as-you-go customers.
  *
  * Credits are stored in `oriclaw_credits` (customer_id, balance_brl, updated_at).
  * Purchases are handled via Stripe Hosted Checkout; the webhook handler adds
@@ -64,7 +64,7 @@ router.post('/purchase', async (req: Request, res: Response): Promise<void> => {
         price_data: {
           currency: 'brl',
           product_data: {
-            name: `OriClaw Créditos R$${amount_brl}`,
+            name: `ConectaClaw Créditos R$${amount_brl}`,
             description: `≈${VALID_AMOUNTS[amount_brl].toLocaleString()} mensagens`,
           },
           unit_amount: amount_brl * 100, // centavos

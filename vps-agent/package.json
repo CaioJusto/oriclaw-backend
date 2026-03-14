@@ -1,7 +1,7 @@
 {
   "name": "oriclaw-vps-agent",
   "version": "1.0.0",
-  "description": "OriClaw VPS agent — bridges dashboard to OpenClaw on the droplet",
+  "description": "ConectaClaw VPS agent — bridges dashboard to OpenClaw on the droplet",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

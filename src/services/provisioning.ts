@@ -176,6 +176,36 @@ mkdir -p /home/openclaw/.openclaw /home/openclaw/.openclaw/.openclaw
 mkdir -p /var/tmp/openclaw-compile-cache
 chown -R openclaw:openclaw /home/openclaw /var/tmp/openclaw-compile-cache
 
+if [ ! -x /home/openclaw/.npm-global/bin/openclaw ] && [ ! -x /home/openclaw/.local/bin/openclaw ]; then
+  echo "[oriclaw] ERROR: openclaw binary not found under /home/openclaw" >&2
+  exit 1
+fi
+
+cat > /usr/local/bin/openclaw << 'OPENCLAWEOF'
+#!/bin/bash
+set -e
+
+OPENCLAW_BIN=""
+for candidate in /home/openclaw/.npm-global/bin/openclaw /home/openclaw/.local/bin/openclaw; do
+  if [ -x "$candidate" ]; then
+    OPENCLAW_BIN="$candidate"
+    break
+  fi
+done
+
+if [ -z "$OPENCLAW_BIN" ]; then
+  echo "openclaw binary not found under /home/openclaw" >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  exec sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw "$OPENCLAW_BIN" "$@"
+fi
+
+exec env HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw "$OPENCLAW_BIN" "$@"
+OPENCLAWEOF
+chmod 755 /usr/local/bin/openclaw
+
 useradd -r -s /usr/sbin/nologin oriclaw-agent 2>/dev/null || true
 usermod -aG systemd-journal oriclaw-agent 2>/dev/null || true
 usermod -aG openclaw oriclaw-agent 2>/dev/null || true
@@ -226,7 +256,7 @@ Environment=OPENCLAW_NO_RESPAWN=1
 Environment=NODE_OPTIONS=--max-old-space-size=1280
 Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
 EnvironmentFile=-/home/openclaw/.openclaw/.env
-ExecStart=/home/openclaw/.npm-global/bin/openclaw gateway run --allow-unconfigured --bind lan
+ExecStart=/usr/local/bin/openclaw gateway run --allow-unconfigured --bind lan
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=90
@@ -244,7 +274,7 @@ chmod 600 /etc/systemd/system/openclaw.service.d/openrouter.conf
 cat > /etc/sudoers.d/oriclaw-agent << 'SUDOEOF'
 oriclaw-agent ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart openclaw, /usr/bin/systemctl start openclaw, /usr/bin/systemctl stop openclaw, /usr/bin/systemctl reset-failed openclaw, /usr/bin/systemctl is-active openclaw, /usr/bin/systemctl status openclaw
 Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
-oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
+oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /usr/local/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw
@@ -270,7 +300,7 @@ chmod 440 /etc/sudoers.d/oriclaw-agent
 
 cat > /etc/systemd/system/oriclaw-agent.service << 'AGENTEOF'
 [Unit]
-Description=OriClaw VPS Agent
+Description=ConectaClaw VPS Agent
 After=network.target
 
 [Service]
@@ -330,9 +360,36 @@ for config_path, native_only in path_specs:
         cfg['gateway'].setdefault('controlUi', {})
         cfg['gateway']['controlUi']['allowedOrigins'] = allowed_origins
 
+    channels = cfg.setdefault('channels', {})
+    for channel_name in ('telegram', 'discord'):
+        channel_cfg = channels.setdefault(channel_name, {})
+        if isinstance(channel_cfg, dict):
+            channel_cfg.setdefault('enabled', False)
+        else:
+            channels[channel_name] = {'enabled': False}
+
+    whatsapp_cfg = channels.get('whatsapp')
+    if isinstance(whatsapp_cfg, dict):
+        whatsapp_cfg['enabled'] = False
+    elif whatsapp_cfg is not None:
+        channels['whatsapp'] = {'enabled': False}
+
+    plugins = cfg.setdefault('plugins', {})
+    entries = plugins.setdefault('entries', {})
+    whatsapp_plugin = entries.get('whatsapp')
+    if isinstance(whatsapp_plugin, dict):
+        whatsapp_plugin['enabled'] = False
+    elif whatsapp_plugin is not None:
+        entries['whatsapp'] = {'enabled': False}
+
     if native_only:
         for legacy_key in ('model', 'channel', 'ai_mode', 'assistant_name', 'system_prompt', 'language', 'timezone', 'discord_guild_id'):
             cfg.pop(legacy_key, None)
+    else:
+        if cfg.get('channel') not in ('telegram', 'discord'):
+            cfg['channel'] = 'telegram'
+        if cfg.get('model') == 'claude-sonnet-4-5':
+            cfg['model'] = 'claude-sonnet-4.6'
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(cfg, indent=2))

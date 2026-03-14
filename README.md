@@ -1,10 +1,10 @@
-# OriClaw Backend
+# ConectaClaw Backend
 
-Backend da plataforma **OriClaw** — SaaS que permite contratar um agente de IA com VPS dedicada em poucos cliques, voltado para o mercado brasileiro.
+Backend da plataforma **ConectaClaw** — SaaS que permite contratar um agente de IA com VPS dedicada em poucos cliques, voltado para o mercado brasileiro.
 
-## O que é o OriClaw?
+## O que é o ConectaClaw?
 
-OriClaw é uma plataforma que provisiona automaticamente um agente de IA (baseado no OpenClaw) em uma VPS DigitalOcean exclusiva por cliente, com suporte a múltiplos canais (WhatsApp, Telegram, Discord) e múltiplos modos de IA (BYOK, Créditos OriClaw, ChatGPT Plus via OAuth).
+ConectaClaw é uma plataforma que provisiona automaticamente um agente de IA (baseado no OpenClaw) em uma VPS DigitalOcean exclusiva por cliente, com suporte atual a Telegram e Discord, WhatsApp em breve, e múltiplos modos de IA (BYOK, Créditos ConectaClaw, ChatGPT Plus via OAuth).
 
 ## Arquitetura
 
@@ -16,7 +16,7 @@ OriClaw é uma plataforma que provisiona automaticamente um agente de IA (basead
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │               Frontend — Next.js 14 (Vercel)                     │
-│           oriclaw.com.br  |  Supabase Auth                       │
+│           conectaclaw.com  |  Supabase Auth                       │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ REST API
                            ▼
@@ -46,7 +46,7 @@ OriClaw é uma plataforma que provisiona automaticamente um agente de IA (basead
 - Conta Supabase com projeto configurado
 - Conta Stripe com webhooks configurados
 - Token da API DigitalOcean
-- (Opcional) Conta OpenRouter para modo créditos OriClaw
+- (Opcional) Conta OpenRouter para modo créditos ConectaClaw
 - (Opcional) App OAuth OpenAI para modo ChatGPT Plus
 
 ## Variáveis de Ambiente
@@ -81,12 +81,12 @@ DIGITALOCEAN_TOKEN=
 # ATENÇÃO: Não alterar em produção sem migrar os dados criptografados existentes
 ENCRYPTION_KEY=
 
-# ── OriClaw / OpenRouter ──────────────────────────────────────────
-# Chave OpenRouter usada quando o cliente usa Créditos OriClaw (modo gerenciado)
+# ── ConectaClaw / OpenRouter ──────────────────────────────────────────
+# Chave OpenRouter usada quando o cliente usa Créditos ConectaClaw (modo gerenciado)
 ORICLAW_OPENROUTER_KEY=
 
 # ── CORS ──────────────────────────────────────────────────────────
-# URL do frontend em produção (ex: https://oriclaw.com.br)
+# URL do frontend em produção (ex: https://conectaclaw.com)
 # Usado para restringir CORS nas rotas da API
 CORS_ORIGIN=
 
@@ -118,9 +118,9 @@ npm run dev
 
 O servidor sobe em `http://localhost:3001` por padrão.
 
-## Automação OpenClaw
+## Automação ConectaClaw
 
-O `openclaw` roda na VPS do cliente, não no backend local. Para reduzir operação manual, o projeto agora inclui automações em [`scripts/openclaw-ops.mjs`](/Users/caiojusto/Documents/oriclaw/oriclaw-backend/scripts/openclaw-ops.mjs) que combinam chamadas do `vps-agent` com execução remota via SSH.
+O `openclaw` roda na VPS do cliente, não no backend local. Para reduzir operação manual, o projeto agora inclui automações em `scripts/openclaw-ops.mjs` que combinam chamadas do `vps-agent` com execução remota via SSH.
 
 Comandos estudados e incorporados ao fluxo:
 
@@ -173,7 +173,7 @@ Uso recomendado:
 
 4. Para forçar um deploy manual:
    ```bash
-   railway up --service oriclaw-backend --detach
+   railway up --service conectaclaw-backend --detach
    ```
 
 5. Configure o webhook do Stripe apontando para:
@@ -184,7 +184,7 @@ Uso recomendado:
 ## Estrutura de Pastas
 
 ```
-oriclaw-backend/
+conectaclaw-backend/
 ├── src/
 │   ├── routes/          # Rotas Express (instances, billing, channels, ai, auth)
 │   ├── services/        # Lógica de negócio
@@ -267,7 +267,7 @@ CREATE POLICY "owner_access" ON oriclaw_instances
 ```
 
 #### `oriclaw_credits`
-Saldo de créditos para o modo gerenciado (OriClaw OpenRouter).
+Saldo de créditos para o modo gerenciado (ConectaClaw OpenRouter).
 
 ```sql
 CREATE TABLE oriclaw_credits (
