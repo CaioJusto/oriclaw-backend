@@ -1178,6 +1178,7 @@ let whatsappLoginStartedAt = 0;
 let whatsappRawQR = null;       // raw QR string from Baileys
 let whatsappQRTimestamp = 0;
 let whatsappLinkedAt = 0;
+let whatsappForceFreshLogin = false;
 const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 
 let whatsappSetupDone = false;
@@ -1254,9 +1255,14 @@ async function startWhatsAppLogin() {
   const authDir = '/tmp/oriclaw-wa-auth';
   try {
     fs.mkdirSync(authDir, { recursive: true });
-    // Copy existing OpenClaw auth if available (so we don't re-link)
-    for (const openclawAuth of getWhatsAppAuthDirs()) {
-      execSync(`cp -rn '${openclawAuth}'/* '${authDir}/' 2>/dev/null || true`, { timeout: 5000 });
+    execSync(`find '${authDir}' -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true`, { timeout: 5000 });
+    if (!whatsappForceFreshLogin) {
+      // Copy existing OpenClaw auth if available (so we don't re-link)
+      for (const openclawAuth of getWhatsAppAuthDirs()) {
+        execSync(`cp -rn '${openclawAuth}'/* '${authDir}/' 2>/dev/null || true`, { timeout: 5000 });
+      }
+    } else {
+      console.log('[whatsapp] skipping stale auth seed after previous 401');
     }
   } catch { /* ignore */ }
 
@@ -1311,6 +1317,7 @@ async function startWhatsAppLogin() {
       if (connection === 'open') {
         console.log('[whatsapp-login] connected!');
         whatsappRawQR = null;
+        whatsappForceFreshLogin = false;
         whatsappLinkedAt = Date.now();
         for (const ocAuth of getWhatsAppAuthDirs()) {
           try {
@@ -1331,6 +1338,9 @@ async function startWhatsAppLogin() {
         const err = lastDisconnect?.error;
         const code = err?.output?.statusCode;
         console.log('[whatsapp-login] connection closed, code:', code, 'error:', err?.message || err);
+        if (code === 401) {
+          whatsappForceFreshLogin = true;
+        }
         cleanupWhatsAppSocket();
       }
     });
