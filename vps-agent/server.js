@@ -1181,16 +1181,25 @@ let whatsappLinkedAt = 0;
 const WHATSAPP_QR_MAX_AGE_MS = 30_000;
 
 let whatsappSetupDone = false;
+let whatsappSetupInFlight = false;
 
 function ensureWhatsAppSetup() {
-  if (whatsappSetupDone) return;
-  try {
-    setOpenclawJsonValue('channels.whatsapp.enabled', true);
+  if (whatsappSetupDone || whatsappSetupInFlight) return;
+  whatsappSetupInFlight = true;
+
+  runOpenclawAsync(['config', 'set', 'channels.whatsapp.enabled', 'true', '--strict-json'], (err) => {
+    whatsappSetupInFlight = false;
+    if (err) {
+      console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
+      return;
+    }
+
     whatsappSetupDone = true;
     console.log('[whatsapp] ensureWhatsAppSetup applied');
-  } catch (err) {
-    console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
-  }
+  }, {
+    allowFailure: true,
+    timeout: 20_000,
+  });
 }
 
 /**
