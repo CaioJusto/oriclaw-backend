@@ -277,11 +277,28 @@ function getOpenClawConfigPath() {
   return OPENCLAW_CONFIG_PATHS.find((cfgPath) => fs.existsSync(cfgPath)) || OPENCLAW_CONFIG_PATHS[0];
 }
 
+function readConfigPath(configPath) {
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    try {
+      const raw = runProcess('sudo', ['-u', 'openclaw', '/usr/bin/cat', configPath], { allowFailure: true }).trim();
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 /**
  * Read the active OpenClaw config.
  */
 function readConfig() {
-  try { return JSON.parse(fs.readFileSync(getOpenClawConfigPath(), 'utf8')); } catch { return {}; }
+  for (const configPath of OPENCLAW_CONFIG_PATHS) {
+    const config = readConfigPath(configPath);
+    if (config) return config;
+  }
+  return {};
 }
 
 /**
@@ -959,10 +976,17 @@ function invalidateGatewayHealthCache() {
 function getGatewayUrlCandidates() {
   const { port, token, allowedOrigins } = readGatewayConnectionConfig();
   const urls = [];
+  const loopbackUrl = `ws://127.0.0.1:${port}`;
   const addUrl = (value) => {
     if (typeof value !== 'string' || !value || urls.includes(value)) return;
     urls.push(value);
   };
+
+  // Internal agent calls must prefer the local gateway socket instead of the
+  // public sslip/nginx path. Using the public URL here can hang on hairpin or
+  // firewall paths and makes local health checks depend on external routing.
+  addUrl(loopbackUrl);
+  addUrl(`ws://${getGatewayHost()}:${port}`);
 
   if (lastSuccessfulGatewayUrl && (Date.now() - lastSuccessfulGatewayUrlAt) < GATEWAY_URL_CACHE_TTL_MS) {
     addUrl(lastSuccessfulGatewayUrl);
@@ -974,9 +998,6 @@ function getGatewayUrlCandidates() {
   for (const origin of allowedOrigins) {
     addUrl(toWebSocketOrigin(origin));
   }
-
-  addUrl(`ws://127.0.0.1:${port}`);
-  addUrl(`ws://${getGatewayHost()}:${port}`);
 
   const interfaces = os.networkInterfaces();
   const privateIps = [];
@@ -999,7 +1020,7 @@ function getGatewayUrlCandidates() {
 
   for (const ip of [...new Set(publicIps)]) addUrl(`ws://${ip}:${port}`);
 
-  const args = ['--url', urls[0] || `ws://127.0.0.1:${port}`];
+  const args = ['--url', loopbackUrl];
   if (token) {
     args.push('--token', token);
   }
