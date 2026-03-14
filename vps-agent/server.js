@@ -495,7 +495,6 @@ function writeConfig(updates) {
   for (const configPath of getNativeConfigPathsForWrite()) {
     writeOwnedJsonFile(configPath, nativeConfig, { mode: '600' });
   }
-  try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
   return config;
 }
 
