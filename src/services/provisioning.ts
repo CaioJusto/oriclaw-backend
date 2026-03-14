@@ -14,6 +14,12 @@ import { CLOUD_INIT_SCRIPT } from './cloudInit';
 import { ProvisionRequest, DODroplet, DODropletResponse } from '../types';
 import { encrypt, decrypt } from './crypto';
 import { AGENT_PRIVATE_CIDR } from './agentNetwork';
+import {
+  buildPinnedAgentHttpsAgent,
+  createProvisionedAgentTlsMaterial,
+  type AgentTlsMaterial,
+} from './agentTls';
+import { VPS_AGENT_PACKAGE_JSON_GZIP_B64, VPS_AGENT_SERVER_JS_GZIP_B64 } from './vpsAgentAssets';
 
 // ── DO API rate-limit guard ───────────────────────────────────────────────────
 // Limits simultaneous droplet creations to avoid hitting DigitalOcean's rate
@@ -41,6 +47,7 @@ export async function provisionInstance(
 
   // Generate random agent secret for this instance
   const agentSecret = crypto.randomBytes(32).toString('hex');
+  const agentTls = createProvisionedAgentTlsMaterial();
 
   let instance: Awaited<ReturnType<typeof createInstance>>;
   try {
@@ -54,7 +61,11 @@ export async function provisionInstance(
       status: 'provisioning',
       stripe_subscription_id: req.stripe_subscription_id ?? null,
       api_key_encrypted: req.api_key_anthropic ? encrypt(req.api_key_anthropic) : null,
-      metadata: { agent_secret: encrypt(agentSecret) },
+      metadata: {
+        agent_secret: encrypt(agentSecret),
+        agent_tls_cert_pem: agentTls.certPem,
+        agent_tls_fingerprint256: agentTls.fingerprint256,
+      },
     });
   } catch (dbErr) {
     // If the DB insert fails, release the reserved slot before re-throwing
@@ -63,7 +74,7 @@ export async function provisionInstance(
   }
 
   // Create DO Droplet (non-blocking — status will update async)
-  createDropletAsync(instance.id, req.customer_id, agentSecret, req.stripe_subscription_id ?? null)
+  createDropletAsync(instance.id, req.customer_id, agentSecret, agentTls, req.stripe_subscription_id ?? null)
     .catch(async (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[provision] Droplet creation failed for ${instance.id}:`, msg);
@@ -74,7 +85,13 @@ export async function provisionInstance(
       // Bug fix #2: preserve agent_secret and add suspended_reason
       updateInstance(instance.id, {
         status: 'suspended',
-        metadata: { agent_secret: encrypt(agentSecret), error: msg, suspended_reason: 'provisioning_failed' },
+        metadata: {
+          agent_secret: encrypt(agentSecret),
+          agent_tls_cert_pem: agentTls.certPem,
+          agent_tls_fingerprint256: agentTls.fingerprint256,
+          error: msg,
+          suspended_reason: 'provisioning_failed',
+        },
       }).catch(console.error);
     })
     .finally(() => {
@@ -82,6 +99,16 @@ export async function provisionInstance(
     });
 
   return { instance_id: instance.id, status: 'provisioning' };
+}
+
+function wrapCloudInitScript(rawScript: string): string {
+  const compressed = zlib.gzipSync(Buffer.from(rawScript, 'utf8'));
+  const b64 = compressed.toString('base64');
+  return `#!/bin/bash
+echo '${b64}' | base64 -d | gunzip > /tmp/oriclaw-init.sh
+chmod +x /tmp/oriclaw-init.sh
+/tmp/oriclaw-init.sh
+`;
 }
 
 const PLAN_SIZES: Record<string, string> = {
@@ -92,15 +119,6 @@ const PLAN_SIZES: Record<string, string> = {
 
 const DEFAULT_DROPLET_REGION = process.env.ORICLAW_DROPLET_REGION || 'nyc1';
 const DEFAULT_VPC_ID = process.env.ORICLAW_VPC_ID || '';
-const SNAPSHOT_BOOTSTRAP_REPO = process.env.ORICLAW_BACKEND_REPO || 'CaioJusto/oriclaw-backend';
-const SNAPSHOT_BOOTSTRAP_REF =
-  process.env.ORICLAW_BOOTSTRAP_REF ||
-  process.env.SOURCE_COMMIT ||
-  process.env.GITHUB_SHA ||
-  process.env.COMMIT_SHA ||
-  'main';
-const SNAPSHOT_AGENT_BASE_URL =
-  `https://raw.githubusercontent.com/${SNAPSHOT_BOOTSTRAP_REPO}/${SNAPSHOT_BOOTSTRAP_REF}/vps-agent`;
 
 // If set, provision from a pre-built snapshot instead of cloud-init.
 // This reduces provisioning time from ~7 min to ~1 min.
@@ -111,13 +129,16 @@ const SNAPSHOT_ID = process.env.ORICLAW_SNAPSHOT_ID || '';
  * Refreshes the agent/runtime configuration at boot so golden snapshots do not
  * need to be rebuilt for every code deploy.
  */
-function buildSnapshotCloudInit(agentSecret: string, gatewayToken: string): string {
+function buildSnapshotCloudInit(
+  agentSecret: string,
+  gatewayToken: string,
+  agentTls: AgentTlsMaterial
+): string {
   return `#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export AGENT_PRIVATE_CIDR='${AGENT_PRIVATE_CIDR}'
-export SNAPSHOT_AGENT_BASE_URL='${SNAPSHOT_AGENT_BASE_URL}'
 export GATEWAY_TOKEN='${gatewayToken}'
 
 # Stop services before overwriting secrets
@@ -135,7 +156,7 @@ if [ -n "$PUBLIC_IP" ]; then
 fi
 
 apt-get update -y
-apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git ufw nginx openssl python3 python3-pip build-essential || true
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl wget git ufw nginx python3 python3-pip build-essential || true
 
 useradd -m -s /bin/bash openclaw 2>/dev/null || true
 mkdir -p /home/openclaw/.openclaw /home/openclaw/.openclaw/.openclaw
@@ -155,20 +176,12 @@ chmod 600 /etc/oriclaw-agent.env
 chown oriclaw-agent:oriclaw-agent /etc/oriclaw-agent.env
 
 mkdir -p /opt/oriclaw-agent
-for attempt in 1 2 3; do
-  curl -fsSL "$SNAPSHOT_AGENT_BASE_URL/package.json" -o /opt/oriclaw-agent/package.json && break
-  echo "[oriclaw] package.json download attempt $attempt failed, retrying in 5s..."
-  sleep 5
-done
-for attempt in 1 2 3; do
-  curl -fsSL "$SNAPSHOT_AGENT_BASE_URL/server.js" -o /opt/oriclaw-agent/server.js && break
-  echo "[oriclaw] server.js download attempt $attempt failed, retrying in 5s..."
-  sleep 5
-done
-if [ ! -s /opt/oriclaw-agent/server.js ]; then
-  echo "[oriclaw] ERROR: failed to refresh vps-agent from $SNAPSHOT_AGENT_BASE_URL" >&2
-  exit 1
-fi
+cat <<'PKGB64' | base64 -d | gunzip > /opt/oriclaw-agent/package.json
+${VPS_AGENT_PACKAGE_JSON_GZIP_B64}
+PKGB64
+cat <<'SERVERB64' | base64 -d | gunzip > /opt/oriclaw-agent/server.js
+${VPS_AGENT_SERVER_JS_GZIP_B64}
+SERVERB64
 chown -R oriclaw-agent:oriclaw-agent /opt/oriclaw-agent
 
 cd /opt/oriclaw-agent
@@ -179,11 +192,8 @@ for attempt in 1 2 3; do
 done
 
 mkdir -p /etc/oriclaw-agent/tls
-if [ ! -f /etc/oriclaw-agent/tls/key.pem ] || [ ! -f /etc/oriclaw-agent/tls/cert.pem ]; then
-  openssl req -x509 -newkey rsa:2048 -keyout /etc/oriclaw-agent/tls/key.pem \\
-    -out /etc/oriclaw-agent/tls/cert.pem -days 3650 -nodes \\
-    -subj "/CN=oriclaw-vps-agent" 2>/dev/null
-fi
+echo '${agentTls.certPemB64}' | base64 -d > /etc/oriclaw-agent/tls/cert.pem
+echo '${agentTls.keyPemB64}' | base64 -d > /etc/oriclaw-agent/tls/key.pem
 chmod 600 /etc/oriclaw-agent/tls/key.pem
 chmod 644 /etc/oriclaw-agent/tls/cert.pem
 
@@ -267,8 +277,6 @@ sslip_domain = os.environ.get('SSLIP_DOMAIN', '')
 allowed_origins = []
 if sslip_domain:
     allowed_origins.append(f"https://{sslip_domain}")
-if public_ip:
-    allowed_origins.append(f"http://{public_ip}:18789")
 
 paths = [
     Path('/home/openclaw/.openclaw/.openclaw/openclaw.json'),
@@ -290,9 +298,8 @@ for config_path in paths:
     cfg['gateway'].setdefault('auth', {})
     cfg['gateway']['auth']['mode'] = 'token'
     cfg['gateway']['auth']['token'] = gateway_token
-    cfg['gateway'].setdefault('controlUi', {})
-    cfg['gateway']['controlUi']['dangerouslyAllowHostHeaderOriginFallback'] = True
     if allowed_origins:
+        cfg['gateway'].setdefault('controlUi', {})
         cfg['gateway']['controlUi']['allowedOrigins'] = allowed_origins
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,13 +320,29 @@ ufw allow 443/tcp
 ufw --force enable
 
 if [ -n "$SSLIP_DOMAIN" ]; then
+  apt-get install -y -o Dpkg::Options::="--force-confdef" certbot python3-certbot-nginx 2>/dev/null || true
+  systemctl start nginx 2>/dev/null || true
+  certbot certonly --nginx -d "$SSLIP_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email 2>/dev/null || true
+
+  if [ -f "/etc/letsencrypt/live/$SSLIP_DOMAIN/fullchain.pem" ]; then
+    SSL_CERT="/etc/letsencrypt/live/$SSLIP_DOMAIN/fullchain.pem"
+    SSL_KEY="/etc/letsencrypt/live/$SSLIP_DOMAIN/privkey.pem"
+    SSL_EXTRA="include /etc/letsencrypt/options-ssl-nginx.conf;
+        ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+  else
+    SSL_CERT="/etc/oriclaw-agent/tls/cert.pem"
+    SSL_KEY="/etc/oriclaw-agent/tls/key.pem"
+    SSL_EXTRA=""
+  fi
+
   cat > /etc/nginx/sites-available/openclaw-gateway << NGXEOF
 server {
     listen 443 ssl;
     server_name $SSLIP_DOMAIN;
 
-    ssl_certificate /etc/oriclaw-agent/tls/cert.pem;
-    ssl_certificate_key /etc/oriclaw-agent/tls/key.pem;
+    ssl_certificate $SSL_CERT;
+    ssl_certificate_key $SSL_KEY;
+    $SSL_EXTRA
 
     location / {
         proxy_pass http://127.0.0.1:18789;
@@ -330,6 +353,8 @@ server {
         proxy_set_header X-Real-IP \\\$remote_addr;
         proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \\\$scheme;
+        proxy_read_timeout 86400;
+        proxy_send_timeout 86400;
     }
 }
 NGXEOF
@@ -384,6 +409,7 @@ async function createDropletAsync(
   instanceId: string,
   customerId: string,
   agentSecret: string,
+  agentTls: AgentTlsMaterial,
   stripeSubId: string | null
 ): Promise<void> {
   // Generate gateway token for OpenClaw UI auth
@@ -399,21 +425,17 @@ async function createDropletAsync(
     // ── Snapshot-based provisioning (~1 min) ──
     // Uses a pre-built golden image plus a patch script that refreshes runtime files.
     console.log(`[provision] Using snapshot ${SNAPSHOT_ID} for instance ${instanceId}`);
-    const cloudInit = buildSnapshotCloudInit(agentSecret, gatewayToken);
+    const cloudInit = wrapCloudInitScript(buildSnapshotCloudInit(agentSecret, gatewayToken, agentTls));
     droplet = await createDropletWithInit(customerId, cloudInit, planSize, SNAPSHOT_ID);
   } else {
     // ── Full cloud-init provisioning (~7 min) ──
     // Compresses the full script with gzip+base64 to stay under DO's 16KB user_data limit.
     const rawScript = CLOUD_INIT_SCRIPT
       .replace(/__AGENT_SECRET__/g, agentSecret)
-      .replace(/__GATEWAY_TOKEN__/g, gatewayToken);
-    const compressed = zlib.gzipSync(Buffer.from(rawScript, 'utf8'));
-    const b64 = compressed.toString('base64');
-    const cloudInit = `#!/bin/bash
-echo '${b64}' | base64 -d | gunzip > /tmp/oriclaw-init.sh
-chmod +x /tmp/oriclaw-init.sh
-/tmp/oriclaw-init.sh
-`;
+      .replace(/__GATEWAY_TOKEN__/g, gatewayToken)
+      .replace(/__AGENT_TLS_CERT_PEM_B64__/g, agentTls.certPemB64)
+      .replace(/__AGENT_TLS_KEY_PEM_B64__/g, agentTls.keyPemB64);
+    const cloudInit = wrapCloudInitScript(rawScript);
     droplet = await createDropletWithInit(customerId, cloudInit, planSize);
   }
   console.log(`[provision] Droplet created: ${droplet.id} (status=${droplet.status}) for instance ${instanceId}`);
@@ -471,7 +493,7 @@ chmod +x /tmp/oriclaw-init.sh
   // Snapshot deploys are much faster (~1 min), so use a shorter timeout.
   const agentTimeoutMs = SNAPSHOT_ID ? 5 * 60 * 1000 : 20 * 60 * 1000;
   const agentHosts = [privateIp, ip].filter((value): value is string => Boolean(value));
-  const agentReady = await waitForAgentReadiness(agentHosts, agentSecret, agentTimeoutMs);
+  const agentReady = await waitForAgentReadiness(agentHosts, agentSecret, agentTls.certPem, agentTls.fingerprint256, agentTimeoutMs);
   if (!agentReady) {
     // Cancel Stripe subscription — user shouldn't be billed for an unresponsive VPS
     await cancelSubscriptionForInstance(instanceId, stripeSubId);
@@ -635,10 +657,13 @@ function sleep(ms: number): Promise<void> {
 async function waitForAgentReadiness(
   hosts: string[],
   agentSecret: string,
+  certPem: string,
+  fingerprint256: string,
   maxWaitMs: number
 ): Promise<boolean> {
   if (hosts.length === 0) return false;
   const deadline = Date.now() + maxWaitMs;
+  const httpsAgent = buildPinnedAgentHttpsAgent(certPem, fingerprint256);
 
   while (Date.now() < deadline) {
     for (const host of hosts) {
@@ -646,7 +671,7 @@ async function waitForAgentReadiness(
         const response = await axios.get(`https://${host}:8080/health`, {
           headers: { 'x-agent-secret': agentSecret },
           timeout: 2_000,
-          httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false }),
+          httpsAgent,
         });
 
         if (response.status === 200) {

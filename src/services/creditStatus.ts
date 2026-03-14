@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { decrypt } from './crypto';
 import { supabase } from './supabase';
-import { agentHttpsAgent, resolveAgentBaseUrl } from './agentNetwork';
+import { resolveAgentTransport } from './agentNetwork';
 
 type CreditManagedInstance = {
   id: string;
@@ -39,11 +39,11 @@ async function sendCreditStatus(instance: CreditManagedInstance, balance: number
   }
 
   const blocked = balance <= 0;
-  const baseUrl = await resolveAgentBaseUrl(instance);
-  if (!baseUrl) return;
+  const transport = await resolveAgentTransport(instance, agentSecret);
+  if (!transport) return;
 
   await axios.post(
-    `${baseUrl}/credit-status`,
+    `${transport.baseUrl}/credit-status`,
     { blocked, balance_brl: balance },
     {
       headers: {
@@ -51,7 +51,7 @@ async function sendCreditStatus(instance: CreditManagedInstance, balance: number
         'Content-Type': 'application/json',
       },
       timeout: 5_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent: transport.httpsAgent,
     }
   );
 }

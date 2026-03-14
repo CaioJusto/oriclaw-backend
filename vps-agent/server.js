@@ -3,7 +3,7 @@
 const express = require('express');
 const https = require('https');
 const crypto = require('crypto');
-const { execSync, exec, spawn } = require('child_process');
+const { execFile, execSync, spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -156,6 +156,35 @@ setInterval(() => {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function runCmd(cmd) {
   return execSync(cmd, { encoding: 'utf8', timeout: 30_000 });
+}
+
+function runProcess(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    timeout: options.timeout ?? 30_000,
+    input: options.input,
+    env: options.env ?? process.env,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0 && !options.allowFailure) {
+    const stderr = typeof result.stderr === 'string' ? result.stderr.trim() : '';
+    const stdout = typeof result.stdout === 'string' ? result.stdout.trim() : '';
+    throw new Error(stderr || stdout || `${command} exited with status ${result.status}`);
+  }
+
+  return typeof result.stdout === 'string' ? result.stdout : '';
+}
+
+function runProcessAsync(command, args, callback, options = {}) {
+  return execFile(command, args, {
+    timeout: options.timeout ?? 30_000,
+    encoding: 'utf8',
+    env: options.env ?? process.env,
+  }, callback);
 }
 
 function getOpenclawStatus() {
@@ -316,7 +345,7 @@ function extractQRData(logs) {
 
 function readGatewayHealth() {
   try {
-    const out = runCmd(`${openclawGatewayCall('health', '--json')} 2>/dev/null`);
+    const out = runOpenclawGatewayCall('health', ['--json'], { allowFailure: true });
     return safeJsonParse(out);
   } catch {
     return null;
@@ -420,8 +449,8 @@ function canRunAfter(lastIso, cooldownMs) {
 }
 
 function restartOpenclawForWatchdog(reason) {
-  runCmd('sudo systemctl reset-failed openclaw 2>/dev/null || true');
-  runCmd('sudo systemctl restart openclaw');
+  runSystemctl(['reset-failed', 'openclaw'], { allowFailure: true });
+  runSystemctl(['restart', 'openclaw']);
   watchdogState.last_restart_at = new Date().toISOString();
   watchdogState.last_reason = reason;
   watchdogState.total_self_heals += 1;
@@ -434,9 +463,8 @@ function reconcileChannelConfig(config, env) {
     const telegramEnabled = config?.channels?.telegram?.enabled === true;
     const telegramToken = config?.channels?.telegram?.botToken;
     if (!telegramEnabled || telegramToken !== env.TELEGRAM_BOT_TOKEN) {
-      const safeToken = sanitizeEnvValue(env.TELEGRAM_BOT_TOKEN);
-      runCmd(`${openclawExec(`config set channels.telegram.botToken '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
-      runCmd(`${openclawExec('config set channels.telegram.enabled true --strict-json')} 2>/dev/null || true`);
+      setOpenclawJsonString('channels.telegram.botToken', sanitizeEnvValue(env.TELEGRAM_BOT_TOKEN));
+      setOpenclawJsonValue('channels.telegram.enabled', true);
       repaired.push('telegram');
     }
   }
@@ -445,15 +473,14 @@ function reconcileChannelConfig(config, env) {
     const discordEnabled = config?.channels?.discord?.enabled === true;
     const discordToken = config?.channels?.discord?.token;
     if (!discordEnabled || discordToken !== env.DISCORD_BOT_TOKEN) {
-      const safeToken = sanitizeEnvValue(env.DISCORD_BOT_TOKEN);
-      runCmd(`${openclawExec(`config set channels.discord.token '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
-      runCmd(`${openclawExec('config set channels.discord.enabled true --strict-json')} 2>/dev/null || true`);
+      setOpenclawJsonString('channels.discord.token', sanitizeEnvValue(env.DISCORD_BOT_TOKEN));
+      setOpenclawJsonValue('channels.discord.enabled', true);
       repaired.push('discord');
     }
   }
 
   if ((config?.channel === 'whatsapp' || hasWhatsAppAuthState()) && config?.channels?.whatsapp?.enabled !== true) {
-    runCmd(`${openclawExec('config set channels.whatsapp.enabled true --strict-json')} 2>/dev/null || true`);
+    setOpenclawJsonValue('channels.whatsapp.enabled', true);
     repaired.push('whatsapp');
   }
 
@@ -672,13 +699,19 @@ app.get('/health/detailed', auth, (req, res) => {
 
 // ── OpenClaw command helpers ─────────────────────────────────────────────────
 const OPENCLAW_CMD = '/home/openclaw/.npm-global/bin/openclaw';
+const OPENCLAW_SUDO_ARGS = [
+  '-u', 'openclaw',
+  'OPENCLAW_HOME=/home/openclaw/.openclaw',
+  'HOME=/home/openclaw',
+  OPENCLAW_CMD,
+];
 
-function openclawExec(args) {
-  return `sudo -u openclaw OPENCLAW_HOME=/home/openclaw/.openclaw HOME=/home/openclaw ${OPENCLAW_CMD} ${args}`;
+function runOpenclaw(args, options = {}) {
+  return runProcess('sudo', [...OPENCLAW_SUDO_ARGS, ...args], options);
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+function runOpenclawAsync(args, callback, options = {}) {
+  return runProcessAsync('sudo', [...OPENCLAW_SUDO_ARGS, ...args], callback, options);
 }
 
 function isPrivateIpv4(host) {
@@ -702,26 +735,62 @@ function getGatewayHost() {
   return uniqueCandidates.find(isPrivateIpv4) || uniqueCandidates[0] || '127.0.0.1';
 }
 
-function getGatewayCliFlags() {
+function getGatewayCliArgs() {
   const config = readConfig();
   const gateway = config?.gateway || {};
   const auth = gateway.auth || {};
   const port = Number(gateway.port || 18789);
-  const flags = [`--url ${shellQuote(`ws://${getGatewayHost()}:${port}`)}`];
+  const args = ['--url', `ws://${getGatewayHost()}:${port}`];
   if (auth.mode === 'token' && auth.token) {
-    flags.push(`--token ${shellQuote(auth.token)}`);
+    args.push('--token', auth.token);
   }
-  return flags.join(' ');
+  return args;
 }
 
-function openclawGatewayCall(method, extraArgs = '') {
-  const parts = ['gateway call', getGatewayCliFlags(), extraArgs, method].filter(Boolean);
-  return openclawExec(parts.join(' '));
+function runOpenclawGatewayCall(method, extraArgs = [], options = {}) {
+  return runOpenclaw(['gateway', 'call', ...getGatewayCliArgs(), ...extraArgs, method], options);
 }
 
-function openclawDevicesExec(args) {
-  const parts = ['devices', args, getGatewayCliFlags()].filter(Boolean);
-  return openclawExec(parts.join(' '));
+function runOpenclawDevices(args, options = {}) {
+  return runOpenclaw(['devices', ...args, ...getGatewayCliArgs()], options);
+}
+
+function runSystemctl(args, options = {}) {
+  return runProcess('sudo', ['systemctl', ...args], options);
+}
+
+function runSystemctlAsync(args, callback, options = {}) {
+  return runProcessAsync('sudo', ['systemctl', ...args], callback, options);
+}
+
+function setOpenclawJsonString(path, value) {
+  return runOpenclaw(['config', 'set', path, JSON.stringify(value), '--strict-json'], { allowFailure: true });
+}
+
+function setOpenclawJsonValue(path, value) {
+  return runOpenclaw(['config', 'set', path, String(value), '--strict-json'], { allowFailure: true });
+}
+
+function removeWhatsAppAuthState() {
+  for (const authDir of getWhatsAppAuthDirs()) {
+    try {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    } catch (err) {
+      console.warn('[whatsapp] failed to remove auth dir:', authDir, err.message);
+    }
+  }
+
+  for (const dir of [
+    path.join(OPENCLAW_CONFIG_DIR, 'session'),
+    path.join(OPENCLAW_CONFIG_DIR, '.wwebjs_auth'),
+    path.join(OPENCLAW_CONFIG_DIR, '.baileys'),
+  ]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      console.warn('[whatsapp] failed to remove session dir:', dir, err.message);
+    }
+  }
 }
 
 // ── WhatsApp connection check helper ─────────────────────────────────────────
@@ -757,9 +826,9 @@ let whatsappSetupDone = false;
 function ensureWhatsAppSetup() {
   if (whatsappSetupDone) return;
   try {
-    exec(`${openclawExec('config set channels.whatsapp.enabled true --strict-json')} 2>/dev/null || true`, { timeout: 30_000 });
+    setOpenclawJsonValue('channels.whatsapp.enabled', true);
     whatsappSetupDone = true;
-    console.log('[whatsapp] ensureWhatsAppSetup fired (async)');
+    console.log('[whatsapp] ensureWhatsAppSetup applied');
   } catch (err) {
     console.error('[whatsapp] ensureWhatsAppSetup error:', err.message);
   }
@@ -877,12 +946,14 @@ async function startWhatsAppLogin() {
         whatsappLinkedAt = Date.now();
         for (const ocAuth of getWhatsAppAuthDirs()) {
           try {
-            execSync(`mkdir -p '${ocAuth}' && cp -r /tmp/oriclaw-wa-auth/* '${ocAuth}/' 2>/dev/null || true && chown -R openclaw:openclaw '${ocAuth}'`, { timeout: 10000 });
+            runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', ocAuth]);
+            runProcess('sudo', ['-u', 'openclaw', 'cp', '-r', '/tmp/oriclaw-wa-auth/.', `${ocAuth}/`], { allowFailure: true });
+            runProcess('chown', ['-R', 'openclaw:openclaw', ocAuth], { allowFailure: true });
           } catch (err) {
             console.error('[whatsapp-login] auth sync error:', err.message);
           }
         }
-        exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (restartErr) => {
+        runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
           if (restartErr) console.error('[whatsapp-login] restart after auth sync failed:', restartErr.message);
         });
         cleanupWhatsAppSocket();
@@ -1060,8 +1131,7 @@ app.post('/configure', auth, (req, res) => {
     if (openrouter_key) {
       // Configure OpenRouter API key in openclaw.json env section (native OpenClaw config)
       try {
-        const sanitizedKey = sanitizeEnvValue(openrouter_key);
-        runCmd(openclawExec(`config set env.OPENROUTER_API_KEY ${sanitizedKey}`));
+        runOpenclaw(['config', 'set', 'env.OPENROUTER_API_KEY', sanitizeEnvValue(openrouter_key)]);
         console.log('[configure] set OPENROUTER_API_KEY in openclaw.json env');
       } catch (err) {
         console.error('[configure] openclaw config set env failed:', err.message);
@@ -1075,7 +1145,7 @@ app.post('/configure', auth, (req, res) => {
       try {
         // OpenRouter models (format: provider/model-name) need "openrouter/" prefix for OpenClaw
         const openclawModel = MODEL_REGEX.test(safeModel) ? `openrouter/${safeModel}` : safeModel;
-        runCmd(openclawExec(`models set ${openclawModel}`));
+        runOpenclaw(['models', 'set', openclawModel]);
         console.log(`[configure] set OpenClaw model to ${openclawModel}`);
       } catch (err) {
         console.error('[configure] openclaw models set failed:', err.message);
@@ -1085,7 +1155,7 @@ app.post('/configure', auth, (req, res) => {
     if (timezone) envUpdates.TZ = timezone;
     if (Object.keys(envUpdates).length > 0) writeEnvFile(envUpdates);
 
-    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (restartErr) => {
+    runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
       if (restartErr) {
         clearTimeout(configuringTimer); configuringTimer = null; isConfiguring = false;
         return res.status(500).json({ success: false, error: 'Falha ao reiniciar o assistente: ' + restartErr.message });
@@ -1127,7 +1197,7 @@ app.post('/restart', auth, (req, res) => {
 
   const previous_status = getOpenclawStatus();
 
-  exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+  runSystemctlAsync(['restart', 'openclaw'], (err) => {
     if (err) {
       clearTimeout(restartingTimer); restartingTimer = null; isRestarting = false;
       return res.status(500).json({ error: err.message, previous_status, restarted: false });
@@ -1161,14 +1231,22 @@ app.get('/chat-url', auth, (req, res) => {
 
     // Read gateway token from OpenClaw config (files owned by openclaw user, read via sudo)
     let gatewayToken = '';
+    let preferredOrigin = '';
     for (const cfgPath of OPENCLAW_CONFIG_PATHS) {
       try {
         const raw = runCmd(`sudo -u openclaw /usr/bin/cat '${cfgPath}' 2>/dev/null`);
         const config = JSON.parse(raw);
         if (config?.gateway?.auth?.token) {
           gatewayToken = config.gateway.auth.token;
-          break;
         }
+        const allowedOrigins = Array.isArray(config?.gateway?.controlUi?.allowedOrigins)
+          ? config.gateway.controlUi.allowedOrigins
+          : [];
+        const httpsOrigin = allowedOrigins.find((origin) => typeof origin === 'string' && origin.startsWith('https://'));
+        if (typeof httpsOrigin === 'string' && httpsOrigin.length > 0) {
+          preferredOrigin = httpsOrigin;
+        }
+        if (gatewayToken && preferredOrigin) break;
       } catch { /* try next */ }
     }
 
@@ -1179,13 +1257,13 @@ app.get('/chat-url', auth, (req, res) => {
     let available = false;
     const gatewayHost = getGatewayHost();
     try {
-      runCmd(`nc -z -w2 ${shellQuote(gatewayHost)} ${gatewayPort} 2>/dev/null`);
+      runProcess('nc', ['-z', '-w2', gatewayHost, String(gatewayPort)]);
       available = true;
     } catch {
       try {
         // Fallback: check on public IP (openclaw --bind lan listens there)
         if (publicIp && publicIp !== 'localhost') {
-          runCmd(`nc -z -w2 ${publicIp} ${gatewayPort} 2>/dev/null`);
+          runProcess('nc', ['-z', '-w2', publicIp, String(gatewayPort)]);
           available = true;
         }
       } catch {
@@ -1200,7 +1278,8 @@ app.get('/chat-url', auth, (req, res) => {
     // OpenClaw Control UI now expects to be opened top-level from the gateway
     // origin. When proxied through nginx on 443, the gateway URL is same-origin.
     const sslipDomain = publicIp.replace(/\./g, '-') + '.sslip.io';
-    const baseUrl = `https://${sslipDomain}/`;
+    const baseOrigin = preferredOrigin || `https://${sslipDomain}`;
+    const baseUrl = baseOrigin.endsWith('/') ? baseOrigin : `${baseOrigin}/`;
     const url = gatewayToken
       ? `${baseUrl}#token=${encodeURIComponent(gatewayToken)}`
       : baseUrl;
@@ -1216,7 +1295,7 @@ app.post('/chat-approve', auth, (req, res) => {
     // List pending devices and approve all
     let listOut = '';
     try {
-      listOut = runCmd(`${openclawDevicesExec('list --json')} 2>/dev/null`);
+      listOut = runOpenclawDevices(['list', '--json'], { allowFailure: true });
     } catch { /* ignore */ }
 
     let approved = 0;
@@ -1228,7 +1307,7 @@ app.post('/chat-approve', auth, (req, res) => {
           const reqId = p.requestId || p.id;
           if (reqId) {
             try {
-              runCmd(`${openclawDevicesExec(`approve ${shellQuote(reqId)}`)} 2>/dev/null`);
+              runOpenclawDevices(['approve', reqId], { allowFailure: true });
               approved++;
             } catch { /* ignore */ }
           }
@@ -1240,7 +1319,7 @@ app.post('/chat-approve', auth, (req, res) => {
           const match = line.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
           if (match) {
             try {
-              runCmd(`${openclawDevicesExec(`approve ${shellQuote(match[1])}`)} 2>/dev/null`);
+              runOpenclawDevices(['approve', match[1]], { allowFailure: true });
               approved++;
             } catch { /* ignore */ }
           }
@@ -1339,9 +1418,8 @@ app.post('/channels/telegram', auth, async (req, res) => {
   try {
     // Configure Telegram channel via OpenClaw config set
     try {
-      const safeToken = sanitizeEnvValue(token);
-      runCmd(`${openclawExec(`config set channels.telegram.botToken '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
-      runCmd(`${openclawExec('config set channels.telegram.enabled true --strict-json')} 2>/dev/null || true`);
+      setOpenclawJsonString('channels.telegram.botToken', sanitizeEnvValue(token));
+      setOpenclawJsonValue('channels.telegram.enabled', true);
     } catch (err) {
       console.warn('[telegram] OpenClaw CLI config warning:', err.message);
     }
@@ -1349,7 +1427,7 @@ app.post('/channels/telegram', auth, async (req, res) => {
     // Also write to .env as fallback
     writeEnvFile({ TELEGRAM_BOT_TOKEN: token });
 
-    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+    runSystemctlAsync(['restart', 'openclaw'], (err) => {
       if (err) console.error('[telegram] restart error:', err.message);
     });
 
@@ -1389,9 +1467,8 @@ app.post('/channels/discord', auth, async (req, res) => {
   try {
     // Configure Discord channel via OpenClaw config set
     try {
-      const safeToken = sanitizeEnvValue(token);
-      runCmd(`${openclawExec(`config set channels.discord.token '"${safeToken}"' --strict-json`)} 2>/dev/null || true`);
-      runCmd(`${openclawExec('config set channels.discord.enabled true --strict-json')} 2>/dev/null || true`);
+      setOpenclawJsonString('channels.discord.token', sanitizeEnvValue(token));
+      setOpenclawJsonValue('channels.discord.enabled', true);
     } catch (err) {
       console.warn('[discord] OpenClaw CLI config warning:', err.message);
     }
@@ -1400,7 +1477,7 @@ app.post('/channels/discord', auth, async (req, res) => {
     writeEnvFile({ DISCORD_BOT_TOKEN: token });
     if (guild_id) writeConfig({ discord_guild_id: guild_id });
 
-    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+    runSystemctlAsync(['restart', 'openclaw'], (err) => {
       if (err) console.error('[discord] restart error:', err.message);
     });
 
@@ -1427,18 +1504,15 @@ app.delete('/channels/:channel', auth, (req, res) => {
       // Delete WhatsApp session files so the bot doesn't auto-reconnect
       // Respond immediately, then fire-and-forget the restart
       res.json({ success: true });
-      exec(
-        'rm -rf /home/openclaw/.openclaw/session /home/openclaw/.openclaw/.wwebjs_auth /home/openclaw/.openclaw/.baileys /home/openclaw/.openclaw/credentials/whatsapp /home/openclaw/.openclaw/.openclaw/channels/whatsapp/default/auth /home/openclaw/.openclaw/channels/whatsapp/default/auth && sudo systemctl restart openclaw',
-        { timeout: 30_000 },
-        (err) => {
-          if (err) console.error('[vps-agent] restart after whatsapp disconnect failed:', err.message);
-        }
-      );
+      removeWhatsAppAuthState();
+      runSystemctlAsync(['restart', 'openclaw'], (err) => {
+        if (err) console.error('[vps-agent] restart after whatsapp disconnect failed:', err.message);
+      });
       return;
     } else {
       // Disable channel via OpenClaw config
       try {
-        runCmd(`${openclawExec(`config set channels.${channel}.enabled false --strict-json`)} 2>/dev/null || true`);
+        setOpenclawJsonValue(`channels.${channel}.enabled`, false);
       } catch { /* ignore */ }
 
       const env = readEnvFile();
@@ -1447,7 +1521,7 @@ app.delete('/channels/:channel', auth, (req, res) => {
       fs.writeFileSync(OPENCLAW_ENV_FILE, content, 'utf8');
       try { runCmd(`chown -R openclaw:openclaw ${OPENCLAW_CONFIG_DIR}`); } catch { /* ignore */ }
 
-      exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+      runSystemctlAsync(['restart', 'openclaw'], (err) => {
         if (err) console.error('[disconnect] restart error:', err.message);
       });
     }
@@ -1488,13 +1562,13 @@ app.post('/credit-status', auth, (req, res) => {
 
   if (blocked === true && !creditBlocked) {
     creditBlocked = true;
-    exec('sudo systemctl stop openclaw', { timeout: 30_000 }, (err) => {
+    runSystemctlAsync(['stop', 'openclaw'], (err) => {
       if (err) console.error('[credit-guard] failed to stop openclaw:', err.message);
       else console.log('[credit-guard] openclaw stopped — credits exhausted');
     });
   } else if (blocked === false && creditBlocked) {
     creditBlocked = false;
-    exec('sudo systemctl start openclaw', { timeout: 30_000 }, (err) => {
+    runSystemctlAsync(['start', 'openclaw'], (err) => {
       if (err) console.error('[credit-guard] failed to start openclaw:', err.message);
       else console.log('[credit-guard] openclaw started — credits restored');
     });
@@ -1513,18 +1587,17 @@ app.post('/configure-codex-oauth', auth, (req, res) => {
   try {
     // Write OAuth credentials to OpenClaw credentials directory
     const credDir = path.join(OPENCLAW_CONFIG_DIR, 'credentials');
-    runCmd(`sudo -u openclaw mkdir -p '${credDir}'`);
+    runProcess('sudo', ['-u', 'openclaw', 'mkdir', '-p', credDir]);
 
     const oauthPath = path.join(credDir, 'oauth.json');
-    const safeContent = JSON.stringify(oauth_data).replace(/'/g, "'\\''");
-    runCmd(`echo '${safeContent}' | sudo -u openclaw tee '${oauthPath}' > /dev/null`);
-    runCmd(`sudo -u openclaw chmod 600 '${oauthPath}'`);
+    runProcess('sudo', ['-u', 'openclaw', 'tee', oauthPath], { input: JSON.stringify(oauth_data) });
+    runProcess('sudo', ['-u', 'openclaw', 'chmod', '600', oauthPath]);
 
     // Update config to use openai-codex model
     writeConfig({ model: 'openai-codex/gpt-5.4', ai_mode: 'chatgpt' });
 
     // Restart OpenClaw to pick up new auth
-    exec('sudo systemctl restart openclaw', { timeout: 30_000 }, (err) => {
+    runSystemctlAsync(['restart', 'openclaw'], (err) => {
       if (err) {
         return res.status(500).json({ error: 'Failed to restart openclaw: ' + err.message });
       }

@@ -1,25 +1,6 @@
-import fs from 'fs';
-import path from 'path';
+import { VPS_AGENT_PACKAGE_JSON, VPS_AGENT_SERVER_JS } from './vpsAgentAssets';
 
 const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
-const VPS_AGENT_DIR_CANDIDATES = [
-  path.resolve(process.cwd(), 'vps-agent'),
-  path.resolve(__dirname, '../../vps-agent'),
-];
-
-function readVpsAgentAsset(filename: string): string {
-  for (const dir of VPS_AGENT_DIR_CANDIDATES) {
-    const fullPath = path.join(dir, filename);
-    if (fs.existsSync(fullPath)) {
-      return fs.readFileSync(fullPath, 'utf8').trim();
-    }
-  }
-
-  throw new Error(`Missing VPS agent asset: ${filename}`);
-}
-
-const VPS_AGENT_PACKAGE_JSON = readVpsAgentAsset('package.json');
-const VPS_AGENT_SERVER_JS = readVpsAgentAsset('server.js');
 
 /**
  * Cloud-init script for OriClaw droplets.
@@ -111,9 +92,6 @@ cat > /home/openclaw/.openclaw/.openclaw/openclaw.json << CONFIGEOF
     "auth": {
       "mode": "token",
       "token": "__GATEWAY_TOKEN__"
-    },
-    "controlUi": {
-      "dangerouslyAllowHostHeaderOriginFallback": true
     }
   }
 }
@@ -1398,11 +1376,10 @@ mkdir -p /etc/systemd/system/openclaw.service.d
 touch /etc/systemd/system/openclaw.service.d/openrouter.conf
 chmod 600 /etc/systemd/system/openclaw.service.d/openrouter.conf
 
-# ── Generate self-signed TLS certificate for VPS Agent ────────────────────────
+# ── Provision pinned TLS certificate for VPS Agent ────────────────────────────
 mkdir -p /etc/oriclaw-agent/tls
-openssl req -x509 -newkey rsa:2048 -keyout /etc/oriclaw-agent/tls/key.pem \
-  -out /etc/oriclaw-agent/tls/cert.pem -days 3650 -nodes \
-  -subj "/CN=oriclaw-vps-agent" 2>/dev/null
+echo '__AGENT_TLS_CERT_PEM_B64__' | base64 -d > /etc/oriclaw-agent/tls/cert.pem
+echo '__AGENT_TLS_KEY_PEM_B64__' | base64 -d > /etc/oriclaw-agent/tls/key.pem
 chmod 600 /etc/oriclaw-agent/tls/key.pem
 chmod 644 /etc/oriclaw-agent/tls/cert.pem
 
@@ -1477,7 +1454,7 @@ apt-get install -y -o Dpkg::Options::="--force-confdef" nginx 2>/dev/null || tru
 # Get public IP and set up sslip.io domain for Let's Encrypt
 PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}')
 SSLIP_DOMAIN=$(echo "$PUBLIC_IP" | tr '.' '-').sslip.io
-sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set gateway.controlUi.allowedOrigins "[\"https://$SSLIP_DOMAIN\",\"http://$PUBLIC_IP:18789\"]" --strict-json 2>/dev/null || true
+sudo -u openclaw HOME=/home/openclaw OPENCLAW_HOME=/home/openclaw/.openclaw /home/openclaw/.npm-global/bin/openclaw config set gateway.controlUi.allowedOrigins "[\"https://$SSLIP_DOMAIN\"]" --strict-json 2>/dev/null || true
 
 # Get Let's Encrypt cert via certbot (non-interactive)
 apt-get install -y -o Dpkg::Options::="--force-confdef" certbot python3-certbot-nginx 2>/dev/null || true

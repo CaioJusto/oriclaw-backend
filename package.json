@@ -17,6 +17,7 @@
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
+    "selfsigned": "^3.0.1",
     "stripe": "^20.4.1"
   },
   "devDependencies": {

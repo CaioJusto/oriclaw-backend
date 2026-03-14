@@ -16,7 +16,7 @@ import axios from 'axios';
 import { getInstanceById, getInstanceByCustomerId, updateInstance } from '../services/supabase';
 import { encrypt, decrypt } from '../services/crypto';
 import { getUserId } from '../middleware/requireAuth';
-import { agentHttpsAgent, resolveAgentBaseUrl } from '../services/agentNetwork';
+import { resolveAgentTransport } from '../services/agentNetwork';
 
 const router = Router();
 type OpenAIValidationStatus = 'verified' | 'saved_unverified';
@@ -209,21 +209,25 @@ router.post('/openai-codex/exchange', async (req: Request, res: Response): Promi
 
     // Send OAuth data to VPS agent
     const agentSecretEnc = meta.agent_secret as string | undefined;
-    const baseUrl = await resolveAgentBaseUrl(instance);
-    if (!agentSecretEnc || !baseUrl) {
+    if (!agentSecretEnc) {
       res.status(500).json({ error: 'Instância sem agent configurado.' });
       return;
     }
 
     const agentSecret = decrypt(agentSecretEnc);
+    const transport = await resolveAgentTransport(instance, agentSecret);
+    if (!transport) {
+      res.status(500).json({ error: 'Instância sem agent configurado.' });
+      return;
+    }
 
     await axios.post(
-      `${baseUrl}/configure-codex-oauth`,
+      `${transport.baseUrl}/configure-codex-oauth`,
       { oauth_data: { key: apiKey, provider: 'openai-codex' } },
       {
         headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
         timeout: 30_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent: transport.httpsAgent,
       }
     );
 

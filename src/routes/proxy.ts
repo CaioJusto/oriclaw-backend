@@ -13,7 +13,7 @@ import { getInstanceById, updateInstance } from '../services/supabase';
 import { decrypt, encrypt } from '../services/crypto';
 import { getUserId } from '../middleware/requireAuth';
 import { getAdminSettings } from '../services/openrouter';
-import { agentHttpsAgent, resolveAgentBaseUrl } from '../services/agentNetwork';
+import { resolveAgentTransport } from '../services/agentNetwork';
 
 const router = Router();
 
@@ -62,28 +62,29 @@ async function resolveInstance(instanceId: string, userId: string, checkCredits 
     }
   }
 
-  const baseUrl = await resolveAgentBaseUrl(instance);
-  if (!baseUrl) {
+  const transport = await resolveAgentTransport(instance, agentSecret);
+  if (!transport) {
     throw Object.assign(new Error('Servidor ainda inicializando. Tente novamente em alguns minutos.'), { status: 503 });
   }
 
-  return { instance, baseUrl, agentSecret };
+  return { instance, baseUrl: transport.baseUrl, httpsAgent: transport.httpsAgent, agentSecret };
 }
 
 function agentHeaders(secret: string) {
   return { 'x-agent-secret': secret, 'Content-Type': 'application/json' };
 }
 
-/** Axios config for VPS agent calls (includes TLS agent for self-signed certs) */
-function agentAxiosConfig(secret: string, timeout = 15_000) {
-  return { headers: agentHeaders(secret), timeout, httpsAgent: agentHttpsAgent };
-}
-
 // ── Middleware: auth + resolve instance ─────────────────────────────────────
 async function withInstance(
   req: Request,
   res: Response,
-  handler: (ctx: { baseUrl: string; agentSecret: string; instance: Awaited<ReturnType<typeof getInstanceById>>; userId: string }) => Promise<void>,
+  handler: (ctx: {
+    baseUrl: string;
+    httpsAgent: import('https').Agent;
+    agentSecret: string;
+    instance: Awaited<ReturnType<typeof getInstanceById>>;
+    userId: string;
+  }) => Promise<void>,
   { checkCredits = false } = {}
 ): Promise<void> {
   // Reject non-UUID instance_id early to avoid PostgreSQL parse errors
@@ -109,11 +110,11 @@ async function withInstance(
 
 // ── GET /api/proxy/:instance_id/health ───────────────────────────────────────
 router.get('/:instance_id/health', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     const { data } = await axios.get(`${baseUrl}/health`, {
       headers: agentHeaders(agentSecret),
       timeout: 10_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -121,12 +122,12 @@ router.get('/:instance_id/health', async (req: Request, res: Response): Promise<
 
 // ── GET /api/proxy/:instance_id/health/detailed ──────────────────────────────
 router.get('/:instance_id/health/detailed', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     try {
       const { data } = await axios.get(`${baseUrl}/health/detailed`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -139,12 +140,12 @@ router.get('/:instance_id/health/detailed', async (req: Request, res: Response):
 
 // ── GET /api/proxy/:instance_id/chat-url ─────────────────────────────────────
 router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     try {
       const { data } = await axios.get(`${baseUrl}/chat-url`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent,
       });
 
       // Workaround: older VPS agents check `nc -z localhost 18789` which fails
@@ -155,7 +156,7 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
           const { data: healthData } = await axios.get(`${baseUrl}/health`, {
             headers: agentHeaders(agentSecret),
             timeout: 5_000,
-            httpsAgent: agentHttpsAgent,
+            httpsAgent,
           });
           if (healthData && healthData.openclaw === 'running') {
             data.available = true;
@@ -174,12 +175,12 @@ router.get('/:instance_id/chat-url', async (req: Request, res: Response): Promis
 
 // ── GET /api/proxy/:instance_id/qr ──────────────────────────────────────────
 router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     try {
       const { data } = await axios.get(`${baseUrl}/qr`, {
         headers: agentHeaders(agentSecret),
         timeout: 15_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -200,7 +201,7 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
     return;
   }
 
-  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
     const body = { ...req.body } as Record<string, unknown>;
     const existingMeta = ((instance?.metadata ?? {}) as Record<string, unknown>);
     const existingAiMode = existingMeta.ai_mode as string | undefined;
@@ -324,7 +325,7 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
     const { data } = await axios.post(`${baseUrl}/configure`, sanitizedBody, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
 
     // Persist ai_mode and status in Supabase instance record
@@ -391,12 +392,12 @@ router.post('/:instance_id/configure', async (req: Request, res: Response): Prom
 
 // ── POST /api/proxy/:instance_id/restart ────────────────────────────────────
 router.post('/:instance_id/restart', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
     console.log(`[audit] restart: user=${userId} instance=${instance?.id} ip=${req.ip}`);
     const { data } = await axios.post(`${baseUrl}/restart`, {}, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -404,11 +405,11 @@ router.post('/:instance_id/restart', async (req: Request, res: Response): Promis
 
 // ── GET /api/proxy/:instance_id/logs ─────────────────────────────────────────
 router.get('/:instance_id/logs', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     const { data } = await axios.get(`${baseUrl}/logs`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -416,12 +417,12 @@ router.get('/:instance_id/logs', async (req: Request, res: Response): Promise<vo
 
 // ── GET /api/proxy/:instance_id/channels ─────────────────────────────────────
 router.get('/:instance_id/channels', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     try {
       const { data } = await axios.get(`${baseUrl}/channels`, {
         headers: agentHeaders(agentSecret),
         timeout: 10_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent,
       });
       res.json(data);
     } catch (err: unknown) {
@@ -434,11 +435,11 @@ router.get('/:instance_id/channels', async (req: Request, res: Response): Promis
 
 // ── POST /api/proxy/:instance_id/channels/telegram ───────────────────────────
 router.post('/:instance_id/channels/telegram', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     const { data } = await axios.post(`${baseUrl}/channels/telegram`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -446,11 +447,11 @@ router.post('/:instance_id/channels/telegram', async (req: Request, res: Respons
 
 // ── POST /api/proxy/:instance_id/channels/discord ────────────────────────────
 router.post('/:instance_id/channels/discord', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
     const { data } = await axios.post(`${baseUrl}/channels/discord`, req.body, {
       headers: agentHeaders(agentSecret),
       timeout: 30_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -458,7 +459,7 @@ router.post('/:instance_id/channels/discord', async (req: Request, res: Response
 
 // ── DELETE /api/proxy/:instance_id/channels/:channel ─────────────────────────
 router.delete('/:instance_id/channels/:channel', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
     const channel = req.params.channel;
     const VALID_CHANNELS = ['whatsapp', 'telegram', 'discord'];
     if (!VALID_CHANNELS.includes(channel)) {
@@ -469,7 +470,7 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
     const { data } = await axios.delete(`${baseUrl}/channels/${channel}`, {
       headers: agentHeaders(agentSecret),
       timeout: 15_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     });
     res.json(data);
   });
@@ -498,7 +499,7 @@ router.delete('/:instance_id/channels/:channel', async (req: Request, res: Respo
   $$;
 */
 router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<void> => {
-  await withInstance(req, res, async ({ baseUrl, agentSecret, instance, userId }) => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
     const rawSubPath = (req.params as Record<string, string>)[0] ?? '';
     const subPath = path.posix.normalize(rawSubPath).replace(/^\/+/, '');
     if (subPath.includes('..')) {
@@ -512,7 +513,7 @@ router.all('/:instance_id/ai/*', async (req: Request, res: Response): Promise<vo
         headers: { ...agentHeaders(agentSecret) },
         data: req.body,
         timeout: 60_000,
-        httpsAgent: agentHttpsAgent,
+        httpsAgent,
       });
 
       res.json(data);

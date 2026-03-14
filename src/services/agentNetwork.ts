@@ -1,25 +1,46 @@
 import https from 'https';
+import { TLSSocket } from 'tls';
 import { OriClawInstance } from '../types';
 import { getDroplet, getDropletPrivateIP, getDropletPublicIP } from './digitalocean';
 import { updateInstance } from './supabase';
+import {
+  buildPinnedAgentHttpsAgent,
+  getTlsMaterialFromCertPem,
+  normalizeFingerprint256,
+} from './agentTls';
 
-export const agentHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 export const AGENT_PORT = 8080;
 export const AGENT_PRIVATE_CIDR = process.env.ORICLAW_AGENT_PRIVATE_CIDR || '10.116.0.0/20';
 
 type AgentInstanceLike = Pick<OriClawInstance, 'id' | 'droplet_id' | 'droplet_ip' | 'metadata'>;
 
-type AgentIpMetadata = {
+type AgentMetadata = {
   agent_private_ip?: unknown;
   agent_public_ip?: unknown;
+  agent_tls_cert_pem?: unknown;
+  agent_tls_fingerprint256?: unknown;
+};
+
+type AgentPinnedTls = {
+  certPem: string;
+  fingerprint256: string;
+};
+
+export type AgentTransport = {
+  baseUrl: string;
+  httpsAgent: https.Agent;
 };
 
 function asIp(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
 }
 
-function getMetadata(instance: Pick<OriClawInstance, 'metadata'>): AgentIpMetadata {
-  return ((instance.metadata ?? {}) as AgentIpMetadata);
+function asPem(value: unknown): string | null {
+  return typeof value === 'string' && value.includes('BEGIN CERTIFICATE') ? value : null;
+}
+
+function getMetadata(instance: Pick<OriClawInstance, 'metadata'>): AgentMetadata {
+  return (instance.metadata ?? {}) as AgentMetadata;
 }
 
 function getCachedPrivateIp(instance: Pick<OriClawInstance, 'metadata'>): string | null {
@@ -28,6 +49,20 @@ function getCachedPrivateIp(instance: Pick<OriClawInstance, 'metadata'>): string
 
 function getCachedPublicIp(instance: Pick<OriClawInstance, 'droplet_ip' | 'metadata'>): string | null {
   return asIp(getMetadata(instance).agent_public_ip) ?? asIp(instance.droplet_ip);
+}
+
+function getPinnedTls(instance: Pick<OriClawInstance, 'metadata'>): AgentPinnedTls | null {
+  const metadata = getMetadata(instance);
+  const certPem = asPem(metadata.agent_tls_cert_pem);
+  const fingerprint256 = normalizeFingerprint256(
+    typeof metadata.agent_tls_fingerprint256 === 'string' ? metadata.agent_tls_fingerprint256 : null
+  );
+
+  if (!certPem || !fingerprint256) {
+    return null;
+  }
+
+  return { certPem, fingerprint256 };
 }
 
 async function refreshAgentIps(instance: AgentInstanceLike): Promise<{ privateIp: string | null; publicIp: string | null }> {
@@ -98,4 +133,86 @@ export async function resolveAgentHosts(instance: AgentInstanceLike): Promise<st
   if (!baseUrl) return [];
 
   return [baseUrl.replace(/^https:\/\//, '').replace(/:\d+$/, '')];
+}
+
+function pemFromRawCert(raw: Buffer): string {
+  const base64 = raw.toString('base64');
+  const lines = base64.match(/.{1,64}/g) ?? [];
+  return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----\n`;
+}
+
+async function fetchPinnedTlsFromHost(host: string, agentSecret: string): Promise<AgentPinnedTls> {
+  return await new Promise<AgentPinnedTls>((resolve, reject) => {
+    const req = https.request(
+      {
+        host,
+        port: AGENT_PORT,
+        path: '/health',
+        method: 'GET',
+        headers: { 'x-agent-secret': agentSecret },
+        rejectUnauthorized: false,
+        timeout: 5_000,
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`Agent TLS bootstrap returned status ${res.statusCode}`));
+          return;
+        }
+
+        const socket = res.socket as TLSSocket;
+        const peer = socket.getPeerCertificate(true);
+        if (!peer || !peer.raw) {
+          res.resume();
+          reject(new Error('Agent TLS certificate missing from peer response'));
+          return;
+        }
+
+        const certPem = pemFromRawCert(peer.raw);
+        const tls = getTlsMaterialFromCertPem(certPem);
+        res.resume();
+        res.on('end', () => resolve({ certPem: tls.certPem, fingerprint256: tls.fingerprint256 }));
+      }
+    );
+
+    req.on('timeout', () => req.destroy(new Error('Agent TLS bootstrap timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function bootstrapPinnedTls(instance: AgentInstanceLike, agentSecret: string): Promise<AgentPinnedTls> {
+  const hosts = await resolveAgentHosts(instance);
+  let lastError: Error | null = null;
+
+  for (const host of hosts) {
+    try {
+      const tls = await fetchPinnedTlsFromHost(host, agentSecret);
+      await updateInstance(instance.id, {
+        metadata: {
+          agent_tls_cert_pem: tls.certPem,
+          agent_tls_fingerprint256: tls.fingerprint256,
+        },
+      });
+      return tls;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw lastError ?? new Error('Unable to bootstrap pinned TLS for agent');
+}
+
+export async function resolveAgentTransport(
+  instance: AgentInstanceLike,
+  agentSecret: string
+): Promise<AgentTransport | null> {
+  const baseUrl = await resolveAgentBaseUrl(instance);
+  if (!baseUrl) return null;
+
+  const tls = getPinnedTls(instance) ?? await bootstrapPinnedTls(instance, agentSecret);
+  return {
+    baseUrl,
+    httpsAgent: buildPinnedAgentHttpsAgent(tls.certPem, tls.fingerprint256),
+  };
 }

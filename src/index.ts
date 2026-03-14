@@ -17,7 +17,7 @@ import { retryPendingDeletions } from './services/provisioning';
 import { calculateOpenRouterCostUsd, getAdminSettings, normalizeOpenRouterModelId } from './services/openrouter';
 import { decrypt } from './services/crypto';
 import { notifyCreditStatusForAllCreditsInstances } from './services/creditStatus';
-import { agentHttpsAgent, resolveAgentBaseUrl } from './services/agentNetwork';
+import { resolveAgentTransport } from './services/agentNetwork';
 import axios from 'axios';
 
 // ── Required environment variable validation ──────────────────────────────────
@@ -291,14 +291,18 @@ function getActionableChannelFailures(watchdog: AgentWatchdogState | null | unde
   return Array.from(failed);
 }
 
-async function triggerAgentSelfHeal(baseUrl: string, agentSecret: string): Promise<AgentWatchdogState | null> {
+async function triggerAgentSelfHeal(
+  baseUrl: string,
+  httpsAgent: import('https').Agent,
+  agentSecret: string
+): Promise<AgentWatchdogState | null> {
   const { data } = await axios.post(
     `${baseUrl}/self-heal`,
     {},
     {
       headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
       timeout: 15_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     }
   );
 
@@ -332,16 +336,16 @@ async function monitorManagedInstances(): Promise<void> {
         continue;
       }
 
-      const baseUrl = await resolveAgentBaseUrl(inst);
-      if (!baseUrl) continue;
+      const transport = await resolveAgentTransport(inst, agentSecret);
+      if (!transport) continue;
 
       const nowIso = new Date().toISOString();
 
       try {
-        const { data } = await axios.get(`${baseUrl}/health/detailed`, {
+        const { data } = await axios.get(`${transport.baseUrl}/health/detailed`, {
           headers: { 'x-agent-secret': agentSecret },
           timeout: 10_000,
-          httpsAgent: agentHttpsAgent,
+          httpsAgent: transport.httpsAgent,
         });
 
         const health = (data ?? {}) as AgentDetailedHealth;
@@ -357,7 +361,7 @@ async function monitorManagedInstances(): Promise<void> {
         let selfHealResult: AgentWatchdogState | null = null;
         if (shouldHeal) {
           try {
-            selfHealResult = await triggerAgentSelfHeal(baseUrl, agentSecret);
+            selfHealResult = await triggerAgentSelfHeal(transport.baseUrl, transport.httpsAgent, agentSecret);
             console.warn(
               `[health-poll] Self-heal triggered for ${inst.id}: ` +
               `${selfHealResult?.last_result ?? 'unknown'} (${selfHealResult?.last_reason ?? 'no-reason'})`
@@ -414,7 +418,12 @@ async function getCustomerCreditBalance(customerId: string): Promise<number> {
   return (data as { balance_brl: number } | null)?.balance_brl ?? 0;
 }
 
-async function acknowledgeUsageEvents(baseUrl: string, agentSecret: string, eventIds: string[]): Promise<void> {
+async function acknowledgeUsageEvents(
+  baseUrl: string,
+  httpsAgent: import('https').Agent,
+  agentSecret: string,
+  eventIds: string[]
+): Promise<void> {
   if (!baseUrl || eventIds.length === 0) return;
 
   await axios.post(
@@ -423,7 +432,7 @@ async function acknowledgeUsageEvents(baseUrl: string, agentSecret: string, even
     {
       headers: { 'x-agent-secret': agentSecret, 'Content-Type': 'application/json' },
       timeout: 10_000,
-      httpsAgent: agentHttpsAgent,
+      httpsAgent,
     }
   );
 }
@@ -526,14 +535,14 @@ async function collectUsageFromAgents(): Promise<void> {
         continue;
       }
 
-      const baseUrl = await resolveAgentBaseUrl(inst);
-      if (!baseUrl) continue;
+      const transport = await resolveAgentTransport(inst, agentSecret);
+      if (!transport) continue;
 
       try {
-        const { data: usageData } = await axios.get(`${baseUrl}/usage/pending`, {
+        const { data: usageData } = await axios.get(`${transport.baseUrl}/usage/pending`, {
           headers: { 'x-agent-secret': agentSecret },
           timeout: 10_000,
-          httpsAgent: agentHttpsAgent,
+          httpsAgent: transport.httpsAgent,
         });
 
         const events = Array.isArray(usageData?.events) ? (usageData.events as CreditUsageEvent[]) : [];
@@ -607,7 +616,7 @@ async function collectUsageFromAgents(): Promise<void> {
 
         if (acknowledgedEventIds.length > 0) {
           try {
-            await acknowledgeUsageEvents(baseUrl, agentSecret, acknowledgedEventIds);
+            await acknowledgeUsageEvents(transport.baseUrl, transport.httpsAgent, agentSecret, acknowledgedEventIds);
           } catch (ackErr) {
             console.warn(
               `[usage-poll] Failed to acknowledge usage events for ${inst.id}:`,
