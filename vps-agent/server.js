@@ -1207,8 +1207,8 @@ function ensureWhatsAppSetup() {
   });
 }
 
-function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR) {
-  if (whatsappAuthSyncInFlight || !fs.existsSync(authDir)) return false;
+function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR, options = {}) {
+  if ((!options.force && whatsappAuthSyncInFlight) || !fs.existsSync(authDir)) return false;
   whatsappAuthSyncInFlight = true;
 
   try {
@@ -1225,6 +1225,22 @@ function syncWhatsAppAuthToOpenclaw(authDir = WHATSAPP_TEMP_AUTH_DIR) {
   } finally {
     whatsappAuthSyncInFlight = false;
   }
+}
+
+function restartOpenclawAfterPairing(authDir = WHATSAPP_TEMP_AUTH_DIR, reason = 'pairing_restart_required') {
+  setTimeout(() => {
+    const synced = syncWhatsAppAuthToOpenclaw(authDir, { force: true });
+    if (!synced) {
+      console.warn('[whatsapp-login] skipped restart because auth sync did not complete:', reason);
+      return;
+    }
+
+    console.log('[whatsapp-login] restarting openclaw after pairing:', reason);
+    invalidateGatewayHealthCache();
+    runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
+      if (restartErr) console.error('[whatsapp-login] restart after pairing failed:', restartErr.message);
+    });
+  }, 300);
 }
 
 function scheduleWhatsAppAuthSync(authDir = WHATSAPP_TEMP_AUTH_DIR, delayMs = 400) {
@@ -1372,12 +1388,10 @@ async function startWhatsAppLogin() {
         if (code === 401) {
           whatsappForceFreshLogin = true;
         }
-        if ((code === 515 || code === 428) && syncWhatsAppAuthToOpenclaw(authDir)) {
-          whatsappLinkedAt = Date.now();
-          invalidateGatewayHealthCache();
-          runSystemctlAsync(['restart', 'openclaw'], (restartErr) => {
-            if (restartErr) console.error('[whatsapp-login] restart after restart-required close failed:', restartErr.message);
-          });
+        if (code === 515) {
+          restartOpenclawAfterPairing(authDir, 'stream_error_515');
+        } else if (code === 428 && whatsappAuthSyncedAt && (Date.now() - whatsappAuthSyncedAt) < 15_000) {
+          restartOpenclawAfterPairing(authDir, 'connection_terminated_after_auth_sync');
         }
         cleanupWhatsAppSocket();
       }
