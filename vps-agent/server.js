@@ -885,6 +885,24 @@ app.get('/health/detailed', auth, (req, res) => {
       }
     } catch { /* ignore */ }
 
+    let liveChannels = watchdogState.channels;
+    let liveDegradedChannels = watchdogState.degraded_channels;
+    try {
+      const config = readConfig();
+      const env = readEnvFile();
+      const logs = getJournalLogsSinceLastStart(120);
+      if (openclaw === 'running') {
+        refreshGatewayHealthCache({ force: true });
+      }
+      const gatewayHealth = openclaw === 'running'
+        ? readGatewayHealth({ refresh: false })
+        : null;
+      liveChannels = buildChannelSnapshot(config, env, logs, gatewayHealth);
+      liveDegradedChannels = getDegradedChannels(liveChannels);
+    } catch (snapshotErr) {
+      console.warn('[health/detailed] live channel snapshot failed:', snapshotErr.message);
+    }
+
     res.json({
       openclaw,
       uptime_seconds,
@@ -895,7 +913,11 @@ app.get('/health/detailed', auth, (req, res) => {
       disk_total_gb,
       last_message_at,
       restart_count,
-      watchdog: watchdogState,
+      watchdog: {
+        ...watchdogState,
+        channels: liveChannels,
+        degraded_channels: liveDegradedChannels,
+      },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
