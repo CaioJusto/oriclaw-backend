@@ -118,6 +118,45 @@ npm run dev
 
 O servidor sobe em `http://localhost:3001` por padrão.
 
+## Automação OpenClaw
+
+O `openclaw` roda na VPS do cliente, não no backend local. Para reduzir operação manual, o projeto agora inclui automações em [`scripts/openclaw-ops.mjs`](/Users/caiojusto/Documents/oriclaw/oriclaw-backend/scripts/openclaw-ops.mjs) que combinam chamadas do `vps-agent` com execução remota via SSH.
+
+Comandos estudados e incorporados ao fluxo:
+
+- `openclaw health`
+- `openclaw doctor`
+- `openclaw channels list`
+- `openclaw channels status --probe`
+- `openclaw channels capabilities`
+
+Variáveis usadas pelos scripts:
+
+```bash
+export ORICLAW_AGENT_HOST=134.209.67.16
+export ORICLAW_AGENT_SECRET=...
+export ORICLAW_SSH_HOST=134.209.67.16
+export ORICLAW_SSH_USER=root
+export ORICLAW_SSH_KEY_PATH=~/.ssh/id_ed25519
+```
+
+Atalhos disponíveis:
+
+```bash
+npm run ops:openclaw:status
+npm run ops:openclaw:doctor
+npm run ops:openclaw:channels
+npm run ops:openclaw:logs
+npm run ops:openclaw:self-heal
+npm run ops:openclaw -- whatsapp-relink --force
+```
+
+Uso recomendado:
+
+- `status`: validar rapidamente `openclaw`, canais e watchdog sem entrar na VPS
+- `doctor`: rodar diagnóstico operacional real do `openclaw` na VPS
+- `whatsapp-relink --force`: limpar auth quebrada, reiniciar serviços e bootstrapar QR novo
+
 ## Deploy no Railway
 
 1. Conecte o repositório ao Railway via Dashboard ou CLI:

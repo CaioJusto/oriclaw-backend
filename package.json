@@ -5,6 +5,13 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "ops:openclaw": "node scripts/openclaw-ops.mjs",
+    "ops:openclaw:status": "node scripts/openclaw-ops.mjs status",
+    "ops:openclaw:doctor": "node scripts/openclaw-ops.mjs doctor",
+    "ops:openclaw:channels": "node scripts/openclaw-ops.mjs channels",
+    "ops:openclaw:logs": "node scripts/openclaw-ops.mjs logs",
+    "ops:openclaw:self-heal": "node scripts/openclaw-ops.mjs self-heal",
+    "ops:openclaw:whatsapp-relink": "node scripts/openclaw-ops.mjs whatsapp-relink",
     "smoke": "node scripts/smoke-check.mjs",
     "start": "node dist/index.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts"

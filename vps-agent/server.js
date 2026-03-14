@@ -220,6 +220,29 @@ function runProcess(command, args, options = {}) {
   return typeof result.stdout === 'string' ? result.stdout : '';
 }
 
+function runProcessCombined(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    timeout: options.timeout ?? 30_000,
+    input: options.input,
+    env: options.env ?? process.env,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+  const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+  const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
+
+  if (result.status !== 0 && !options.allowFailure) {
+    throw new Error(combined || `${command} exited with status ${result.status}`);
+  }
+
+  return combined;
+}
+
 function runProcessAsync(command, args, callback, options = {}) {
   return execFile(command, args, {
     timeout: options.timeout ?? 30_000,
@@ -980,6 +1003,10 @@ function runOpenclawAsync(args, callback, options = {}) {
   return runProcessAsync('sudo', [...OPENCLAW_SUDO_ARGS, ...args], callback, options);
 }
 
+function runOpenclawCombined(args, options = {}) {
+  return runProcessCombined('sudo', [...OPENCLAW_SUDO_ARGS, ...args], options);
+}
+
 function isPrivateIpv4(host) {
   return /^10\./.test(host) ||
     /^192\.168\./.test(host) ||
@@ -1234,6 +1261,78 @@ function runSystemctl(args, options = {}) {
 
 function runSystemctlAsync(args, callback, options = {}) {
   return runProcessAsync('sudo', ['systemctl', ...args], callback, options);
+}
+
+function truncateOutput(output, maxLength = 12_000) {
+  const normalized = typeof output === 'string' ? output.trim() : '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}\n...[truncated]`;
+}
+
+function buildDiagnosticsPayload() {
+  const config = readConfig();
+  const env = readEnvFile();
+  const openclaw = getOpenclawStatus();
+  const logsSinceLastStart = getJournalLogsSinceLastStart(120);
+
+  if (openclaw === 'running') {
+    refreshGatewayHealthCache({ force: true });
+  }
+
+  const gatewayHealth = openclaw === 'running'
+    ? readGatewayHealth({ refresh: false })
+    : null;
+  const channels = buildChannelSnapshot(config, env, logsSinceLastStart, gatewayHealth);
+  const degradedChannels = getDegradedChannels(channels);
+  const freeMemMb = Math.round(os.freemem() / 1024 / 1024);
+  const totalMemMb = Math.round(os.totalmem() / 1024 / 1024);
+
+  return {
+    generated_at: new Date().toISOString(),
+    summary: {
+      openclaw,
+      ram_used_mb: Math.max(totalMemMb - freeMemMb, 0),
+      ram_total_mb: totalMemMb,
+      watchdog: {
+        last_run_at: watchdogState.last_run_at || null,
+        last_result: watchdogState.last_result || null,
+        last_reason: watchdogState.last_reason || null,
+        last_error: watchdogState.last_error || null,
+        degraded_channels: degradedChannels,
+      },
+      whatsapp: {
+        status: channels.whatsapp.connected
+          ? 'connected'
+          : (channels.whatsapp.needs_relink ? 'needs_relink' : 'disconnected'),
+        desired: channels.whatsapp.desired,
+        auth_present: channels.whatsapp.auth_present,
+        login_in_progress: channels.whatsapp.login_in_progress,
+        stabilizing: channels.whatsapp.stabilizing,
+      },
+    },
+    agent: {
+      channels,
+      watchdog: {
+        ...watchdogState,
+        degraded_channels: degradedChannels,
+        channels,
+      },
+    },
+    sections: {
+      openclaw_health: truncateOutput(runOpenclawCombined(['health'], { allowFailure: true, timeout: 20_000 })),
+      openclaw_doctor: truncateOutput(runOpenclawCombined(['doctor'], { allowFailure: true, timeout: 20_000 })),
+      channels_list: truncateOutput(runOpenclawCombined(['channels', 'list'], { allowFailure: true, timeout: 15_000 })),
+      channels_status: truncateOutput(
+        runOpenclawCombined(['channels', 'status', '--probe'], { allowFailure: true, timeout: 15_000 }) ||
+        runOpenclawCombined(['channels', 'status'], { allowFailure: true, timeout: 15_000 })
+      ),
+      channels_capabilities: truncateOutput(runOpenclawCombined(['channels', 'capabilities'], { allowFailure: true, timeout: 15_000 })),
+      memory: truncateOutput(runProcessCombined('free', ['-h'], { allowFailure: true, timeout: 10_000 })),
+      swap: truncateOutput(runProcessCombined('swapon', ['--show'], { allowFailure: true, timeout: 10_000 })),
+      service_status: truncateOutput(runProcessCombined('systemctl', ['status', 'openclaw', '--no-pager', '--lines=20'], { allowFailure: true, timeout: 15_000 })),
+      recent_logs: truncateOutput(runCmd('journalctl -u openclaw -n 80 --no-pager --output=short-iso 2>/dev/null || true')),
+    },
+  };
 }
 
 function setOpenclawJsonString(path, value) {
@@ -1536,6 +1635,40 @@ function cleanupWhatsAppSocket() {
     whatsappSocket = null;
   }
   whatsappLoginProcess = null;
+}
+
+function resetWhatsAppRelinkState() {
+  cleanupWhatsAppSocket();
+  if (whatsappAuthSyncTimer) {
+    clearTimeout(whatsappAuthSyncTimer);
+    whatsappAuthSyncTimer = null;
+  }
+
+  whatsappRawQR = null;
+  whatsappQRTimestamp = 0;
+  whatsappLinkedAt = 0;
+  whatsappForceFreshLogin = true;
+  whatsappAuthSyncInFlight = false;
+  whatsappAuthSyncedAt = 0;
+  whatsappPairingRestartAt = 0;
+  try {
+    fs.rmSync(WHATSAPP_TEMP_AUTH_DIR, { recursive: true, force: true });
+  } catch { /* ignore */ }
+}
+
+async function triggerWhatsAppRelink() {
+  removeWhatsAppAuthState();
+  resetWhatsAppRelinkState();
+  ensureWhatsAppSetup();
+  await startWhatsAppLogin();
+  const nowIso = new Date().toISOString();
+  watchdogState.last_run_at = nowIso;
+  watchdogState.last_qr_bootstrap_at = nowIso;
+  watchdogState.last_reason = 'whatsapp_manual_relink';
+  watchdogState.last_result = 'started_qr_recovery';
+  watchdogState.last_error = null;
+  watchdogState.consecutive_channel_failures = 0;
+  return watchdogState;
 }
 
 function readOpenClawLogQR() {
@@ -1900,6 +2033,7 @@ app.get('/channels', auth, (req, res) => {
         phone: config.whatsapp_phone || null,
         auth_present: snapshot.whatsapp.auth_present,
         login_in_progress: snapshot.whatsapp.login_in_progress,
+        stabilizing: snapshot.whatsapp.stabilizing,
       },
       telegram: {
         status: !snapshot.telegram.desired
@@ -1923,10 +2057,31 @@ app.get('/watchdog', auth, (req, res) => {
   res.json(watchdogState);
 });
 
+app.get('/diagnostics', auth, (req, res) => {
+  try {
+    res.json(buildDiagnosticsPayload());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/self-heal', auth, async (req, res) => {
   try {
     const result = await runWatchdogCycle('manual');
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/channels/whatsapp/relink', auth, async (req, res) => {
+  try {
+    const watchdog = await triggerWhatsAppRelink();
+    res.json({
+      success: true,
+      watchdog,
+      relink_started: true,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

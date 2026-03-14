@@ -433,6 +433,61 @@ router.get('/:instance_id/logs', async (req: Request, res: Response): Promise<vo
   });
 });
 
+// ── GET /api/proxy/:instance_id/watchdog ─────────────────────────────────────
+router.get('/:instance_id/watchdog', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
+    try {
+      const { data } = await axios.get(`${baseUrl}/watchdog`, {
+        headers: agentHeaders(agentSecret),
+        timeout: 10_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Watchdog fetch failed' });
+    }
+  });
+});
+
+// ── GET /api/proxy/:instance_id/diagnostics ──────────────────────────────────
+router.get('/:instance_id/diagnostics', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
+    try {
+      const { data } = await axios.get(`${baseUrl}/diagnostics`, {
+        headers: agentHeaders(agentSecret),
+        timeout: 25_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Diagnostics fetch failed' });
+    }
+  });
+});
+
+// ── POST /api/proxy/:instance_id/self-heal ───────────────────────────────────
+router.post('/:instance_id/self-heal', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
+    console.log(`[audit] self-heal: user=${userId} instance=${instance?.id} ip=${req.ip}`);
+    try {
+      const { data } = await axios.post(`${baseUrl}/self-heal`, {}, {
+        headers: agentHeaders(agentSecret),
+        timeout: 20_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Self-heal failed' });
+    }
+  });
+});
+
 // ── GET /api/proxy/:instance_id/channels ─────────────────────────────────────
 router.get('/:instance_id/channels', async (req: Request, res: Response): Promise<void> => {
   await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
@@ -447,6 +502,25 @@ router.get('/:instance_id/channels', async (req: Request, res: Response): Promis
       const axErr = err as { response?: { status?: number; data?: unknown } };
       const status = axErr.response?.status ?? 502;
       res.status(status).json(axErr.response?.data ?? { error: 'Channels fetch failed' });
+    }
+  });
+});
+
+// ── POST /api/proxy/:instance_id/channels/whatsapp/relink ───────────────────
+router.post('/:instance_id/channels/whatsapp/relink', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret, instance, userId }) => {
+    console.log(`[audit] whatsapp-relink: user=${userId} instance=${instance?.id} ip=${req.ip}`);
+    try {
+      const { data } = await axios.post(`${baseUrl}/channels/whatsapp/relink`, {}, {
+        headers: agentHeaders(agentSecret),
+        timeout: 20_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'WhatsApp relink failed' });
     }
   });
 });
