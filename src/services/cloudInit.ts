@@ -162,6 +162,10 @@ const OPENCLAW_CONFIG_PATHS = [
   path.join(OPENCLAW_CONFIG_DIR, 'openclaw.json'),
   OPENCLAW_CONFIG_FILE,
 ];
+const OPENCLAW_PAIRING_ROOT_DIRS = [
+  path.join(OPENCLAW_CONFIG_DIR, '.openclaw'),
+  OPENCLAW_CONFIG_DIR,
+];
 
 // ── Concurrency locks ─────────────────────────────────────────────────────────
 let isConfiguring = false;
@@ -407,6 +411,160 @@ function getWhatsAppAuthDirs() {
   ];
 }
 
+function getDevicePairingFiles(rootDir) {
+  const dir = path.join(rootDir, 'devices');
+  return {
+    pendingPath: path.join(dir, 'pending.json'),
+    pairedPath: path.join(dir, 'paired.json'),
+  };
+}
+
+function safeReadJsonFile(filePath, fallback) {
+  try {
+    const raw = runCmd(\`sudo -u openclaw /usr/bin/cat \${shellQuote(filePath)} 2>/dev/null || true\`).trim();
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeOwnedJsonFile(filePath, value) {
+  const dir = path.dirname(filePath);
+  const tempPath = path.join(dir, \`\${path.basename(filePath)}.\${process.pid}.\${Date.now()}.tmp\`);
+  const content = \`\${JSON.stringify(value, null, 2)}\\n\`;
+
+  runCmd(\`sudo -u openclaw mkdir -p \${shellQuote(dir)}\`);
+  runProcess('sudo', ['-u', 'openclaw', 'tee', tempPath], { input: content, allowFailure: true });
+  runCmd(\`sudo -u openclaw chmod 600 \${shellQuote(tempPath)} 2>/dev/null || true\`);
+  runCmd(\`sudo -u openclaw mv \${shellQuote(tempPath)} \${shellQuote(filePath)}\`);
+}
+
+function normalizeStringList(...values) {
+  const out = [];
+  const seen = new Set();
+
+  const addValue = (value) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) return;
+    seen.add(trimmed);
+    out.push(trimmed);
+  };
+
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      value.forEach(addValue);
+    } else {
+      addValue(value);
+    }
+  }
+
+  return out;
+}
+
+function approvePendingDevicePairings(options = {}) {
+  let approved = 0;
+  const seenRoots = new Set();
+  const allowedClientModes = normalizeStringList(options.clientModes);
+  const allowedClientIds = normalizeStringList(options.clientIds);
+
+  for (const rootDir of OPENCLAW_PAIRING_ROOT_DIRS) {
+    if (!rootDir || seenRoots.has(rootDir)) continue;
+    seenRoots.add(rootDir);
+
+    const { pendingPath, pairedPath } = getDevicePairingFiles(rootDir);
+    const pending = safeReadJsonFile(pendingPath, {});
+    const paired = safeReadJsonFile(pairedPath, {});
+    const pendingIds = Object.keys(pending).sort((left, right) => {
+      const leftTs = Number(pending[left]?.ts || 0);
+      const rightTs = Number(pending[right]?.ts || 0);
+      return leftTs - rightTs;
+    });
+
+    let changed = false;
+
+    for (const requestId of pendingIds) {
+      const req = pending[requestId];
+      const deviceId = typeof req?.deviceId === 'string' ? req.deviceId.trim() : '';
+      const publicKey = typeof req?.publicKey === 'string' ? req.publicKey.trim() : '';
+      const clientMode = typeof req?.clientMode === 'string' ? req.clientMode.trim() : '';
+      const clientId = typeof req?.clientId === 'string' ? req.clientId.trim() : '';
+
+      if (!deviceId || !publicKey) {
+        delete pending[requestId];
+        changed = true;
+        continue;
+      }
+
+      const modeAllowed = allowedClientModes.length === 0 || allowedClientModes.includes(clientMode);
+      const clientAllowed = allowedClientIds.length === 0 || allowedClientIds.includes(clientId);
+      if (!modeAllowed || !clientAllowed) {
+        continue;
+      }
+
+      const existing = paired[deviceId] && typeof paired[deviceId] === 'object'
+        ? paired[deviceId]
+        : {};
+      const now = Date.now();
+      const role = typeof req?.role === 'string' && req.role.trim()
+        ? req.role.trim()
+        : (typeof existing?.role === 'string' ? existing.role.trim() : '');
+      const roles = normalizeStringList(existing?.roles, existing?.role, req?.roles, req?.role);
+      const approvedScopes = normalizeStringList(existing?.approvedScopes, existing?.scopes, req?.scopes);
+      const tokens = existing?.tokens && typeof existing.tokens === 'object'
+        ? { ...existing.tokens }
+        : {};
+
+      if (role) {
+        const existingToken = tokens[role] && typeof tokens[role] === 'object' ? tokens[role] : null;
+        const tokenScopes = approvedScopes.length > 0
+          ? approvedScopes
+          : normalizeStringList(existingToken?.scopes, existing?.approvedScopes, existing?.scopes);
+
+        tokens[role] = {
+          token: crypto.randomBytes(32).toString('base64url'),
+          role,
+          scopes: tokenScopes,
+          createdAtMs: typeof existingToken?.createdAtMs === 'number' ? existingToken.createdAtMs : now,
+          rotatedAtMs: existingToken ? now : undefined,
+          revokedAtMs: undefined,
+          lastUsedAtMs: existingToken?.lastUsedAtMs,
+        };
+      }
+
+      paired[deviceId] = {
+        ...existing,
+        deviceId,
+        publicKey,
+        displayName: req?.displayName ?? existing?.displayName,
+        platform: req?.platform ?? existing?.platform,
+        deviceFamily: req?.deviceFamily ?? existing?.deviceFamily,
+        clientId: req?.clientId ?? existing?.clientId,
+        clientMode: req?.clientMode ?? existing?.clientMode,
+        role: role || existing?.role,
+        roles,
+        scopes: approvedScopes,
+        approvedScopes,
+        remoteIp: req?.remoteIp ?? existing?.remoteIp,
+        tokens,
+        createdAtMs: typeof existing?.createdAtMs === 'number' ? existing.createdAtMs : now,
+        approvedAtMs: now,
+      };
+
+      delete pending[requestId];
+      approved += 1;
+      changed = true;
+    }
+
+    if (changed) {
+      writeOwnedJsonFile(pendingPath, pending);
+      writeOwnedJsonFile(pairedPath, paired);
+    }
+  }
+
+  return approved;
+}
+
 /**
  * Extract QR data from OpenClaw logs.
  */
@@ -547,26 +705,121 @@ function shellQuote(value) {
   return \`'\${String(value).replace(/'/g, \`'\\\\''\`)}'\`;
 }
 
-function getGatewayCliFlags() {
-  const config = readConfig();
-  const gateway = config?.gateway || {};
-  const auth = gateway.auth || {};
-  const port = Number(gateway.port || 18789);
-  const flags = [\`--url \${shellQuote(\`ws://127.0.0.1:\${port}\`)}\`];
-  if (auth.mode === 'token' && auth.token) {
-    flags.push(\`--token \${shellQuote(auth.token)}\`);
+function getPublicIpv4() {
+  try {
+    return runCmd(\`curl -s --max-time 3 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || hostname -I | awk '{print $1}'\`).trim();
+  } catch {
+    try {
+      return runCmd(\`hostname -I | awk '{print $1}'\`).trim();
+    } catch {
+      return 'localhost';
+    }
   }
-  return flags.join(' ');
+}
+
+function toWebSocketOrigin(origin) {
+  const trimmed = typeof origin === 'string' ? origin.trim().replace(/\/+$/, '') : '';
+  if (!trimmed) return '';
+  if (trimmed.startsWith('https://')) return \`wss://\${trimmed.slice('https://'.length)}\`;
+  if (trimmed.startsWith('http://')) return \`ws://\${trimmed.slice('http://'.length)}\`;
+  return '';
+}
+
+function readGatewayConnectionConfig() {
+  const activeConfig = readConfig();
+  let port = Number(activeConfig?.gateway?.port || 18789);
+  let token = typeof activeConfig?.gateway?.auth?.token === 'string' ? activeConfig.gateway.auth.token : '';
+  let allowedOrigins = Array.isArray(activeConfig?.gateway?.controlUi?.allowedOrigins)
+    ? activeConfig.gateway.controlUi.allowedOrigins
+    : [];
+
+  for (const cfgPath of OPENCLAW_CONFIG_PATHS) {
+    try {
+      const raw = runCmd(\`sudo -u openclaw /usr/bin/cat '\${cfgPath}' 2>/dev/null\`);
+      const config = JSON.parse(raw);
+      const candidatePort = Number(config?.gateway?.port || port);
+      if (Number.isFinite(candidatePort) && candidatePort > 0) {
+        port = candidatePort;
+      }
+      if (!token && typeof config?.gateway?.auth?.token === 'string' && config.gateway.auth.token) {
+        token = config.gateway.auth.token;
+      }
+      if (allowedOrigins.length === 0 && Array.isArray(config?.gateway?.controlUi?.allowedOrigins)) {
+        allowedOrigins = config.gateway.controlUi.allowedOrigins;
+      }
+      if (token && allowedOrigins.length > 0) break;
+    } catch { /* ignore invalid config variants */ }
+  }
+
+  return { port, token, allowedOrigins };
+}
+
+let lastSuccessfulGatewayUrl = '';
+let lastSuccessfulGatewayUrlAt = 0;
+const GATEWAY_URL_CACHE_TTL_MS = 10 * 60_000;
+
+function getGatewayConnection() {
+  const { port, token, allowedOrigins } = readGatewayConnectionConfig();
+  const urls = [];
+  const addUrl = (value) => {
+    if (typeof value !== 'string' || !value || urls.includes(value)) return;
+    urls.push(value);
+  };
+
+  if (lastSuccessfulGatewayUrl && (Date.now() - lastSuccessfulGatewayUrlAt) < GATEWAY_URL_CACHE_TTL_MS) {
+    addUrl(lastSuccessfulGatewayUrl);
+  } else {
+    lastSuccessfulGatewayUrl = '';
+    lastSuccessfulGatewayUrlAt = 0;
+  }
+
+  for (const origin of allowedOrigins) {
+    addUrl(toWebSocketOrigin(origin));
+  }
+
+  addUrl(\`ws://127.0.0.1:\${port}\`);
+
+  const publicIp = getPublicIpv4();
+  if (publicIp && publicIp !== 'localhost') {
+    addUrl(\`ws://\${publicIp}:\${port}\`);
+    addUrl(\`wss://\${publicIp.replace(/\\./g, '-')}.sslip.io\`);
+  }
+
+  const flagsFor = (url) => [\`--url \${shellQuote(url)}\`]
+    .concat(token ? [\`--token \${shellQuote(token)}\`] : [])
+    .join(' ');
+
+  return {
+    urls,
+    flagsFor,
+    fallbackFlags: flagsFor(urls[0] || \`ws://127.0.0.1:\${port}\`),
+  };
 }
 
 function openclawGatewayCall(method, extraArgs = '') {
-  const parts = ['gateway call', getGatewayCliFlags(), extraArgs, method].filter(Boolean);
+  const parts = ['gateway call', getGatewayConnection().fallbackFlags, extraArgs, method].filter(Boolean);
   return openclawExec(parts.join(' '));
 }
 
-function openclawDevicesExec(args) {
-  const parts = ['devices', args, getGatewayCliFlags()].filter(Boolean);
-  return openclawExec(parts.join(' '));
+function buildOpenclawDevicesCommand(args, flags) {
+  return openclawExec(['devices', args, flags].filter(Boolean).join(' '));
+}
+
+function runOpenclawDevices(args) {
+  const { urls, flagsFor, fallbackFlags } = getGatewayConnection();
+  let command = buildOpenclawDevicesCommand(args, fallbackFlags);
+
+  for (const url of urls) {
+    command = buildOpenclawDevicesCommand(args, flagsFor(url));
+    try {
+      const output = runCmd(\`\${command} 2>/dev/null\`);
+      lastSuccessfulGatewayUrl = url;
+      lastSuccessfulGatewayUrlAt = Date.now();
+      return { command, output };
+    } catch { /* try next URL */ }
+  }
+
+  return { command, output: '' };
 }
 
 // ── WhatsApp connection check helper ─────────────────────────────────────────
@@ -1048,41 +1301,10 @@ app.get('/chat-url', auth, (req, res) => {
 // POST /chat-approve → auto-approve pending device pairing requests
 app.post('/chat-approve', auth, (req, res) => {
   try {
-    // List pending devices and approve all
-    let listOut = '';
-    try {
-      listOut = runCmd(\`\${openclawDevicesExec('list --json')} 2>/dev/null\`);
-    } catch { /* ignore */ }
-
-    let approved = 0;
-    if (listOut) {
-      try {
-        const data = JSON.parse(listOut);
-        const pending = data?.pending || [];
-        for (const p of pending) {
-          const reqId = p.requestId || p.id;
-          if (reqId) {
-            try {
-              runCmd(\`\${openclawDevicesExec(\`approve \${shellQuote(reqId)}\`)} 2>/dev/null\`);
-              approved++;
-            } catch { /* ignore */ }
-          }
-        }
-      } catch {
-        // Fallback: parse text output for request IDs
-        const lines = listOut.split('\\n');
-        for (const line of lines) {
-          const match = line.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
-          if (match) {
-            try {
-              runCmd(\`\${openclawDevicesExec(\`approve \${shellQuote(match[1])}\`)} 2>/dev/null\`);
-              approved++;
-            } catch { /* ignore */ }
-          }
-        }
-      }
-    }
-
+    const approved = approvePendingDevicePairings({
+      clientModes: ['webchat'],
+      clientIds: ['openclaw-control-ui'],
+    });
     res.json({ approved });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1449,6 +1671,10 @@ Defaults:oriclaw-agent env_keep += "OPENCLAW_HOME HOME"
 oriclaw-agent ALL=(openclaw) NOPASSWD: SETENV: /home/openclaw/.npm-global/bin/openclaw
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/*
 oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/cat /home/openclaw/.openclaw/.openclaw/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mkdir -p /home/openclaw/.openclaw/.openclaw/devices
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/tee /home/openclaw/.openclaw/.openclaw/devices/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/chmod 600 /home/openclaw/.openclaw/.openclaw/devices/*
+oriclaw-agent ALL=(openclaw) NOPASSWD: /usr/bin/mv /home/openclaw/.openclaw/.openclaw/devices/* /home/openclaw/.openclaw/.openclaw/devices/*
 oriclaw-agent ALL=(root) NOPASSWD: /bin/mkdir -p /etc/systemd/system/openclaw.service.d
 oriclaw-agent ALL=(root) NOPASSWD: /usr/bin/tee /etc/systemd/system/openclaw.service.d/*
 oriclaw-agent ALL=(root) NOPASSWD: /bin/chmod 600 /etc/systemd/system/openclaw.service.d/*
