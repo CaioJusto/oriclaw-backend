@@ -191,6 +191,24 @@ router.get('/:instance_id/qr', async (req: Request, res: Response): Promise<void
   });
 });
 
+// ── POST /api/proxy/:instance_id/chat-approve ───────────────────────────────
+router.post('/:instance_id/chat-approve', async (req: Request, res: Response): Promise<void> => {
+  await withInstance(req, res, async ({ baseUrl, httpsAgent, agentSecret }) => {
+    try {
+      const { data } = await axios.post(`${baseUrl}/chat-approve`, {}, {
+        headers: agentHeaders(agentSecret),
+        timeout: 15_000,
+        httpsAgent,
+      });
+      res.json(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { status?: number; data?: unknown } };
+      const status = axErr.response?.status ?? 502;
+      res.status(status).json(axErr.response?.data ?? { error: 'Chat approve failed' });
+    }
+  });
+});
+
 // ── POST /api/proxy/:instance_id/configure ──────────────────────────────────
 router.post('/:instance_id/configure', async (req: Request, res: Response): Promise<void> => {
   const MAX_SYSTEM_PROMPT_BYTES = 8_000;
