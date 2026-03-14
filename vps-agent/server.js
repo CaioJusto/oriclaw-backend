@@ -5,6 +5,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { execSync, exec, spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const QRCode = require('qrcode');
 
@@ -678,12 +679,33 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+function isPrivateIpv4(host) {
+  return /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+}
+
+function getGatewayHost() {
+  const interfaces = os.networkInterfaces();
+  const candidates = [];
+
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (!entry || entry.family !== 'IPv4' || entry.internal || !entry.address) continue;
+      candidates.push(entry.address);
+    }
+  }
+
+  const uniqueCandidates = [...new Set(candidates)];
+  return uniqueCandidates.find(isPrivateIpv4) || uniqueCandidates[0] || '127.0.0.1';
+}
+
 function getGatewayCliFlags() {
   const config = readConfig();
   const gateway = config?.gateway || {};
   const auth = gateway.auth || {};
   const port = Number(gateway.port || 18789);
-  const flags = [`--url ${shellQuote(`ws://127.0.0.1:${port}`)}`];
+  const flags = [`--url ${shellQuote(`ws://${getGatewayHost()}:${port}`)}`];
   if (auth.mode === 'token' && auth.token) {
     flags.push(`--token ${shellQuote(auth.token)}`);
   }
@@ -1153,8 +1175,9 @@ app.get('/chat-url', auth, (req, res) => {
 
     // Check if gateway port is responding (--bind lan may not listen on localhost)
     let available = false;
+    const gatewayHost = getGatewayHost();
     try {
-      runCmd(`nc -z -w2 localhost ${gatewayPort} 2>/dev/null`);
+      runCmd(`nc -z -w2 ${shellQuote(gatewayHost)} ${gatewayPort} 2>/dev/null`);
       available = true;
     } catch {
       try {
